@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-06-02
+
+configurable BLS User-Agent via BLS_USER_AGENT; @cyanheads/mcp-ts-core ^0.9.21
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-05-30
 
 enrichment adoption — search/series/dataframe tools surface query echoes, result totals, and empty-result guidance

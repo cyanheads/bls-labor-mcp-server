@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 04:48:35
+Generated on: 2026-06-02 13:39:36
 
 ```text
 bls-labor-mcp-server/
@@ -21,6 +21,7 @@ bls-labor-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -30,12 +31,14 @@ bls-labor-mcp-server/
 │   ├── build.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
 ├── skills/
@@ -62,6 +65,8 @@ bls-labor-mcp-server/
 │   ├── api-errors/
 │   │   └── SKILL.md
 │   ├── api-linter/
+│   │   └── SKILL.md
+│   ├── api-mirror/
 │   │   └── SKILL.md
 │   ├── api-services/
 │   │   ├── references/
@@ -90,6 +95,13 @@ bls-labor-mcp-server/
 │   ├── git-wrapup/
 │   │   └── SKILL.md
 │   ├── maintenance/
+│   │   └── SKILL.md
+│   ├── orchestrations/
+│   │   ├── workflows/
+│   │   │   ├── field-test-fix.md
+│   │   │   ├── fix-wrapup-release.md
+│   │   │   ├── greenfield-build.md
+│   │   │   └── maintenance-release.md
 │   │   └── SKILL.md
 │   ├── polish-docs-meta/
 │   │   ├── references/
@@ -144,8 +156,10 @@ bls-labor-mcp-server/
 │   ├── services/
 │   │   ├── bls-api/
 │   │   │   └── bls-api-service.test.ts
-│   │   └── bls-catalog/
-│   │       └── bls-catalog-service.test.ts
+│   │   ├── bls-catalog/
+│   │   │   └── bls-catalog-service.test.ts
+│   │   └── canvas-bridge/
+│   │       └── sql-gate-extras.test.ts
 │   └── tools/
 │       ├── bls-dataframe-describe.tool.test.ts
 │       ├── bls-dataframe-drop.tool.test.ts
