@@ -73,11 +73,13 @@ export interface BatchFetchOptions {
 export class BlsApiService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly userAgent: string;
   private surveyCache: { surveys: SurveyMeta[]; cachedAt: number } | undefined;
 
-  constructor(apiKey: string, baseUrl: string) {
+  constructor(apiKey: string, baseUrl: string, userAgent: string) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl;
+    this.userAgent = userAgent;
   }
 
   /** Batch-fetch 1–50 series. One API query regardless of series count. */
@@ -97,7 +99,7 @@ export class BlsApiService {
 
         const response = await fetch(`${this.baseUrl}/timeseries/data`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'User-Agent': this.userAgent },
           body: JSON.stringify(body),
           signal: ctx.signal,
         });
@@ -117,7 +119,10 @@ export class BlsApiService {
     return withRetry(
       async () => {
         const url = `${this.baseUrl}/timeseries/data/${encodeURIComponent(seriesId)}?latest=true&catalog=true&registrationkey=${this.apiKey}`;
-        const response = await fetch(url, { signal: ctx.signal });
+        const response = await fetch(url, {
+          headers: { 'User-Agent': this.userAgent },
+          signal: ctx.signal,
+        });
         const text = await response.text();
         const series = this.parseSeriesResponse(text, { seriesIds: [seriesId] });
         const found = series.find((s) => s.seriesId === seriesId);
@@ -146,7 +151,10 @@ export class BlsApiService {
     const surveys = await withRetry(
       async () => {
         const url = `${this.baseUrl}/surveys?registrationkey=${this.apiKey}`;
-        const response = await fetch(url, { signal: ctx.signal });
+        const response = await fetch(url, {
+          headers: { 'User-Agent': this.userAgent },
+          signal: ctx.signal,
+        });
         const text = await response.text();
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
@@ -303,7 +311,7 @@ let _service: BlsApiService | undefined;
 
 export function initBlsApiService(_config: AppConfig, _storage: unknown): void {
   const cfg = getServerConfig();
-  _service = new BlsApiService(cfg.apiKey, cfg.baseUrl);
+  _service = new BlsApiService(cfg.apiKey, cfg.baseUrl, cfg.userAgent);
 }
 
 export function getBlsApiService(): BlsApiService {

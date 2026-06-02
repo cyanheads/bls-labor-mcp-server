@@ -25,6 +25,14 @@ const ServerConfigSchema = z.object({
     .url()
     .default('https://download.bls.gov/pub/time.series')
     .describe('LABSTAT flat-file base URL — override to point at a local mirror'),
+  userAgent: z
+    .string()
+    .default(
+      'cyanheads-bls-mcp/1.0 (https://github.com/cyanheads/bls-labor-mcp-server; casey@caseyjhand.com)',
+    )
+    .describe(
+      'User-Agent sent on all HTTP requests — BLS data-access policy requires a descriptive UA with contact',
+    ),
   datasetTtlSeconds: z.coerce
     .number()
     .int()
@@ -49,6 +57,7 @@ export function getServerConfig(): ServerConfig {
     catalogBaseUrl: 'BLS_CATALOG_BASE_URL',
     datasetTtlSeconds: 'BLS_DATASET_TTL_SECONDS',
     dataframeDropEnabled: 'BLS_DATAFRAME_DROP_ENABLED',
+    userAgent: 'BLS_USER_AGENT',
   });
   return _config;
 }

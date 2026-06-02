@@ -169,7 +169,10 @@ export class BlsCatalogService {
   private loaded = false;
   private loadError: string | undefined;
 
-  constructor(private readonly catalogBaseUrl: string) {}
+  constructor(
+    private readonly catalogBaseUrl: string,
+    private readonly userAgent: string,
+  ) {}
 
   /**
    * Fetch all LABSTAT series files and build the in-memory index.
@@ -202,10 +205,14 @@ export class BlsCatalogService {
     const baseUrl = this.catalogBaseUrl;
     const abbr = survey.abbr;
 
+    const headers = { 'User-Agent': this.userAgent };
     const [seriesRes, ...codeResults] = await Promise.allSettled([
-      fetch(`${baseUrl}/${abbr}/${abbr}.series`, { signal: AbortSignal.timeout(30_000) }),
+      fetch(`${baseUrl}/${abbr}/${abbr}.series`, { headers, signal: AbortSignal.timeout(30_000) }),
       ...(survey.codeTables ?? []).map((table) =>
-        fetch(`${baseUrl}/${abbr}/${abbr}.${table}`, { signal: AbortSignal.timeout(15_000) }),
+        fetch(`${baseUrl}/${abbr}/${abbr}.${table}`, {
+          headers,
+          signal: AbortSignal.timeout(15_000),
+        }),
       ),
     ]);
 
@@ -328,7 +335,8 @@ export class BlsCatalogService {
 let _service: BlsCatalogService | undefined;
 
 export function initBlsCatalogService(_config: AppConfig, _storage: StorageService): void {
-  _service = new BlsCatalogService(getServerConfig().catalogBaseUrl);
+  const { catalogBaseUrl, userAgent } = getServerConfig();
+  _service = new BlsCatalogService(catalogBaseUrl, userAgent);
 }
 
 export function getBlsCatalogService(): BlsCatalogService {
