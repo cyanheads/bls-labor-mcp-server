@@ -145,10 +145,38 @@ describe('blsGetLatestTool — additional coverage', () => {
     expect(result.succeeded).toBe(1);
     expect(result.failed).toHaveLength(1);
     expect(result.failed[0]!.seriesId).toBe('INVALID000');
+    // results must mirror request order: results[0] = LNS14000000, results[1] = INVALID000
+    expect(result.results[0]!.seriesId).toBe('LNS14000000');
+    expect(result.results[0]!.latestObservation).toBeDefined();
+    expect(result.results[1]!.seriesId).toBe('INVALID000');
+    expect(result.results[1]!.latestObservation).toBeUndefined();
 
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('bls_search_series');
+  });
+
+  it('preserves request order when invalid series precedes valid series', async () => {
+    // Regression: previously results were [...succeeded, ...failed], so a failed[0] would
+    // appear at results[1] instead of results[0]. This test puts the invalid ID first.
+    fetchLatestMock
+      .mockRejectedValueOnce(new Error('Series does not exist'))
+      .mockResolvedValueOnce(MOCK_SERIES);
+
+    const ctx = createMockContext();
+    const input = blsGetLatestTool.input.parse({
+      series_ids: ['ZZZZZZZ_INVALID', 'LNS14000000'],
+    });
+    const result = await blsGetLatestTool.handler(input, ctx);
+
+    expect(result.succeeded).toBe(1);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0]!.seriesId).toBe('ZZZZZZZ_INVALID');
+    // results[0] must be the invalid (first requested), results[1] the valid (second requested)
+    expect(result.results[0]!.seriesId).toBe('ZZZZZZZ_INVALID');
+    expect(result.results[0]!.latestObservation).toBeUndefined();
+    expect(result.results[1]!.seriesId).toBe('LNS14000000');
+    expect(result.results[1]!.latestObservation?.value).toBe('4.1');
   });
 
   it('rejects empty series_ids array', () => {

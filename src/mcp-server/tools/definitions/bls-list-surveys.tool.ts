@@ -6,6 +6,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
 /** Survey category tags used to group BLS programs for filtering. */
@@ -23,6 +24,22 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
   description:
     'List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+
+  errors: [
+    {
+      reason: 'service_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'BLS /surveys API is unreachable or returns a non-200 response.',
+      recovery: 'Retry after a short delay. If persistent, check BLS API status at api.bls.gov.',
+    },
+    {
+      reason: 'serialization_failure',
+      code: JsonRpcErrorCode.InternalError,
+      when: 'BLS /surveys response cannot be parsed (malformed JSON or unexpected schema).',
+      recovery:
+        'This is a BLS API inconsistency — retry or use a known survey code directly with bls_search_series.',
+    },
+  ],
 
   input: z.object({
     category: z

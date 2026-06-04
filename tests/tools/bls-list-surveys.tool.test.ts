@@ -4,7 +4,7 @@
  */
 
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsListSurveysTool } from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
 
 const MOCK_SURVEYS = [
@@ -31,13 +31,17 @@ const MOCK_SURVEYS = [
   },
 ];
 
+const listSurveysMock = vi.fn();
+
 vi.mock('@/services/bls-api/bls-api-service.js', () => ({
-  getBlsApiService: () => ({
-    listSurveys: vi.fn().mockResolvedValue(MOCK_SURVEYS),
-  }),
+  getBlsApiService: () => ({ listSurveys: listSurveysMock }),
 }));
 
 describe('blsListSurveysTool', () => {
+  beforeEach(() => {
+    listSurveysMock.mockResolvedValue(MOCK_SURVEYS);
+  });
+
   it('returns all surveys when no category filter is given', async () => {
     const ctx = createMockContext();
     const input = blsListSurveysTool.input.parse({});
@@ -79,8 +83,9 @@ describe('blsListSurveysTool', () => {
 });
 
 describe('blsListSurveysTool — additional coverage', () => {
-  // The module-level vi.mock above injects MOCK_SURVEYS (CE, CU, LN) for all calls.
-  // These tests rely on that mock being present.
+  beforeEach(() => {
+    listSurveysMock.mockResolvedValue(MOCK_SURVEYS);
+  });
 
   it('returns empty list when no surveys match the category filter', async () => {
     // MOCK_SURVEYS contains CE, CU, LN — none are in the time_use category (TU only)
@@ -158,5 +163,43 @@ describe('blsListSurveysTool — additional coverage', () => {
     expect(text).toContain('net change');
     expect(text).toContain('% change');
     expect(text).toContain('annual avg');
+  });
+});
+
+describe('blsListSurveysTool — error contracts', () => {
+  beforeEach(() => {
+    listSurveysMock.mockReset();
+  });
+
+  it('propagates service_unavailable with data.reason when listSurveys rejects', async () => {
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    listSurveysMock.mockRejectedValue(
+      serviceUnavailable('BLS surveys API returned HTML instead of JSON — likely rate-limited.', {
+        reason: 'service_unavailable',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
+    const input = blsListSurveysTool.input.parse({});
+
+    await expect(blsListSurveysTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'service_unavailable' },
+    });
+  });
+
+  it('propagates serialization_failure with data.reason when listSurveys rejects with parse error', async () => {
+    const { serializationError } = await import('@cyanheads/mcp-ts-core/errors');
+    listSurveysMock.mockRejectedValue(
+      serializationError('Failed to parse BLS surveys response as JSON', {
+        reason: 'serialization_failure',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
+    const input = blsListSurveysTool.input.parse({});
+
+    await expect(blsListSurveysTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'serialization_failure' },
+    });
   });
 });

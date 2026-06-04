@@ -37,12 +37,6 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         'The daily quota resets at UTC midnight. Retry after midnight or reduce query volume.',
     },
     {
-      reason: 'series_not_found',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'One or more SeriesIDs do not exist in BLS data.',
-      recovery: 'Use bls_search_series to find valid SeriesIDs before calling bls_get_latest.',
-    },
-    {
       reason: 'series_locked',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS database is temporarily locked for the requested series.',
@@ -86,11 +80,19 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         z
           .object({
             seriesId: z.string().describe('SeriesID that failed.'),
-            error: z.string().describe('Error message.'),
+            error: z
+              .string()
+              .describe(
+                'Error message. Common values: "Series does not exist" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data).',
+              ),
           })
-          .describe('A series that could not be fetched.'),
+          .describe(
+            'A series that could not be fetched, e.g. due to an invalid SeriesID or empty data window.',
+          ),
       )
-      .describe('Series that failed to fetch, with per-item error details.'),
+      .describe(
+        'Series that failed to fetch. Inspect seriesId and error for per-item details. Not-found series appear here rather than as a tool-level error.',
+      ),
   }),
 
   enrichment: {
@@ -115,7 +117,8 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       })),
     );
 
-    const succeeded: Array<{
+    // results preserves request order: results[i] corresponds to series_ids[i].
+    const results: Array<{
       seriesId: string;
       title?: string;
       area?: string;
@@ -130,6 +133,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       };
     }> = [];
     const failed: Array<{ seriesId: string; error: string }> = [];
+    let succeededCount = 0;
 
     for (const [i, settlement] of pairs.entries()) {
       // i is always within bounds — pairs is derived 1:1 from input.series_ids.
@@ -141,25 +145,23 @@ export const blsGetLatestTool = tool('bls_get_latest', {
           const reason = (err.data as Record<string, unknown> | undefined)?.reason;
           if (reason === 'quota_exceeded' || reason === 'series_locked') throw err;
         }
-        failed.push({
-          seriesId: requestedId,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        failed.push({ seriesId: requestedId, error: errorMsg });
+        results.push({ seriesId: requestedId });
         continue;
       }
 
       const { seriesId, data } = settlement.value;
       const obs = data.observations[0];
       if (!obs) {
-        failed.push({
-          seriesId,
-          error:
-            'No observations returned — series may exist but has no data for the current period.',
-        });
+        const errorMsg =
+          'No observations returned — series may exist but has no data for the current period.';
+        failed.push({ seriesId, error: errorMsg });
+        results.push({ seriesId });
         continue;
       }
 
-      succeeded.push({
+      results.push({
         seriesId: data.seriesId,
         ...(data.title && { title: data.title }),
         ...(data.area && { area: data.area }),
@@ -173,10 +175,11 @@ export const blsGetLatestTool = tool('bls_get_latest', {
           ...(obs.footnotes?.length && { footnotes: obs.footnotes }),
         },
       });
+      succeededCount++;
     }
 
     if (failed.length > 0) {
-      const allFailed = succeeded.length === 0;
+      const allFailed = succeededCount === 0;
       ctx.enrich.notice(
         allFailed
           ? `All ${failed.length} series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.`
@@ -185,8 +188,8 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     }
 
     return {
-      results: [...succeeded, ...failed.map((f) => ({ seriesId: f.seriesId }))],
-      succeeded: succeeded.length,
+      results,
+      succeeded: succeededCount,
       failed,
     };
   },

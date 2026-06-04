@@ -159,6 +159,7 @@ export class BlsApiService {
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
             'BLS surveys API returned HTML instead of JSON — likely rate-limited.',
+            { reason: 'service_unavailable' },
           );
         }
         let parsed: BlsSurveysResponse;
@@ -167,13 +168,14 @@ export class BlsApiService {
         } catch (e: unknown) {
           throw serializationError(
             'Failed to parse BLS surveys response as JSON',
-            {},
+            { reason: 'serialization_failure' },
             { cause: e },
           );
         }
         if (parsed.status !== 'REQUEST_SUCCEEDED') {
           throw serviceUnavailable(
             `BLS surveys API: ${parsed.message?.join('; ') ?? 'unknown error'}`,
+            { reason: 'service_unavailable' },
           );
         }
         return (parsed.Results?.survey ?? []).map((s): SurveyMeta => {
