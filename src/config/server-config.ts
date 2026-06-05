@@ -25,6 +25,20 @@ const ServerConfigSchema = z.object({
     .url()
     .default('https://download.bls.gov/pub/time.series')
     .describe('LABSTAT flat-file base URL — override to point at a local mirror'),
+  catalogCachePath: z
+    .string()
+    .default('.cache/bls-catalog.json')
+    .describe(
+      'Filesystem path where the parsed catalog index is persisted so it survives restarts. Empty disables caching (re-fetch every boot). In containers, mount a volume here to survive image updates.',
+    ),
+  catalogCacheTtlHours: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(168)
+    .describe(
+      'Catalog cache freshness window in hours — re-fetch live once the cache is older (default 168 h / 7 days; the LABSTAT catalog changes slowly).',
+    ),
   userAgent: z
     .string()
     .default(
@@ -44,6 +58,34 @@ const ServerConfigSchema = z.object({
     .default('false')
     .transform((v) => v === 'true')
     .describe('Expose bls_dataframe_drop when true — off by default; TTL handles cleanup'),
+
+  // ── Observations mirror ───────────────────────────────────────────────
+  observationsMirrorEnabled: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true')
+    .describe(
+      'Enable the local LABSTAT observation mirror. Off by default — requires a one-time bootstrap (bls-observations-init) before serving mirror traffic.',
+    ),
+  observationsMirrorPath: z
+    .string()
+    .default('.mirror/bls-observations.db')
+    .describe(
+      'Filesystem path for the observations SQLite store. In containers, mount a persistent volume here so the mirror survives image updates.',
+    ),
+  observationsMirrorRefreshCron: z
+    .string()
+    .default('0 6 * * 1')
+    .describe(
+      'Cron expression for incremental observation refreshes (HTTP transport only). Default: Monday 06:00 UTC. Stdio operators run refreshes out-of-band.',
+    ),
+  observationsMirrorFallbackLive: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true')
+    .describe(
+      'Fall back to the live BLS API when the mirror is not ready or a series has no mirror rows. When false, a not-ready mirror returns an error.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -55,9 +97,15 @@ export function getServerConfig(): ServerConfig {
     apiKey: 'BLS_API_KEY',
     baseUrl: 'BLS_BASE_URL',
     catalogBaseUrl: 'BLS_CATALOG_BASE_URL',
+    catalogCachePath: 'BLS_CATALOG_CACHE_PATH',
+    catalogCacheTtlHours: 'BLS_CATALOG_CACHE_TTL_HOURS',
     datasetTtlSeconds: 'BLS_DATASET_TTL_SECONDS',
     dataframeDropEnabled: 'BLS_DATAFRAME_DROP_ENABLED',
     userAgent: 'BLS_USER_AGENT',
+    observationsMirrorEnabled: 'BLS_OBSERVATIONS_MIRROR_ENABLED',
+    observationsMirrorPath: 'BLS_OBSERVATIONS_MIRROR_PATH',
+    observationsMirrorRefreshCron: 'BLS_OBSERVATIONS_MIRROR_REFRESH_CRON',
+    observationsMirrorFallbackLive: 'BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE',
   });
   return _config;
 }
