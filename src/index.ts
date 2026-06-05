@@ -6,6 +6,7 @@
  */
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
+import { requestContextService, schedulerService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from './config/server-config.js';
 import { blsDataframeDescribeTool } from './mcp-server/tools/definitions/bls-dataframe-describe.tool.js';
 import { blsDataframeDropTool } from './mcp-server/tools/definitions/bls-dataframe-drop.tool.js';
@@ -19,6 +20,8 @@ import {
   getBlsCatalogService,
   initBlsCatalogService,
 } from './services/bls-catalog/bls-catalog-service.js';
+import { initBlsObservationsService } from './services/bls-observations/bls-observations-service.js';
+import { runObservationsSubprocess } from './services/bls-observations/subprocess.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
 
 const cfg = getServerConfig();
@@ -44,9 +47,10 @@ await createApp({
   resources: [],
   prompts: [],
 
-  setup(core) {
+  async setup(core) {
     initBlsApiService(core.config, core.storage);
     initBlsCatalogService(core.config, core.storage);
+    initBlsObservationsService(core.config, core.storage);
     initCanvasBridge(core.canvas);
 
     // Load catalog in background — non-blocking. bls_search_series throws
@@ -57,5 +61,42 @@ await createApp({
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[bls-labor-mcp-server] Catalog load error: ${msg}\n`);
       });
+
+    // Schedule observation mirror refresh — HTTP transport only.
+    // Stdio operators run syncs out-of-band (e.g. `node dist/services/bls-observations/subprocess.js`).
+    const transport = core.config?.mcpTransportType ?? 'stdio';
+    if (
+      cfg.observationsMirrorEnabled &&
+      cfg.observationsMirrorRefreshCron &&
+      transport === 'http'
+    ) {
+      const bootCtx = requestContextService.createRequestContext({
+        operation: 'bls-observations-refresh-init',
+      });
+      core.logger.info('Scheduling observations mirror refresh', bootCtx);
+
+      await schedulerService.schedule(
+        'bls-observations-refresh',
+        cfg.observationsMirrorRefreshCron,
+        async (jobCtx) => {
+          const mirrorLog = {
+            debug: (m: string, meta?: object) =>
+              core.logger.debug(m, { ...jobCtx, ...(meta ?? {}) }),
+            info: (m: string, meta?: object) => core.logger.info(m, { ...jobCtx, ...(meta ?? {}) }),
+            notice: (m: string, meta?: object) =>
+              core.logger.notice(m, { ...jobCtx, ...(meta ?? {}) }),
+            warning: (m: string, meta?: object) =>
+              core.logger.warning(m, { ...jobCtx, ...(meta ?? {}) }),
+            error: (m: string, meta?: object) =>
+              core.logger.error(m, { ...jobCtx, ...(meta ?? {}) }),
+          };
+          // Offload to a subprocess — synchronous SQLite writes must not block
+          // the server's event loop. WAL allows concurrent readers throughout.
+          await runObservationsSubprocess({ log: mirrorLog });
+        },
+        'Incremental LABSTAT observation harvest into the bls-observations SQLite mirror.',
+      );
+      schedulerService.start('bls-observations-refresh');
+    }
   },
 });

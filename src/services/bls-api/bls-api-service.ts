@@ -5,6 +5,12 @@
  * (survey metadata). Applies retry with 1–2s backoff. Surfaces quota exhaustion,
  * series-not-found, locked-series, no-data, and calculations-not-supported as
  * typed error data so calling tools can produce the right `ctx.fail` reason.
+ *
+ * When `BLS_OBSERVATIONS_MIRROR_ENABLED=true` and the mirror has completed at
+ * least one full sync, `fetchSeries` and `fetchLatest` are routed through the
+ * local SQLite mirror instead of the BLS API, bypassing the 500/day quota cap.
+ * Series IDs missing from the mirror fall back to the live API when
+ * `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=true` (the default).
  * @module services/bls-api/bls-api-service
  */
 
@@ -18,6 +24,12 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
+import {
+  getBlsObservationsService,
+  isBlsObservationsServiceReady,
+} from '@/services/bls-observations/bls-observations-service.js';
+import type { ObservationRow } from '@/services/bls-observations/types.js';
 import type {
   BlsApiResponse,
   BlsSurveysResponse,
@@ -83,7 +95,68 @@ export class BlsApiService {
   }
 
   /** Batch-fetch 1–50 series. One API query regardless of series count. */
-  fetchSeries(options: BatchFetchOptions, ctx: Context): Promise<SeriesData[]> {
+  async fetchSeries(options: BatchFetchOptions, ctx: Context): Promise<SeriesData[]> {
+    const cfg = getServerConfig();
+
+    // ── Mirror routing ───────────────────────────────────────────────────────
+    if (cfg.observationsMirrorEnabled && isBlsObservationsServiceReady()) {
+      const mirror = getBlsObservationsService();
+      const isReady = await mirror.ready();
+
+      if (isReady) {
+        ctx.log.debug('fetchSeries: routing via observations mirror', {
+          seriesCount: options.seriesIds.length,
+        });
+        const queryOpts: { seriesIds: string[]; startYear?: number; endYear?: number } = {
+          seriesIds: options.seriesIds,
+          ...(options.startYear !== undefined ? { startYear: options.startYear } : {}),
+          ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
+        };
+        const mirrorResult = await mirror.queryBySeries(queryOpts);
+
+        const mirrorSeries = this.mirrorRowsToSeriesData(mirrorResult.observations);
+
+        // Fetch missing IDs from live API when fallback is enabled
+        if (mirrorResult.missedIds.length > 0 && cfg.observationsMirrorFallbackLive) {
+          ctx.log.notice('fetchSeries: mirror miss, falling back to live API', {
+            missedIds: mirrorResult.missedIds,
+          });
+          const liveOptions: BatchFetchOptions = {
+            seriesIds: mirrorResult.missedIds,
+            ...(options.startYear !== undefined ? { startYear: options.startYear } : {}),
+            ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
+            ...(options.calculations !== undefined ? { calculations: options.calculations } : {}),
+          };
+          const liveSeries = await this.fetchSeriesLive(liveOptions, ctx);
+          return [...mirrorSeries, ...liveSeries];
+        }
+
+        // Emit a notice when coverage is partial but fallback is disabled
+        if (!mirrorResult.complete) {
+          ctx.log.notice('fetchSeries: mirror_partial — some series IDs not in mirror', {
+            missedIds: mirrorResult.missedIds,
+          });
+        }
+
+        return mirrorSeries;
+      }
+
+      // Mirror not yet ready
+      if (!cfg.observationsMirrorFallbackLive) {
+        throw serviceUnavailable(
+          'Observations mirror is enabled but not yet ready — run the one-time bootstrap first (BLS_OBSERVATIONS_MIRROR_ENABLED=true, then trigger an init sync).',
+          { reason: 'service_unavailable' },
+        );
+      }
+      ctx.log.notice('fetchSeries: mirror not ready, falling back to live API');
+    }
+
+    // ── Live API path (default / fallback) ──────────────────────────────────
+    return this.fetchSeriesLive(options, ctx);
+  }
+
+  /** Live API batch fetch — the original implementation. */
+  private fetchSeriesLive(options: BatchFetchOptions, ctx: Context): Promise<SeriesData[]> {
     return withRetry(
       async () => {
         const body: Record<string, unknown> = {
@@ -115,7 +188,44 @@ export class BlsApiService {
   }
 
   /** Fetch the single most recent observation for one series. */
-  fetchLatest(seriesId: string, ctx: Context): Promise<SeriesData> {
+  async fetchLatest(seriesId: string, ctx: Context): Promise<SeriesData> {
+    const cfg = getServerConfig();
+
+    // ── Mirror routing ───────────────────────────────────────────────────────
+    if (cfg.observationsMirrorEnabled && isBlsObservationsServiceReady()) {
+      const mirror = getBlsObservationsService();
+      const isReady = await mirror.ready();
+
+      if (isReady) {
+        ctx.log.debug('fetchLatest: routing via observations mirror', { seriesId });
+        const mirrorResult = await mirror.queryLatest([seriesId]);
+
+        if (mirrorResult.observations.length > 0) {
+          const seriesList = this.mirrorRowsToSeriesData(mirrorResult.observations);
+          const found = seriesList.find((s) => s.seriesId === seriesId);
+          if (found) return found;
+        }
+
+        // Series not in mirror — fall back to live if enabled
+        if (!cfg.observationsMirrorFallbackLive) {
+          throw notFound(
+            `Series ${seriesId} not found in local mirror. Run a mirror bootstrap or set BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=true.`,
+            { reason: 'series_not_found', seriesId },
+          );
+        }
+        ctx.log.notice('fetchLatest: mirror miss, falling back to live API', { seriesId });
+      } else {
+        if (!cfg.observationsMirrorFallbackLive) {
+          throw serviceUnavailable(
+            'Observations mirror is enabled but not yet ready — run the one-time bootstrap first.',
+            { reason: 'service_unavailable' },
+          );
+        }
+        ctx.log.notice('fetchLatest: mirror not ready, falling back to live API');
+      }
+    }
+
+    // ── Live API path (default / fallback) ──────────────────────────────────
     return withRetry(
       async () => {
         const url = `${this.baseUrl}/timeseries/data/${encodeURIComponent(seriesId)}?latest=true&catalog=true&registrationkey=${this.apiKey}`;
@@ -140,6 +250,83 @@ export class BlsApiService {
         signal: ctx.signal,
       },
     );
+  }
+
+  /**
+   * Convert mirror observation rows to SeriesData, hydrating catalog metadata
+   * (title, area, item, seasonal) from the in-memory catalog index.
+   * The LABSTAT data files carry only raw observation values — catalog metadata
+   * must be joined from the catalog service's in-memory series index.
+   */
+  private mirrorRowsToSeriesData(rows: ObservationRow[]): SeriesData[] {
+    // Group rows by series_id, ordered by (year DESC, period DESC)
+    const grouped = new Map<string, ObservationRow[]>();
+    for (const row of rows) {
+      let list = grouped.get(row.series_id);
+      if (!list) {
+        list = [];
+        grouped.set(row.series_id, list);
+      }
+      list.push(row);
+    }
+
+    // Hydrate catalog metadata from the catalog service when available
+    const catalog = (() => {
+      try {
+        const svc = getBlsCatalogService();
+        return svc.isLoaded ? svc : null;
+      } catch {
+        return null;
+      }
+    })();
+
+    const result: SeriesData[] = [];
+    for (const [seriesId, obsRows] of grouped) {
+      // Try to look up series metadata from the catalog
+      let title: string | undefined;
+      let area: string | undefined;
+      let item: string | undefined;
+      let seasonal: string | undefined;
+
+      if (catalog) {
+        const found = catalog.search({
+          query: seriesId,
+          limit: 1,
+          area: undefined,
+          seasonal_adjustment: undefined,
+          survey: undefined,
+        });
+        const match = found.series.find((s) => s.seriesId === seriesId);
+        if (match) {
+          title = match.title;
+          area = match.areaName;
+          item = match.itemName;
+          seasonal = match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted';
+        }
+      }
+
+      const observations: Observation[] = obsRows
+        .slice()
+        .sort((a, b) =>
+          a.year !== b.year ? b.year.localeCompare(a.year) : b.period.localeCompare(a.period),
+        )
+        .map((row) => ({
+          year: row.year,
+          period: row.period,
+          value: row.value,
+          ...(row.footnote_codes ? { footnotes: [row.footnote_codes] } : {}),
+        }));
+
+      result.push({
+        seriesId,
+        ...(title && { title }),
+        ...(area && { area }),
+        ...(item && { item }),
+        ...(seasonal && { seasonal }),
+        observations,
+      });
+    }
+    return result;
   }
 
   /** List all surveys. Cached in-memory for 30 days per process. */
