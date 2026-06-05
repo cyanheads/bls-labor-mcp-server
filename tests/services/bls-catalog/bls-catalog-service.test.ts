@@ -234,6 +234,35 @@ describe('BlsCatalogService.search', () => {
     });
     expect(result.series[0]!.seriesId).toBe('LNS14000000');
   });
+
+  it('keeps headline common series in play before applying the FTS candidate cap', async () => {
+    const genericMatches: CatalogSeries[] = Array.from({ length: 1_005 }, (_, i) => ({
+      seriesId: `TEST_CPI_DISTRACTOR_${String(i).padStart(4, '0')}`,
+      title: `Consumer Price Index distractor ${i}`,
+      surveyAbbr: 'CE',
+      seasonal: false,
+    }));
+    const headlineCpi: CatalogSeries = {
+      seriesId: 'CUUR0000SA0',
+      title: 'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+      surveyAbbr: 'CU',
+      seasonal: false,
+      areaName: 'U.S. city average',
+      itemName: 'All items',
+    };
+    const svc = await seedAndLoad([...genericMatches, headlineCpi]);
+
+    const result = await svc.search({
+      query: 'consumer price index',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+
+    expect(result.series.map((s) => s.seriesId)).toContain('CUUR0000SA0');
+    expect(result.series.findIndex((s) => s.seriesId === 'CUUR0000SA0')).toBeLessThan(3);
+  });
 });
 
 describe('BlsCatalogService state', () => {

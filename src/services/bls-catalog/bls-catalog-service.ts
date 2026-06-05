@@ -83,9 +83,11 @@ const OES_SURVEY_ABBR = 'oe';
 const COMMON_SERIES: Record<string, string> = {
   LNS14000000: 'civilian unemployment rate seasonally adjusted',
   CES0000000001: 'total nonfarm payrolls seasonally adjusted',
-  CUUR0000SA0: 'cpi-u all items u.s. city average not seasonally adjusted',
-  CUSR0000SA0: 'cpi-u all items u.s. city average seasonally adjusted',
-  WPUFD49104: 'ppi finished goods',
+  CUUR0000SA0:
+    'consumer price index cpi cpi-u all items u.s. city average all urban consumers not seasonally adjusted',
+  CUSR0000SA0:
+    'consumer price index cpi cpi-u all items u.s. city average all urban consumers seasonally adjusted',
+  WPUFD49104: 'producer price index ppi finished goods',
   JTS000000000000000JOL: 'jolts job openings all industries',
   LNS11300000: 'labor force participation rate',
   LNS12000000: 'civilian employment level',
@@ -393,11 +395,15 @@ export class BlsCatalogService {
     const seasonFilter = input.seasonal_adjustment;
 
     // Candidate set: an exact-id lookup (guarantees the precise SeriesID is in
-    // play) unioned with the FTS5 matches, deduped by series id.
+    // play), known headline/common series (so bespoke boosts are not lost to the
+    // FTS candidate cap), and the FTS5 matches, deduped by series id.
     const candidates = new Map<string, CatalogSeries>();
 
     const exact = await this.store.getByIds([input.query.trim().toUpperCase()]);
     for (const row of exact) candidates.set(row.series_id as string, toCatalog(row));
+
+    const commonRows = await this.store.getByIds(Object.keys(COMMON_SERIES));
+    for (const row of commonRows) candidates.set(row.series_id as string, toCatalog(row));
 
     const tokens = query.match(/[a-z0-9]+/gi) ?? [];
     if (tokens.length > 0) {
