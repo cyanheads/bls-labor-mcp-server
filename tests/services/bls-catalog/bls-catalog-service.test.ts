@@ -3,7 +3,10 @@
  * @module tests/services/bls-catalog/bls-catalog-service.test
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
 
@@ -232,5 +235,104 @@ describe('BlsCatalogService.search', () => {
   it('catalogLoadError is undefined when loaded successfully', () => {
     const svc = makeService(FIXTURES);
     expect(svc.catalogLoadError).toBeUndefined();
+  });
+});
+
+describe('BlsCatalogService cache (#32)', () => {
+  const BASE_URL = 'https://download.bls.gov/pub/time.series';
+  const SERIES_TEXT = 'series_id\ttitle\tseasonal\nLNS14000000\tUnemployment Rate\tS\n';
+  let cacheDir: string;
+  let cachePath: string;
+
+  beforeEach(async () => {
+    cacheDir = await mkdtemp(join(tmpdir(), 'bls-cache-'));
+    cachePath = join(cacheDir, 'catalog.json');
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(cacheDir, { recursive: true, force: true });
+  });
+
+  it('persists the catalog after a live load and serves it on the next boot without re-fetching', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(new Response(SERIES_TEXT, { status: 200 })));
+
+    // Cold boot: fetches live, writes the cache.
+    const first = new BlsCatalogService(BASE_URL, 'ua/1.0', cachePath, 168);
+    await first.load(1);
+    expect(first.isLoaded).toBe(true);
+    expect(first.totalSeries).toBeGreaterThan(0);
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(0);
+
+    const cached = JSON.parse(await readFile(cachePath, 'utf8')) as {
+      version: number;
+      series: unknown[];
+    };
+    expect(cached.version).toBe(1);
+    expect(Array.isArray(cached.series)).toBe(true);
+
+    // Warm boot: a fresh instance on the same path loads from cache, no network.
+    fetchSpy.mockClear();
+    const second = new BlsCatalogService(BASE_URL, 'ua/1.0', cachePath, 168);
+    await second.load(1);
+    expect(second.isLoaded).toBe(true);
+    expect(second.totalSeries).toBe(first.totalSeries);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('re-fetches live when the cache is older than the TTL', async () => {
+    await writeFile(
+      cachePath,
+      JSON.stringify({
+        version: 1,
+        fetchedAt: Date.now() - 200 * 3_600_000, // 200 h old, beyond a 168 h TTL
+        series: [{ seriesId: 'STALE000', title: 'Stale', surveyAbbr: 'LN', seasonal: false }],
+      }),
+      'utf8',
+    );
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(new Response(SERIES_TEXT, { status: 200 })));
+
+    const svc = new BlsCatalogService(BASE_URL, 'ua/1.0', cachePath, 168);
+    await svc.load(1);
+
+    expect(fetchSpy).toHaveBeenCalled();
+    const result = svc.search({
+      query: 'STALE000',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.series.find((s) => s.seriesId === 'STALE000')).toBeUndefined();
+  });
+
+  it('falls back to a live fetch when the cache file is corrupt', async () => {
+    await writeFile(cachePath, '{ not valid json', 'utf8');
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(new Response(SERIES_TEXT, { status: 200 })));
+
+    const svc = new BlsCatalogService(BASE_URL, 'ua/1.0', cachePath, 168);
+    await svc.load(1);
+
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(svc.isLoaded).toBe(true);
+    expect(svc.totalSeries).toBeGreaterThan(0);
+  });
+
+  it('skips cache I/O entirely when cachePath is empty', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(new Response(SERIES_TEXT, { status: 200 })));
+
+    const svc = new BlsCatalogService(BASE_URL, 'ua/1.0', '', 168);
+    await svc.load(1);
+
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(svc.isLoaded).toBe(true);
   });
 });

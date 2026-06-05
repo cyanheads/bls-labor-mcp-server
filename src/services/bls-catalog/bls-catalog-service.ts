@@ -7,6 +7,8 @@
  * @module services/bls-catalog/bls-catalog-service
  */
 
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { internalError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
@@ -164,6 +166,22 @@ function parseSeries(
   return entries;
 }
 
+/** Cache schema version — bump to invalidate persisted caches on a shape change. */
+const CATALOG_CACHE_VERSION = 1;
+
+/**
+ * Max surveys fetched concurrently during a cold load. Keeps the startup request
+ * burst small so a datacenter IP is less likely to be rate-limited by download.bls.gov.
+ */
+const SURVEY_FETCH_CONCURRENCY = 3;
+
+/** On-disk catalog cache envelope. */
+interface CatalogCache {
+  fetchedAt: number;
+  series: CatalogSeries[];
+  version: number;
+}
+
 export class BlsCatalogService {
   private index: CatalogSeries[] = [];
   private loaded = false;
@@ -172,25 +190,33 @@ export class BlsCatalogService {
   constructor(
     private readonly catalogBaseUrl: string,
     private readonly userAgent: string,
+    private readonly cachePath = '',
+    private readonly cacheTtlHours = 168,
   ) {}
 
   /**
-   * Fetch all LABSTAT series files and build the in-memory index.
+   * Build the in-memory index: serve a fresh on-disk cache when present, else
+   * fetch all LABSTAT series files (bounded concurrency) and persist the result.
    * Retries up to `maxAttempts` times with linear backoff (attempt * 5 s).
    * Sets `loaded = true` after the final attempt regardless of outcome so
    * callers can distinguish "still loading" from "load failed".
    */
   async load(maxAttempts = 3): Promise<void> {
+    const cached = await this.readCache();
+    if (cached) {
+      this.index = cached;
+      this.loaded = true;
+      this.loadError = undefined;
+      return;
+    }
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const results = await Promise.allSettled(SURVEYS.map((survey) => this.loadSurvey(survey)));
-      const all: CatalogSeries[] = [];
-      for (const r of results) {
-        if (r.status === 'fulfilled') all.push(...r.value);
-      }
+      const all = await this.fetchAllSurveys();
       if (all.length > 0) {
         this.index = all;
         this.loaded = true;
         this.loadError = undefined;
+        await this.writeCache(all);
         return;
       }
       if (attempt < maxAttempts) {
@@ -199,6 +225,58 @@ export class BlsCatalogService {
     }
     this.loaded = true;
     this.loadError = `Catalog load failed after ${maxAttempts} attempts — all LABSTAT downloads returned empty.`;
+  }
+
+  /** Fetch every survey with bounded concurrency to avoid a large startup burst. */
+  private async fetchAllSurveys(): Promise<CatalogSeries[]> {
+    const all: CatalogSeries[] = [];
+    for (let i = 0; i < SURVEYS.length; i += SURVEY_FETCH_CONCURRENCY) {
+      const batch = SURVEYS.slice(i, i + SURVEY_FETCH_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map((survey) => this.loadSurvey(survey)));
+      for (const r of results) {
+        if (r.status === 'fulfilled') all.push(...r.value);
+      }
+    }
+    return all;
+  }
+
+  /** Read the persisted catalog when present, valid, and within the TTL window. */
+  private async readCache(): Promise<CatalogSeries[] | undefined> {
+    if (!this.cachePath) return;
+    try {
+      const parsed = JSON.parse(await readFile(this.cachePath, 'utf8')) as Partial<CatalogCache>;
+      if (
+        parsed.version !== CATALOG_CACHE_VERSION ||
+        typeof parsed.fetchedAt !== 'number' ||
+        !Array.isArray(parsed.series) ||
+        parsed.series.length === 0
+      ) {
+        return;
+      }
+      if (Date.now() - parsed.fetchedAt > this.cacheTtlHours * 3_600_000) return;
+      return parsed.series;
+    } catch {
+      return; // missing or corrupt cache → fetch live
+    }
+  }
+
+  /** Persist the parsed catalog so the next boot can skip the live fetch. */
+  private async writeCache(series: CatalogSeries[]): Promise<void> {
+    if (!this.cachePath) return;
+    try {
+      await mkdir(dirname(this.cachePath), { recursive: true });
+      const payload: CatalogCache = {
+        version: CATALOG_CACHE_VERSION,
+        fetchedAt: Date.now(),
+        series,
+      };
+      await writeFile(this.cachePath, JSON.stringify(payload), 'utf8');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      process.stderr.write(
+        `[bls-labor-mcp-server] Catalog cache write failed (${this.cachePath}): ${msg}\n`,
+      );
+    }
   }
 
   private async loadSurvey(survey: SurveyDefinition): Promise<CatalogSeries[]> {
@@ -335,8 +413,13 @@ export class BlsCatalogService {
 let _service: BlsCatalogService | undefined;
 
 export function initBlsCatalogService(_config: AppConfig, _storage: StorageService): void {
-  const { catalogBaseUrl, userAgent } = getServerConfig();
-  _service = new BlsCatalogService(catalogBaseUrl, userAgent);
+  const { catalogBaseUrl, userAgent, catalogCachePath, catalogCacheTtlHours } = getServerConfig();
+  _service = new BlsCatalogService(
+    catalogBaseUrl,
+    userAgent,
+    catalogCachePath,
+    catalogCacheTtlHours,
+  );
 }
 
 export function getBlsCatalogService(): BlsCatalogService {
