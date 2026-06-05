@@ -109,7 +109,7 @@ export class BlsObservationsService {
     });
 
     // Determine which requested IDs are covered
-    const foundIds = new Set(rows.map((r) => r['series_id'] as string));
+    const foundIds = new Set(rows.map((r) => r.series_id as string));
     const missedIds = seriesIds.filter((id) => !foundIds.has(id));
 
     return {

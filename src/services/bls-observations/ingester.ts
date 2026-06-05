@@ -223,9 +223,9 @@ export async function* observationsSync(
 
   let maxLastModified = priorCheckpoint ?? '';
 
-  for (let abbrIdx = resume.abbrIdx; abbrIdx < SURVEYS.length; abbrIdx++) {
+  for (const [abbrIdx, abbr] of SURVEYS.entries()) {
     if (signal.aborted) break;
-    const abbr = SURVEYS[abbrIdx]!;
+    if (abbrIdx < resume.abbrIdx) continue;
     const baseDir = `${catalogBaseUrl}/${abbr}`;
 
     // Discover data files from the readme
@@ -243,9 +243,9 @@ export async function* observationsSync(
 
     const startFileIdx = abbrIdx === resume.abbrIdx ? resume.fileIdx : 0;
 
-    for (let fileIdx = startFileIdx; fileIdx < dataFiles.length; fileIdx++) {
+    for (const [fileIdx, fileName] of dataFiles.entries()) {
       if (signal.aborted) break;
-      const fileName = dataFiles[fileIdx]!;
+      if (fileIdx < startFileIdx) continue;
       const url = `${baseDir}/${fileName}`;
 
       const result = await fetchText(url, userAgent, signal);

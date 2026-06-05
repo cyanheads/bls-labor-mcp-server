@@ -108,12 +108,12 @@ describe('observationsSync — tab-delimited parsing', () => {
     expect(firstPage.records.length).toBeGreaterThan(0);
 
     const row = firstPage.records[0]!;
-    expect(typeof row['row_key']).toBe('string');
-    expect(typeof row['series_id']).toBe('string');
-    expect(typeof row['year']).toBe('string');
-    expect(typeof row['period']).toBe('string');
-    expect(typeof row['value']).toBe('string');
-    expect(typeof row['footnote_codes']).toBe('string');
+    expect(typeof row.row_key).toBe('string');
+    expect(typeof row.series_id).toBe('string');
+    expect(typeof row.year).toBe('string');
+    expect(typeof row.period).toBe('string');
+    expect(typeof row.value).toBe('string');
+    expect(typeof row.footnote_codes).toBe('string');
   });
 
   it('skips rows with a null "-" value', async () => {
@@ -150,8 +150,8 @@ describe('observationsSync — tab-delimited parsing', () => {
     }
 
     // Should have 2 rows (M12 and M10), not 3 (M11 has '-' value)
-    const lnsRows = allRecords.filter((r) => r['series_id'] === 'LNS14000000');
-    const periodM11 = lnsRows.find((r) => r['period'] === 'M11');
+    const lnsRows = allRecords.filter((r) => r.series_id === 'LNS14000000');
+    const periodM11 = lnsRows.find((r) => r.period === 'M11');
     expect(periodM11).toBeUndefined();
     expect(lnsRows.length).toBe(2);
   });
@@ -191,7 +191,7 @@ describe('observationsSync — tab-delimited parsing', () => {
 
     expect(records.length).toBeGreaterThan(0);
     for (const row of records) {
-      expect(typeof row['footnote_codes']).toBe('string');
+      expect(typeof row.footnote_codes).toBe('string');
     }
   });
 
@@ -228,8 +228,8 @@ describe('observationsSync — tab-delimited parsing', () => {
       break;
     }
 
-    const lnsRow = records.find((r) => r['series_id'] === 'LNS14000000' && r['period'] === 'M12');
-    expect(lnsRow?.['row_key']).toBe('LNS14000000|2024|M12');
+    const lnsRow = records.find((r) => r.series_id === 'LNS14000000' && r.period === 'M12');
+    expect(lnsRow?.row_key).toBe('LNS14000000|2024|M12');
   });
 
   it('gracefully skips a survey whose readme fetch returns 404', async () => {
