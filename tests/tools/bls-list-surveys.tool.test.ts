@@ -3,7 +3,7 @@
  * @module tests/tools/bls-list-surveys.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsListSurveysTool } from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
 
@@ -51,6 +51,8 @@ describe('blsListSurveysTool', () => {
     expect(result.surveys).toHaveLength(3);
     // Sorted alphabetically
     expect(result.surveys[0]!.abbreviation).toBe('CE');
+    // No category filter → no echo (#29)
+    expect(getEnrichment(ctx).categoryFilter).toBeUndefined();
   });
 
   it('filters by employment category', async () => {
@@ -60,6 +62,8 @@ describe('blsListSurveysTool', () => {
 
     // CE and LN are in the employment category map
     expect(result.surveys.every((s) => ['CE', 'LN'].includes(s.abbreviation))).toBe(true);
+    // category filter echoed (#29)
+    expect(getEnrichment(ctx).categoryFilter).toBe('employment');
   });
 
   it('formats output with abbreviation and capability flags', () => {

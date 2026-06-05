@@ -168,6 +168,23 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
   enrichment: {
     totalObservations: z.number().describe('Total observation rows across all requested series.'),
+    seriesRequested: z
+      .number()
+      .describe(
+        'Number of SeriesIDs requested. Compare against the returned series[] length to detect series that returned no data.',
+      ),
+    startYearApplied: z
+      .number()
+      .optional()
+      .describe('Start year in effect, when a range was requested.'),
+    endYearApplied: z
+      .number()
+      .optional()
+      .describe('End year in effect, when a range was requested.'),
+    calculationsApplied: z
+      .boolean()
+      .optional()
+      .describe('Whether BLS net/percent-change calculations were requested.'),
     notice: z
       .string()
       .optional()
@@ -221,7 +238,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const shouldSpill = inlineJson.length > INLINE_BUDGET_CHARS;
 
     const totalObservations = allRows.length;
-    ctx.enrich({ totalObservations });
+    ctx.enrich({
+      totalObservations,
+      seriesRequested: input.series_ids.length,
+      ...(input.start_year !== undefined && { startYearApplied: input.start_year }),
+      ...(input.end_year !== undefined && { endYearApplied: input.end_year }),
+      ...(input.calculations !== undefined && { calculationsApplied: input.calculations }),
+    });
 
     if (shouldSpill) {
       const bridge = getCanvasBridge();

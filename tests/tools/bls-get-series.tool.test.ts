@@ -48,6 +48,30 @@ describe('blsGetSeriesTool', () => {
     const enriched = getEnrichment(ctx);
     expect(enriched.totalObservations).toBe(2);
     expect(enriched.notice).toBeUndefined();
+    // echo: request params, none of the optional ones passed (#30)
+    expect(enriched.seriesRequested).toBe(1);
+    expect(enriched.startYearApplied).toBeUndefined();
+    expect(enriched.endYearApplied).toBeUndefined();
+    expect(enriched.calculationsApplied).toBeUndefined();
+  });
+
+  it('echoes requested params (series count, year range, calculations) in enrichment', async () => {
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000', 'CES0000000001'],
+      start_year: 2020,
+      end_year: 2024,
+      calculations: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.seriesRequested).toBe(2);
+    expect(enriched.startYearApplied).toBe(2020);
+    expect(enriched.endYearApplied).toBe(2024);
+    expect(enriched.calculationsApplied).toBe(true);
   });
 
   it('throws on service error (quota_exceeded)', async () => {

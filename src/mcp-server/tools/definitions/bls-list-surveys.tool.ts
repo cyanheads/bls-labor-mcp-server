@@ -79,6 +79,13 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
     total: z.number().describe('Total surveys returned.'),
   }),
 
+  enrichment: {
+    categoryFilter: z
+      .string()
+      .optional()
+      .describe('Category filter applied, if any. Absent when all surveys were listed.'),
+  },
+
   async handler(input, ctx) {
     ctx.log.info('Executing bls_list_surveys', { category: input.category });
     const all = await getBlsApiService().listSurveys(ctx);
@@ -90,6 +97,8 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
     );
 
     filtered.sort((a, b) => a.surveyAbbreviation.localeCompare(b.surveyAbbreviation));
+
+    if (input.category !== undefined) ctx.enrich({ categoryFilter: input.category });
 
     return {
       surveys: filtered.map((s) => ({

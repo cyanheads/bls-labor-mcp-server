@@ -86,6 +86,24 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .describe(
         'Total series in the loaded catalog index. Distinguishes an empty-result search from a failed catalog load.',
       ),
+    effectiveQuery: z
+      .string()
+      .describe(
+        'Query string as the server received and searched on. Confirms interpretation for self-correction.',
+      ),
+    surveyFilter: z
+      .string()
+      .optional()
+      .describe('Survey filter applied, if any. Absent when no survey filter was passed.'),
+    areaFilter: z
+      .string()
+      .optional()
+      .describe('Area filter applied, if any. Absent when no area filter was passed.'),
+    seasonalFilter: z
+      .boolean()
+      .optional()
+      .describe('Seasonal-adjustment filter applied, if any. Absent when not passed.'),
+    limitApplied: z.number().describe('Result limit in effect (defaults to 10 when omitted).'),
     notice: z
       .string()
       .optional()
@@ -126,7 +144,17 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       limit: input.limit,
     });
 
-    ctx.enrich({ totalFound: result.total, catalogSize: service.totalSeries });
+    ctx.enrich({
+      totalFound: result.total,
+      catalogSize: service.totalSeries,
+      limitApplied: input.limit,
+      ...(input.survey !== undefined && { surveyFilter: input.survey }),
+      ...(input.area !== undefined && { areaFilter: input.area }),
+      ...(input.seasonal_adjustment !== undefined && {
+        seasonalFilter: input.seasonal_adjustment,
+      }),
+    });
+    ctx.enrich.echo(input.query);
     if (result.series.length === 0) {
       const hasFilters =
         input.survey !== undefined ||

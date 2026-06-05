@@ -62,6 +62,34 @@ describe('blsSearchSeriesTool', () => {
     expect(enriched.totalFound).toBe(1);
     expect(enriched.catalogSize).toBe(847000);
     expect(enriched.notice).toBeUndefined();
+    // echo: query + applied limit, no filters passed (#29)
+    expect(enriched.effectiveQuery).toBe('unemployment');
+    expect(enriched.limitApplied).toBe(5);
+    expect(enriched.surveyFilter).toBeUndefined();
+    expect(enriched.areaFilter).toBeUndefined();
+    expect(enriched.seasonalFilter).toBeUndefined();
+  });
+
+  it('echoes applied survey/area/seasonal filters in enrichment', () => {
+    mockSearch.mockReturnValueOnce({ series: MOCK_SERIES, total: 1 });
+    mockIsLoaded = true;
+
+    const ctx = createMockContext();
+    const input = blsSearchSeriesTool.input.parse({
+      query: 'nonfarm',
+      survey: 'CE',
+      area: 'United States',
+      seasonal_adjustment: true,
+      limit: 25,
+    });
+    blsSearchSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.effectiveQuery).toBe('nonfarm');
+    expect(enriched.surveyFilter).toBe('CE');
+    expect(enriched.areaFilter).toBe('United States');
+    expect(enriched.seasonalFilter).toBe(true);
+    expect(enriched.limitApplied).toBe(25);
   });
 
   it('enriches with notice when no series match', () => {
