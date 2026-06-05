@@ -17,7 +17,7 @@ const MOCK_SERIES = [
   },
 ];
 
-const mockSearch = vi.fn().mockReturnValue({ series: MOCK_SERIES, total: 1 });
+const mockSearch = vi.fn().mockResolvedValue({ series: MOCK_SERIES, total: 1 });
 let mockIsLoaded = true;
 let mockTotalSeries = 847000;
 let mockCatalogLoadError: string | undefined;
@@ -38,22 +38,23 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
 }));
 
 describe('blsSearchSeriesTool', () => {
-  it('throws catalog_unavailable when catalog is not loaded', () => {
+  it('throws catalog_unavailable when catalog is not loaded', async () => {
     mockIsLoaded = false;
     const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
 
-    expect(() => blsSearchSeriesTool.handler(input, ctx)).toThrow(
+    await expect(blsSearchSeriesTool.handler(input, ctx)).rejects.toThrow(
       expect.objectContaining({ data: expect.objectContaining({ reason: 'catalog_unavailable' }) }),
     );
     mockIsLoaded = true;
   });
 
-  it('returns series from catalog on happy path and enriches with totals', () => {
+  it('returns series from catalog on happy path and enriches with totals', async () => {
     mockIsLoaded = true;
+    mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1 });
     const ctx = createMockContext();
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment', limit: 5 });
-    const result = blsSearchSeriesTool.handler(input, ctx);
+    const result = await blsSearchSeriesTool.handler(input, ctx);
 
     expect(result.series).toHaveLength(1);
     expect(result.series[0]!.seriesId).toBe('LNS14000000');
@@ -70,8 +71,8 @@ describe('blsSearchSeriesTool', () => {
     expect(enriched.seasonalFilter).toBeUndefined();
   });
 
-  it('echoes applied survey/area/seasonal filters in enrichment', () => {
-    mockSearch.mockReturnValueOnce({ series: MOCK_SERIES, total: 1 });
+  it('echoes applied survey/area/seasonal filters in enrichment', async () => {
+    mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
@@ -82,7 +83,7 @@ describe('blsSearchSeriesTool', () => {
       seasonal_adjustment: true,
       limit: 25,
     });
-    blsSearchSeriesTool.handler(input, ctx);
+    await blsSearchSeriesTool.handler(input, ctx);
 
     const enriched = getEnrichment(ctx);
     expect(enriched.effectiveQuery).toBe('nonfarm');
@@ -92,14 +93,13 @@ describe('blsSearchSeriesTool', () => {
     expect(enriched.limitApplied).toBe(25);
   });
 
-  it('enriches with notice when no series match', () => {
-    const emptySearch = vi.fn().mockReturnValue({ series: [], total: 0 });
-    vi.mocked(mockSearch).mockImplementationOnce(emptySearch);
+  it('enriches with notice when no series match', async () => {
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
     const input = blsSearchSeriesTool.input.parse({ query: 'zzznotasurvey', limit: 5 });
-    blsSearchSeriesTool.handler(input, ctx);
+    await blsSearchSeriesTool.handler(input, ctx);
 
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
@@ -136,10 +136,10 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     mockIsLoaded = true;
     mockTotalSeries = 847000;
     mockCatalogLoadError = undefined;
-    mockSearch.mockReturnValue({ series: MOCK_SERIES, total: 1 });
+    mockSearch.mockResolvedValue({ series: MOCK_SERIES, total: 1 });
   });
 
-  it('throws catalog_unavailable when catalog loaded but empty (totalSeries === 0)', () => {
+  it('throws catalog_unavailable when catalog loaded but empty (totalSeries === 0)', async () => {
     mockIsLoaded = true;
     mockTotalSeries = 0;
     mockCatalogLoadError = 'All LABSTAT downloads returned empty.';
@@ -147,13 +147,13 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
 
-    expect(() => blsSearchSeriesTool.handler(input, ctx)).toThrow(
+    await expect(blsSearchSeriesTool.handler(input, ctx)).rejects.toThrow(
       expect.objectContaining({ data: expect.objectContaining({ reason: 'catalog_unavailable' }) }),
     );
   });
 
-  it('enriches with filter-specific notice when no results and filters are active', () => {
-    mockSearch.mockReturnValueOnce({ series: [], total: 0 });
+  it('enriches with filter-specific notice when no results and filters are active', async () => {
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
@@ -162,7 +162,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
       survey: 'CE',
       seasonal_adjustment: true,
     });
-    blsSearchSeriesTool.handler(input, ctx);
+    await blsSearchSeriesTool.handler(input, ctx);
 
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
@@ -170,7 +170,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     expect(enriched.notice).toContain('filter');
   });
 
-  it('returns areaName and itemName when present in catalog entry', () => {
+  it('returns areaName and itemName when present in catalog entry', async () => {
     const seriesWithCodes = [
       {
         seriesId: 'CU0000SA0',
@@ -181,18 +181,18 @@ describe('blsSearchSeriesTool — additional coverage', () => {
         itemName: 'All items',
       },
     ];
-    mockSearch.mockReturnValueOnce({ series: seriesWithCodes, total: 1 });
+    mockSearch.mockResolvedValueOnce({ series: seriesWithCodes, total: 1 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
     const input = blsSearchSeriesTool.input.parse({ query: 'CPI all items' });
-    const result = blsSearchSeriesTool.handler(input, ctx);
+    const result = await blsSearchSeriesTool.handler(input, ctx);
 
     expect(result.series[0]!.areaName).toBe('U.S. city average');
     expect(result.series[0]!.itemName).toBe('All items');
   });
 
-  it('omits areaName/itemName from output when absent in catalog entry', () => {
+  it('omits areaName/itemName from output when absent in catalog entry', async () => {
     // Return a series with no areaName/itemName from the catalog
     const seriesNoArea = [
       {
@@ -203,12 +203,12 @@ describe('blsSearchSeriesTool — additional coverage', () => {
         // no areaName, no itemName
       },
     ];
-    mockSearch.mockReturnValueOnce({ series: seriesNoArea, total: 1 });
+    mockSearch.mockResolvedValueOnce({ series: seriesNoArea, total: 1 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
-    const result = blsSearchSeriesTool.handler(input, ctx);
+    const result = await blsSearchSeriesTool.handler(input, ctx);
 
     expect('areaName' in (result.series[0] ?? {})).toBe(false);
     expect('itemName' in (result.series[0] ?? {})).toBe(false);
@@ -248,13 +248,13 @@ describe('blsSearchSeriesTool — additional coverage', () => {
   });
 
   // Security: oversized query should not crash the handler
-  it('handles very long query string without throwing', () => {
+  it('handles very long query string without throwing', async () => {
     const longQuery = 'a'.repeat(500);
-    mockSearch.mockReturnValueOnce({ series: [], total: 0 });
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0 });
     mockIsLoaded = true;
 
     const ctx = createMockContext();
     const input = blsSearchSeriesTool.input.parse({ query: longQuery });
-    expect(() => blsSearchSeriesTool.handler(input, ctx)).not.toThrow();
+    await expect(blsSearchSeriesTool.handler(input, ctx)).resolves.toBeDefined();
   });
 });

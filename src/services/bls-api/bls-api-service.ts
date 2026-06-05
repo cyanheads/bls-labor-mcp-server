@@ -25,6 +25,7 @@ import {
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
+import type { CatalogSeries } from '@/services/bls-catalog/types.js';
 import {
   getBlsObservationsService,
   isBlsObservationsServiceReady,
@@ -114,7 +115,7 @@ export class BlsApiService {
         };
         const mirrorResult = await mirror.queryBySeries(queryOpts);
 
-        const mirrorSeries = this.mirrorRowsToSeriesData(mirrorResult.observations);
+        const mirrorSeries = await this.mirrorRowsToSeriesData(mirrorResult.observations);
 
         // Fetch missing IDs from live API when fallback is enabled
         if (mirrorResult.missedIds.length > 0 && cfg.observationsMirrorFallbackLive) {
@@ -201,7 +202,7 @@ export class BlsApiService {
         const mirrorResult = await mirror.queryLatest([seriesId]);
 
         if (mirrorResult.observations.length > 0) {
-          const seriesList = this.mirrorRowsToSeriesData(mirrorResult.observations);
+          const seriesList = await this.mirrorRowsToSeriesData(mirrorResult.observations);
           const found = seriesList.find((s) => s.seriesId === seriesId);
           if (found) return found;
         }
@@ -258,7 +259,7 @@ export class BlsApiService {
    * The LABSTAT data files carry only raw observation values — catalog metadata
    * must be joined from the catalog service's in-memory series index.
    */
-  private mirrorRowsToSeriesData(rows: ObservationRow[]): SeriesData[] {
+  private async mirrorRowsToSeriesData(rows: ObservationRow[]): Promise<SeriesData[]> {
     // Group rows by series_id, ordered by (year DESC, period DESC)
     const grouped = new Map<string, ObservationRow[]>();
     for (const row of rows) {
@@ -270,7 +271,7 @@ export class BlsApiService {
       list.push(row);
     }
 
-    // Hydrate catalog metadata from the catalog service when available
+    // Hydrate catalog metadata in one batch lookup when the catalog is available.
     const catalog = (() => {
       try {
         const svc = getBlsCatalogService();
@@ -279,30 +280,24 @@ export class BlsApiService {
         return null;
       }
     })();
+    const metadata: Map<string, CatalogSeries> = catalog
+      ? await catalog.lookupByIds([...grouped.keys()])
+      : new Map();
 
     const result: SeriesData[] = [];
     for (const [seriesId, obsRows] of grouped) {
-      // Try to look up series metadata from the catalog
+      // Series metadata from the catalog, when present
       let title: string | undefined;
       let area: string | undefined;
       let item: string | undefined;
       let seasonal: string | undefined;
 
-      if (catalog) {
-        const found = catalog.search({
-          query: seriesId,
-          limit: 1,
-          area: undefined,
-          seasonal_adjustment: undefined,
-          survey: undefined,
-        });
-        const match = found.series.find((s) => s.seriesId === seriesId);
-        if (match) {
-          title = match.title;
-          area = match.areaName;
-          item = match.itemName;
-          seasonal = match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted';
-        }
+      const match = metadata.get(seriesId);
+      if (match) {
+        title = match.title;
+        area = match.areaName;
+        item = match.itemName;
+        seasonal = match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted';
       }
 
       const observations: Observation[] = obsRows

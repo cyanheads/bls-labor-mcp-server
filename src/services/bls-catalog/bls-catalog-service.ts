@@ -1,16 +1,17 @@
 /**
  * @fileoverview BLS LABSTAT flat-file catalog service. Downloads `{survey}.series`
- * files from `download.bls.gov/pub/time.series/{survey}/` at startup and builds
- * an in-memory full-text + structured search index. No API quota consumed — all
- * search is offline. Covers the most commonly queried BLS surveys; the BLS FAQ
- * confirms there is no API catalog endpoint.
+ * files from `download.bls.gov/pub/time.series/{survey}/`, parses them into a
+ * searchable series index, and persists that index in an on-disk SQLite store
+ * (the framework's FTS5-capable `sqliteMirrorStore`). Search runs as an FTS5
+ * candidate query rescored by a bespoke relevance function — the index lives on
+ * disk, not the JS heap, so large surveys do not inflate memory. No API quota is
+ * consumed; the BLS FAQ confirms there is no API catalog endpoint.
  * @module services/bls-catalog/bls-catalog-service
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { internalError } from '@cyanheads/mcp-ts-core/errors';
+import { type MirrorRow, type MirrorStore, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
@@ -69,6 +70,15 @@ const SURVEYS: SurveyDefinition[] = [
   { abbr: 'mp', name: 'Productivity - Major Sector', codeTables: ['measure', 'sector'] },
 ];
 
+/**
+ * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.2 GB, 32× every
+ * other survey combined. It is excluded from the catalog unless explicitly opted
+ * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~187K
+ * series), the first harvest fast, and on-disk size modest. OES series remain
+ * fetchable by ID via bls_get_series; they are simply not in the search index.
+ */
+const OES_SURVEY_ABBR = 'oe';
+
 /** Known common series to boost in search rankings. */
 const COMMON_SERIES: Record<string, string> = {
   LNS14000000: 'civilian unemployment rate seasonally adjusted',
@@ -90,6 +100,15 @@ interface SeriesColumns {
   seriesId: number;
   title?: number;
 }
+
+/** Max surveys fetched concurrently during a harvest. Keeps the request burst small. */
+const SURVEY_FETCH_CONCURRENCY = 3;
+
+/** Rows per SQLite upsert transaction during a harvest. Bounds the write batch size. */
+const UPSERT_CHUNK_SIZE = 5_000;
+
+/** Max FTS candidates pulled before the bespoke rescore. Generous so `total` stays accurate. */
+const CANDIDATE_LIMIT = 1_000;
 
 /** Parse an area code → name mapping from a `.area` file. */
 function parseCodeMap(text: string, keyCol = 0, valCol = 1): Map<string, string> {
@@ -166,117 +185,150 @@ function parseSeries(
   return entries;
 }
 
-/** Cache schema version — bump to invalidate persisted caches on a shape change. */
-const CATALOG_CACHE_VERSION = 1;
+/** Map a parsed catalog entry to a SQLite row. `seasonal` is stored as 0/1 (no boolean affinity). */
+function toRow(s: CatalogSeries): MirrorRow {
+  return {
+    series_id: s.seriesId,
+    title: s.title,
+    survey_abbr: s.surveyAbbr,
+    area_name: s.areaName ?? null,
+    item_name: s.itemName ?? null,
+    seasonal: s.seasonal ? 1 : 0,
+  };
+}
+
+/** Map a SQLite row back to a catalog entry. */
+function toCatalog(row: MirrorRow): CatalogSeries {
+  return {
+    seriesId: row.series_id as string,
+    title: row.title as string,
+    surveyAbbr: row.survey_abbr as string,
+    ...(row.area_name != null ? { areaName: row.area_name as string } : {}),
+    ...(row.item_name != null ? { itemName: row.item_name as string } : {}),
+    seasonal: row.seasonal === 1,
+  };
+}
 
 /**
- * Max surveys fetched concurrently during a cold load. Keeps the startup request
- * burst small so a datacenter IP is less likely to be rate-limited by download.bls.gov.
+ * Build the SQLite-backed catalog store. The FTS5 index spans the text columns
+ * the rescorer reads (series id, title, area, item); `survey_abbr`/`seasonal`
+ * are indexed for the structured filters. Exported so tests can seed a store at
+ * the same path/schema the service opens.
  */
-const SURVEY_FETCH_CONCURRENCY = 3;
-
-/** On-disk catalog cache envelope. */
-interface CatalogCache {
-  fetchedAt: number;
-  series: CatalogSeries[];
-  version: number;
+export function createCatalogStore(dbPath: string): MirrorStore {
+  return sqliteMirrorStore({
+    path: dbPath || ':memory:',
+    table: 'bls_catalog',
+    primaryKey: 'series_id',
+    columns: {
+      series_id: 'TEXT',
+      title: 'TEXT',
+      survey_abbr: 'TEXT',
+      area_name: 'TEXT',
+      item_name: 'TEXT',
+      seasonal: 'INTEGER',
+    },
+    fts: ['series_id', 'title', 'area_name', 'item_name'],
+    indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
+  });
 }
 
 export class BlsCatalogService {
-  private index: CatalogSeries[] = [];
+  private readonly store: MirrorStore;
   private loaded = false;
   private loadError: string | undefined;
+  private cachedTotal = 0;
 
   constructor(
     private readonly catalogBaseUrl: string,
     private readonly userAgent: string,
-    private readonly cachePath = '',
+    dbPath = '',
     private readonly cacheTtlHours = 168,
-  ) {}
+    private readonly includeOes = false,
+  ) {
+    this.store = createCatalogStore(dbPath);
+  }
 
   /**
-   * Build the in-memory index: serve a fresh on-disk cache when present, else
-   * fetch all LABSTAT series files (bounded concurrency) and persist the result.
-   * Retries up to `maxAttempts` times with linear backoff (attempt * 5 s).
-   * Sets `loaded = true` after the final attempt regardless of outcome so
-   * callers can distinguish "still loading" from "load failed".
+   * Ensure the on-disk index is present and fresh. Serves an existing index
+   * immediately (queryable during any refresh); harvests when the store is empty
+   * or its last completion is older than the TTL. Retries a fully-empty harvest
+   * up to `maxAttempts` times with linear backoff. Sets `loaded = true` after the
+   * final outcome so callers can distinguish "still loading" from "load failed".
    */
   async load(maxAttempts = 3): Promise<void> {
-    const cached = await this.readCache();
-    if (cached) {
-      this.index = cached;
+    const existing = await this.store.count();
+    if (existing > 0) {
       this.loaded = true;
+      this.cachedTotal = existing;
       this.loadError = undefined;
-      return;
+      const state = await this.store.readState();
+      if (this.isFresh(state.completedAt)) return; // warm + fresh — nothing to do
     }
 
+    let applied = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const all = await this.fetchAllSurveys();
-      if (all.length > 0) {
-        this.index = all;
-        this.loaded = true;
-        this.loadError = undefined;
-        await this.writeCache(all);
-        return;
-      }
+      applied = await this.harvest();
+      if (applied > 0) break;
       if (attempt < maxAttempts) {
         await new Promise<void>((resolve) => setTimeout(resolve, attempt * 5_000));
       }
     }
-    this.loaded = true;
+
+    if (applied > 0) {
+      this.cachedTotal = await this.store.count();
+      this.loaded = true;
+      this.loadError = undefined;
+      await this.store.writeState({
+        status: 'complete',
+        completedAt: new Date().toISOString(),
+        total: this.cachedTotal,
+      });
+      return;
+    }
+
+    if (existing > 0) {
+      // Refresh fetched nothing, but a prior index is still queryable — keep
+      // serving it and retry on the next boot rather than tearing it down.
+      process.stderr.write(
+        '[bls-labor-mcp-server] Catalog refresh fetched no rows — serving the existing index.\n',
+      );
+      return;
+    }
+
+    this.loaded = true; // empty, but "loaded" so search surfaces the empty-catalog error
     this.loadError = `Catalog load failed after ${maxAttempts} attempts — all LABSTAT downloads returned empty.`;
+    await this.store.writeState({ status: 'error', error: this.loadError });
   }
 
-  /** Fetch every survey with bounded concurrency to avoid a large startup burst. */
-  private async fetchAllSurveys(): Promise<CatalogSeries[]> {
-    const all: CatalogSeries[] = [];
-    for (let i = 0; i < SURVEYS.length; i += SURVEY_FETCH_CONCURRENCY) {
-      const batch = SURVEYS.slice(i, i + SURVEY_FETCH_CONCURRENCY);
+  /** True when a completion marker exists and is within the TTL window. */
+  private isFresh(completedAt: string | undefined): boolean {
+    if (!completedAt) return false;
+    const age = Date.now() - Date.parse(completedAt);
+    return Number.isFinite(age) && age <= this.cacheTtlHours * 3_600_000;
+  }
+
+  /**
+   * Fetch every (opted-in) survey with bounded concurrency and upsert the parsed
+   * rows into the store in chunks. Returns the number of rows applied.
+   */
+  private async harvest(): Promise<number> {
+    const surveys = this.includeOes ? SURVEYS : SURVEYS.filter((s) => s.abbr !== OES_SURVEY_ABBR);
+
+    let applied = 0;
+    for (let i = 0; i < surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
+      const batch = surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
       const results = await Promise.allSettled(batch.map((survey) => this.loadSurvey(survey)));
       for (const r of results) {
-        if (r.status === 'fulfilled') all.push(...r.value);
+        if (r.status !== 'fulfilled') continue;
+        for (let j = 0; j < r.value.length; j += UPSERT_CHUNK_SIZE) {
+          const chunk = r.value.slice(j, j + UPSERT_CHUNK_SIZE);
+          await this.store.applyBatch(chunk.map(toRow), []);
+          applied += chunk.length;
+        }
       }
     }
-    return all;
-  }
-
-  /** Read the persisted catalog when present, valid, and within the TTL window. */
-  private async readCache(): Promise<CatalogSeries[] | undefined> {
-    if (!this.cachePath) return;
-    try {
-      const parsed = JSON.parse(await readFile(this.cachePath, 'utf8')) as Partial<CatalogCache>;
-      if (
-        parsed.version !== CATALOG_CACHE_VERSION ||
-        typeof parsed.fetchedAt !== 'number' ||
-        !Array.isArray(parsed.series) ||
-        parsed.series.length === 0
-      ) {
-        return;
-      }
-      if (Date.now() - parsed.fetchedAt > this.cacheTtlHours * 3_600_000) return;
-      return parsed.series;
-    } catch {
-      return; // missing or corrupt cache → fetch live
-    }
-  }
-
-  /** Persist the parsed catalog so the next boot can skip the live fetch. */
-  private async writeCache(series: CatalogSeries[]): Promise<void> {
-    if (!this.cachePath) return;
-    try {
-      await mkdir(dirname(this.cachePath), { recursive: true });
-      const payload: CatalogCache = {
-        version: CATALOG_CACHE_VERSION,
-        fetchedAt: Date.now(),
-        series,
-      };
-      await writeFile(this.cachePath, JSON.stringify(payload), 'utf8');
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      process.stderr.write(
-        `[bls-labor-mcp-server] Catalog cache write failed (${this.cachePath}): ${msg}\n`,
-      );
-    }
+    return applied;
   }
 
   private async loadSurvey(survey: SurveyDefinition): Promise<CatalogSeries[]> {
@@ -321,7 +373,12 @@ export class BlsCatalogService {
     return parseSeries(seriesText, abbr.toUpperCase(), survey.name, areaCodes, itemCodes);
   }
 
-  search(input: CatalogSearchInput): CatalogSearchResult {
+  /**
+   * Search the catalog. Narrows the on-disk index with an FTS5 candidate query
+   * (plus a direct primary-key lookup so an exact SeriesID always surfaces), then
+   * applies the bespoke relevance score over the small candidate set.
+   */
+  async search(input: CatalogSearchInput): Promise<CatalogSearchResult> {
     if (!this.loaded) {
       throw internalError(
         `Catalog index not loaded — server startup may have failed. ${this.loadError ?? ''}`.trim(),
@@ -335,23 +392,42 @@ export class BlsCatalogService {
     const areaFilter = input.area?.toLowerCase();
     const seasonFilter = input.seasonal_adjustment;
 
-    let candidates = this.index;
+    // Candidate set: an exact-id lookup (guarantees the precise SeriesID is in
+    // play) unioned with the FTS5 matches, deduped by series id.
+    const candidates = new Map<string, CatalogSeries>();
 
-    if (surveyFilter) {
-      candidates = candidates.filter((s) => s.surveyAbbr.toUpperCase() === surveyFilter);
-    }
-    if (typeof seasonFilter === 'boolean') {
-      candidates = candidates.filter((s) => s.seasonal === seasonFilter);
+    const exact = await this.store.getByIds([input.query.trim().toUpperCase()]);
+    for (const row of exact) candidates.set(row.series_id as string, toCatalog(row));
+
+    const tokens = query.match(/[a-z0-9]+/gi) ?? [];
+    if (tokens.length > 0) {
+      const match = tokens.map((t) => `"${t.toLowerCase()}"*`).join(' OR ');
+      const filters = [];
+      if (surveyFilter)
+        filters.push({ column: 'survey_abbr', op: 'eq' as const, value: surveyFilter });
+      if (typeof seasonFilter === 'boolean') {
+        filters.push({ column: 'seasonal', op: 'eq' as const, value: seasonFilter ? 1 : 0 });
+      }
+      const { rows } = await this.store.query({
+        match,
+        filters,
+        sort: 'relevance',
+        limit: CANDIDATE_LIMIT,
+        offset: 0,
+      });
+      for (const row of rows) candidates.set(row.series_id as string, toCatalog(row));
     }
 
     // Score each candidate. Exact series ID match = highest priority.
     const scored: Array<{ s: CatalogSeries; score: number }> = [];
-    for (const s of candidates) {
+    for (const s of candidates.values()) {
+      if (surveyFilter && s.surveyAbbr.toUpperCase() !== surveyFilter) continue;
+      if (typeof seasonFilter === 'boolean' && s.seasonal !== seasonFilter) continue;
+
       if (s.seriesId.toUpperCase() === queryUpper) {
         scored.push({ s, score: 1000 });
         continue;
       }
-      // Common series boost
       const commonText = COMMON_SERIES[s.seriesId];
       const isCommon = commonText !== undefined;
 
@@ -378,12 +454,12 @@ export class BlsCatalogService {
       if (commonText?.includes(query)) score += 15;
 
       // Token-level match
-      const tokens = query.split(/\s+/).filter(Boolean);
       for (const token of tokens) {
-        if (titleLower.includes(token)) score += 2;
-        if (areaLower.includes(token)) score += 1;
-        if (itemLower.includes(token)) score += 1;
-        if (s.seriesId.toLowerCase().includes(token)) score += 3;
+        const t = token.toLowerCase();
+        if (titleLower.includes(t)) score += 2;
+        if (areaLower.includes(t)) score += 1;
+        if (itemLower.includes(t)) score += 1;
+        if (s.seriesId.toLowerCase().includes(t)) score += 3;
       }
 
       if (score === 0) continue;
@@ -397,12 +473,23 @@ export class BlsCatalogService {
     return { series, total };
   }
 
+  /**
+   * Look up catalog metadata for a set of SeriesIDs in one query. Used to hydrate
+   * titles/area/item onto mirror-sourced observations. Returns a map keyed by
+   * SeriesID; ids absent from the catalog are simply omitted.
+   */
+  async lookupByIds(ids: string[]): Promise<Map<string, CatalogSeries>> {
+    if (!this.loaded || ids.length === 0) return new Map();
+    const rows = await this.store.getByIds(ids);
+    return new Map(rows.map((row) => [row.series_id as string, toCatalog(row)]));
+  }
+
   get isLoaded(): boolean {
     return this.loaded;
   }
 
   get totalSeries(): number {
-    return this.index.length;
+    return this.cachedTotal;
   }
 
   get catalogLoadError(): string | undefined {
@@ -413,12 +500,14 @@ export class BlsCatalogService {
 let _service: BlsCatalogService | undefined;
 
 export function initBlsCatalogService(_config: AppConfig, _storage: StorageService): void {
-  const { catalogBaseUrl, userAgent, catalogCachePath, catalogCacheTtlHours } = getServerConfig();
+  const { catalogBaseUrl, userAgent, catalogDbPath, catalogCacheTtlHours, catalogIncludeOes } =
+    getServerConfig();
   _service = new BlsCatalogService(
     catalogBaseUrl,
     userAgent,
-    catalogCachePath,
+    catalogDbPath,
     catalogCacheTtlHours,
+    catalogIncludeOes,
   );
 }
 

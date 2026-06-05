@@ -25,11 +25,11 @@ const ServerConfigSchema = z.object({
     .url()
     .default('https://download.bls.gov/pub/time.series')
     .describe('LABSTAT flat-file base URL — override to point at a local mirror'),
-  catalogCachePath: z
+  catalogDbPath: z
     .string()
-    .default('.cache/bls-catalog.json')
+    .default('.cache/bls-catalog.db')
     .describe(
-      'Filesystem path where the parsed catalog index is persisted so it survives restarts. Empty disables caching (re-fetch every boot). In containers, mount a volume here to survive image updates.',
+      'Filesystem path for the on-disk SQLite catalog index. Persists across restarts and is queried on demand — the index is not held in memory. Empty uses an in-memory database (re-harvested every boot). In containers, mount a volume here to survive image updates.',
     ),
   catalogCacheTtlHours: z.coerce
     .number()
@@ -37,15 +37,20 @@ const ServerConfigSchema = z.object({
     .positive()
     .default(168)
     .describe(
-      'Catalog cache freshness window in hours — re-fetch live once the cache is older (default 168 h / 7 days; the LABSTAT catalog changes slowly).',
+      'Catalog freshness window in hours — re-harvest into the SQLite index once its last completion is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). The existing index stays queryable throughout a refresh.',
+    ),
+  catalogIncludeOes: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true')
+    .describe(
+      'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.2 GB (32× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index. OES series stay fetchable by ID via bls_get_series when off.',
     ),
   userAgent: z
     .string()
-    .default(
-      'cyanheads-bls-mcp/1.0 (https://github.com/cyanheads/bls-labor-mcp-server; casey@caseyjhand.com)',
-    )
+    .default('cyanheads-bls-mcp/1.0 (casey@caseyjhand.com)')
     .describe(
-      'User-Agent sent on all HTTP requests — BLS data-access policy requires a descriptive UA with contact',
+      'User-Agent sent on all HTTP requests. BLS data-access policy requires a descriptive UA with a contact; download.bls.gov (Akamai) rejects any UA containing a URL, so use a name + contact email only — no https:// link.',
     ),
   datasetTtlSeconds: z.coerce
     .number()
@@ -97,8 +102,9 @@ export function getServerConfig(): ServerConfig {
     apiKey: 'BLS_API_KEY',
     baseUrl: 'BLS_BASE_URL',
     catalogBaseUrl: 'BLS_CATALOG_BASE_URL',
-    catalogCachePath: 'BLS_CATALOG_CACHE_PATH',
+    catalogDbPath: 'BLS_CATALOG_DB_PATH',
     catalogCacheTtlHours: 'BLS_CATALOG_CACHE_TTL_HOURS',
+    catalogIncludeOes: 'BLS_CATALOG_INCLUDE_OES',
     datasetTtlSeconds: 'BLS_DATASET_TTL_SECONDS',
     dataframeDropEnabled: 'BLS_DATAFRAME_DROP_ENABLED',
     userAgent: 'BLS_USER_AGENT',

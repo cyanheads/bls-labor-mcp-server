@@ -112,7 +112,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       ),
   },
 
-  handler(input, ctx) {
+  async handler(input, ctx) {
     ctx.log.info('Executing bls_search_series', {
       query: input.query,
       survey: input.survey,
@@ -136,7 +136,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       );
     }
 
-    const result = service.search({
+    const result = await service.search({
       query: input.query,
       survey: input.survey,
       area: input.area,

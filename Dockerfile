@@ -78,6 +78,14 @@ COPY --from=build /usr/src/app/dist ./dist
 # Create and set permissions for the log directory, assigning ownership to the 'bun' user.
 RUN mkdir -p /var/log/bls-labor-mcp-server && chown -R bun:bun /var/log/bls-labor-mcp-server
 
+# Create writable data directories owned by the non-root 'bun' user: the on-disk
+# SQLite catalog index (.cache, always on) and the optional observations mirror
+# (.mirror). Without these the server (uid 1000) cannot create them under the
+# root-owned WORKDIR and the catalog fails to open. Mount a volume over either
+# path in production to persist across image updates.
+RUN mkdir -p /usr/src/app/.cache /usr/src/app/.mirror \
+  && chown -R bun:bun /usr/src/app/.cache /usr/src/app/.mirror
+
 # Switch to the non-root user
 USER bun
 
