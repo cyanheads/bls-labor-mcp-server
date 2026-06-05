@@ -38,7 +38,7 @@ const ObservationSchema = z.object({
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    'Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change + percent change together — not individually; not all surveys support it, check bls_list_surveys first). When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.',
+    'Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports — CPI and PPI return percent change only, the inflation rate — so check bls_list_surveys first). When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.',
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -113,7 +113,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'When true, request BLS-computed net change and percent change together (cannot request one independently). Not all surveys support this — check bls_list_surveys first. The API returns an error if requested for an unsupported survey.',
+        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports: CPI and PPI return percent change only (the inflation rate), with no error. Only surveys that support neither net nor percent change (e.g. AP average price data) return an error — check bls_list_surveys first.',
       ),
   }),
 

@@ -102,6 +102,40 @@ describe('blsGetSeriesTool', () => {
     );
   });
 
+  it('returns percent-change-only calculations without error for partially-supported surveys (#37)', async () => {
+    // CPI (survey CU) has allowsNetChange:false, allowsPercentChange:true — the API
+    // returns only the percent-change fields, gracefully, with no error.
+    const pctOnly: SeriesData = {
+      seriesId: 'CUUR0000SA0',
+      title: 'CPI-U All Items',
+      observations: [
+        {
+          year: '2026',
+          period: 'M04',
+          periodName: 'April',
+          value: '333.0',
+          pctChange1Month: '0.2',
+          pctChange12Month: '3.8',
+        },
+      ],
+    };
+    fetchSeriesMock.mockResolvedValue([pctOnly]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['CUUR0000SA0'],
+      calculations: true,
+    });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+
+    const obs = result.series[0]!.observations[0]!;
+    expect(obs.pctChange1Month).toBe('0.2');
+    expect(obs.pctChange12Month).toBe('3.8');
+    expect(obs.netChange1Month).toBeUndefined();
+    expect(obs.netChange12Month).toBeUndefined();
+    expect(getEnrichment(ctx).calculationsApplied).toBe(true);
+  });
+
   it('handles sparse upstream payload — series with no observations', async () => {
     const sparse: SeriesData = { seriesId: 'SPARSE000', observations: [] };
     fetchSeriesMock.mockResolvedValue([sparse]);
