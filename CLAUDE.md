@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** bls-labor-mcp-server
-**Version:** 0.4.1
+**Version:** 0.4.2
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.21`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **Zod:** ^4.4.3
@@ -38,7 +38,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 **API constraints to keep in mind:**
 - 500 queries/day per `BLS_API_KEY`. `bls_get_series` (batch POST) counts as one query regardless of series count. `bls_get_latest` issues one GET per SeriesID — each counts as one query.
 - 50 series per `bls_get_series` request; 20-year history window per request.
-- `calculations: true` enables BLS-server-side net change and percent change together (all-or-nothing, not all surveys support it).
+- `calculations: true` requests BLS-server-side net change and percent change; a survey returns whichever it supports (CPI/PPI return percent change only). Only surveys supporting neither return an error — check `bls_list_surveys`.
 
 **Catalog search is offline.** `bls_search_series` operates against LABSTAT flat files bundled at build time — no API quota consumed. The BLS FAQ confirms there is no API catalog endpoint.
 

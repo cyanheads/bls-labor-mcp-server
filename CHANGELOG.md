@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-06-04
+
+bls_search_series: headline series union fix, concept/synonym resolution
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-06-04
 
 Catalog SQLite index, bls_search_series restored, OES gate

@@ -234,6 +234,109 @@ describe('BlsCatalogService.search', () => {
     });
     expect(result.series[0]!.seriesId).toBe('LNS14000000');
   });
+
+  it('surfaces a headline common series dropped by the FTS candidate cap (#35 regression)', async () => {
+    // 1001 decoys match all three query terms and outrank the single-term headline
+    // series on bm25, filling the entire CANDIDATE_LIMIT (1000) window. Without the
+    // common-series union the headline CPI never reaches the bespoke rescore.
+    const decoys: CatalogSeries[] = Array.from({ length: 1001 }, (_, i) => ({
+      seriesId: `DECOY${String(i).padStart(5, '0')}`,
+      title: `Consumer price index component ${i}`,
+      surveyAbbr: 'XX',
+      seasonal: false,
+    }));
+    const headline: CatalogSeries = {
+      seriesId: 'CUUR0000SA0',
+      title: 'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+      surveyAbbr: 'CU',
+      seasonal: false,
+      itemName: 'All items',
+    };
+    const svc = await seedAndLoad([...decoys, headline]);
+    const result = await svc.search({
+      query: 'consumer price index',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.series[0]!.seriesId).toBe('CUUR0000SA0');
+  });
+
+  it('does not surface common series for an unrelated query, despite the union (#6 guard)', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNS14000000',
+        title: 'Unemployment Rate Seasonally Adjusted',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+      {
+        seriesId: 'TEST_BANANA_01',
+        title: 'Banana retail price',
+        surveyAbbr: 'AP',
+        seasonal: false,
+      },
+    ]);
+    const result = await svc.search({
+      query: 'banana',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.series.some((s) => s.seriesId === 'LNS14000000')).toBe(false);
+  });
+
+  it('resolves a concept synonym (inflation) to its survey headline via the alias map (#36)', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'CUUR0000SA0',
+        title: 'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+        surveyAbbr: 'CU',
+        seasonal: false,
+      },
+      {
+        seriesId: 'TEST_WAGE_01',
+        title: 'Average hourly earnings, total private',
+        surveyAbbr: 'CE',
+        seasonal: true,
+      },
+    ]);
+    const result = await svc.search({
+      query: 'inflation',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.series[0]!.seriesId).toBe('CUUR0000SA0');
+  });
+
+  it('ranks the on-topic survey above wrong-domain token matches (producer price index, #36)', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'WPUFD49104',
+        title: 'PPI Commodity data for final demand - finished goods, not seasonally adjusted',
+        surveyAbbr: 'WP',
+        seasonal: false,
+      },
+      {
+        seriesId: 'TEST_OCC_01',
+        title: 'Producers and directors',
+        surveyAbbr: 'OE',
+        seasonal: false,
+      },
+    ]);
+    const result = await svc.search({
+      query: 'producer price index',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.series[0]!.seriesId).toBe('WPUFD49104');
+  });
 });
 
 describe('BlsCatalogService state', () => {

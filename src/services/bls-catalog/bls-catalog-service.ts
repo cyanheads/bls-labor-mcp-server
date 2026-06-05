@@ -91,6 +91,28 @@ const COMMON_SERIES: Record<string, string> = {
   LNS12000000: 'civilian employment level',
 };
 
+/**
+ * Concept/synonym → survey code(s). Canonical economic vocabulary often names a
+ * survey by a word its series titles never contain (BLS titles never say
+ * "inflation"; PPI series don't contain "producer price index") and the survey's
+ * own name isn't in the per-series FTS text. When a query contains one of these
+ * phrases, the matching surveys' candidates get a relevance boost in the rescore —
+ * combined with the always-unioned COMMON_SERIES, this floats the headline series
+ * to the top. Codes are uppercase to match the stored `survey_abbr`.
+ */
+const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: readonly string[] }> = [
+  { phrases: ['inflation', 'cost of living', 'consumer price', 'cpi'], surveys: ['CU'] },
+  { phrases: ['producer price', 'wholesale price', 'ppi'], surveys: ['WP', 'PC'] },
+  { phrases: ['jobs', 'job growth', 'payroll', 'nonfarm', 'wage', 'earnings'], surveys: ['CE'] },
+  { phrases: ['job opening', 'labor turnover', 'job vacanc', 'quits', 'jolts'], surveys: ['JT'] },
+  { phrases: ['unemployment', 'jobless', 'labor force participation'], surveys: ['LN'] },
+  { phrases: ['productivity', 'output per hour'], surveys: ['PR', 'MP'] },
+  { phrases: ['compensation', 'employer cost'], surveys: ['EC'] },
+];
+
+/** Relevance boost for a candidate whose survey matches a query concept alias. */
+const ALIAS_SURVEY_BOOST = 6;
+
 /** Column indices in a `.series` tab-delimited file. Varies by survey — we try all fallbacks. */
 interface SeriesColumns {
   areaCode?: number;
@@ -392,12 +414,31 @@ export class BlsCatalogService {
     const areaFilter = input.area?.toLowerCase();
     const seasonFilter = input.seasonal_adjustment;
 
+    // Concept/synonym resolution: surveys whose canonical vocabulary the query
+    // names but whose series titles never contain (e.g. "inflation" → CU). Their
+    // candidates get a relevance boost in the rescore below.
+    const aliasSurveys = new Set<string>();
+    for (const alias of CONCEPT_ALIASES) {
+      if (alias.phrases.some((p) => query.includes(p))) {
+        for (const s of alias.surveys) aliasSurveys.add(s);
+      }
+    }
+
     // Candidate set: an exact-id lookup (guarantees the precise SeriesID is in
     // play) unioned with the FTS5 matches, deduped by series id.
     const candidates = new Map<string, CatalogSeries>();
 
     const exact = await this.store.getByIds([input.query.trim().toUpperCase()]);
     for (const row of exact) candidates.set(row.series_id as string, toCatalog(row));
+
+    // Headline common series are always candidates, independent of the FTS cap.
+    // The bm25 pre-filter (CANDIDATE_LIMIT) can drop a headline series that matches
+    // only one broad query term before the rescore's common-series boost can float
+    // it up; unioning them in (mirroring the exact-id lookup above) restores it. The
+    // `score === 0` gate below still excludes them from unrelated queries, so this
+    // does not resurface them as false positives.
+    const common = await this.store.getByIds(Object.keys(COMMON_SERIES));
+    for (const row of common) candidates.set(row.series_id as string, toCatalog(row));
 
     const tokens = query.match(/[a-z0-9]+/gi) ?? [];
     if (tokens.length > 0) {
@@ -460,6 +501,10 @@ export class BlsCatalogService {
         if (areaLower.includes(t)) score += 1;
         if (itemLower.includes(t)) score += 1;
         if (s.seriesId.toLowerCase().includes(t)) score += 3;
+      }
+
+      if (aliasSurveys.size > 0 && aliasSurveys.has(s.surveyAbbr.toUpperCase())) {
+        score += ALIAS_SURVEY_BOOST;
       }
 
       if (score === 0) continue;
