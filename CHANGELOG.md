@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-06-04
+
+Observation mirror, catalog cache, request echoes
+
 ## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-06-04
 
 bls_get_latest result ordering fix, series_not_found contract correction, bls_list_surveys error contracts

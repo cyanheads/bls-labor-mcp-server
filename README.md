@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -136,6 +136,8 @@ BLS-specific:
 - Typed error contracts for BLS-specific failure modes: quota exhaustion, locked database, calculations not supported
 - Period-over-period calculations via BLS server-side flag (consistent with BLS published numbers)
 - DataCanvas spillover (DuckDB) for large multi-series result sets — SQL access without re-querying the API
+- Optional local observation mirror — sync LABSTAT bulk data into an embedded SQLite store to serve `bls_get_series` / `bls_get_latest` without the 500/day API cap (opt-in, off by default)
+- Persistent catalog cache — the parsed series catalog survives restarts, so a transient `download.bls.gov` block at boot no longer breaks search
 
 ## Getting started
 
@@ -239,6 +241,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `BLS_API_KEY` | BLS v2 API key. Optional — 25 req/day without, 500 req/day with. Register free at [bls.gov/developers](https://www.bls.gov/developers/home.htm). | — |
 | `BLS_BASE_URL` | BLS API v2 base URL. | `https://api.bls.gov/publicAPI/v2` |
 | `BLS_CATALOG_BASE_URL` | LABSTAT flat-file base URL. Override to point at a local mirror. | `https://download.bls.gov/pub/time.series` |
+| `BLS_CATALOG_CACHE_PATH` | Path where the parsed catalog is persisted so it survives restarts. Empty disables caching. | `.cache/bls-catalog.json` |
+| `BLS_OBSERVATIONS_MIRROR_ENABLED` | Serve observations from a local SQLite mirror instead of the live API (requires a one-time bootstrap — see below). | `false` |
 | `BLS_DATASET_TTL_SECONDS` | Per-dataframe TTL for canvas-registered tables, in seconds. | `86400` (24 h) |
 | `BLS_DATAFRAME_DROP_ENABLED` | Expose `bls_dataframe_drop`. TTL handles cleanup by default. | `false` |
 | `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas tabular spillover for large result sets. | `none` |
@@ -250,6 +254,19 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation. | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
+
+### Observation mirror (optional)
+
+For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls_get_latest` from an embedded SQLite store instead of the BLS API — eliminating the 500/day quota cap. It is off by default. To enable:
+
+1. Set `BLS_OBSERVATIONS_MIRROR_ENABLED=true` (and review the `BLS_OBSERVATIONS_MIRROR_*` vars in [`.env.example`](./.env.example)).
+2. Run the one-time bootstrap out-of-band — it downloads the full LABSTAT observation set and can take a while:
+
+   ```sh
+   node dist/services/bls-observations/subprocess.js --init
+   ```
+
+Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
 
 ## Running the server
 
@@ -293,6 +310,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/services/bls-api` | BLS API v2 service — batch fetch, latest-value GET, surveys metadata. |
 | `src/services/bls-catalog` | LABSTAT flat-file catalog — offline series index and search. |
+| `src/services/bls-observations` | Optional LABSTAT observation mirror — embedded SQLite store, ingester, and refresh subprocess. |
 | `src/services/canvas-bridge` | DataCanvas bridge — dataframe registration, SQL gate, lifecycle management. |
 | `docs/design.md` | Full tool surface specification, service architecture, and error contracts. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

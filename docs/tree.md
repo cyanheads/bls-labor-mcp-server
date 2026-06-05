@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-06-02 13:39:36
+Generated on: 2026-06-05 02:43:22
 
 ```text
 bls-labor-mcp-server/
@@ -22,6 +22,7 @@ bls-labor-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -146,6 +147,11 @@ bls-labor-mcp-server/
 │   │   ├── bls-catalog/
 │   │   │   ├── bls-catalog-service.ts
 │   │   │   └── types.ts
+│   │   ├── bls-observations/
+│   │   │   ├── bls-observations-service.ts
+│   │   │   ├── ingester.ts
+│   │   │   ├── subprocess.ts
+│   │   │   └── types.ts
 │   │   └── canvas-bridge/
 │   │       ├── canvas-bridge.ts
 │   │       └── sql-gate-extras.ts
@@ -158,6 +164,10 @@ bls-labor-mcp-server/
 │   │   │   └── bls-api-service.test.ts
 │   │   ├── bls-catalog/
 │   │   │   └── bls-catalog-service.test.ts
+│   │   ├── bls-observations/
+│   │   │   ├── bls-observations-routing.test.ts
+│   │   │   ├── ingester.test.ts
+│   │   │   └── subprocess.test.ts
 │   │   └── canvas-bridge/
 │   │       └── sql-gate-extras.test.ts
 │   └── tools/

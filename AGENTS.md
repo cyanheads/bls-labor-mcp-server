@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** bls-labor-mcp-server
-**Version:** 0.3.1
+**Version:** 0.4.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.21`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **Zod:** ^4.4.3
@@ -218,8 +218,13 @@ src/
       bls-api-service.ts                # BLS API v2 service (batch fetch, latest, surveys)
       types.ts                          # BLS API types
     bls-catalog/
-      bls-catalog-service.ts            # LABSTAT flat-file catalog (offline search)
+      bls-catalog-service.ts            # LABSTAT flat-file catalog (offline search + on-disk cache)
       types.ts                          # Catalog domain types
+    bls-observations/                   # Optional observation mirror (opt-in, default off)
+      bls-observations-service.ts       # defineMirror wrapper — SQLite store + query
+      ingester.ts                       # LABSTAT .data.* sync generator
+      subprocess.ts                     # Event-loop-safe harvest subprocess (dual-role entry)
+      types.ts                          # Observation row types
     canvas-bridge/
       canvas-bridge.ts                  # DataCanvas bridge (dataframe registration, SQL gate, lifecycle)
       sql-gate-extras.ts                # Bridge-layer SQL denial rules (system catalogs, DDL)

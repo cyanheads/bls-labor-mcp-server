@@ -60,6 +60,7 @@ The core UX problem is SeriesID resolution: BLS identifiers (`LNS14000000`, `CES
 |:--------|:------|:--------|
 | `BlsApiService` | BLS API v2 (`POST /timeseries/data`, `GET /timeseries/data/{id}?latest=true`, `GET /surveys`, `GET /surveys/{abbr}`) | `bls_get_series`, `bls_get_latest`, `bls_list_surveys` |
 | `BlsCatalogService` | LABSTAT flat files (`{survey}.series` + map files from `download.bls.gov/pub/time.series/`) | `bls_search_series` |
+| `BlsObservationsService` | Optional LABSTAT observation mirror (`{survey}.data.*` → embedded SQLite via framework `defineMirror`); opt-in, default off | `bls_get_series`, `bls_get_latest` (when `BLS_OBSERVATIONS_MIRROR_ENABLED=true` and the mirror is ready) |
 | `CanvasBridgeService` | Framework `DataCanvas` — `df_<id>` minting, all-nullable schema derivation, per-table TTL bookkeeping, bridge-layer system-catalog SQL denial | `bls_get_series` (register on spillover), `bls_dataframe_describe`, `bls_dataframe_query`, `bls_dataframe_drop` |
 
 **`BlsApiService` resilience:**
@@ -71,7 +72,7 @@ The core UX problem is SeriesID resolution: BLS identifiers (`LNS14000000`, `CES
 | 429 handling | Count against daily quota; surface remaining quota estimate in response metadata |
 | Parse failure | HTML error page detection → `ServiceUnavailable`, not `SerializationError` |
 
-**`BlsCatalogService`:** BLS LABSTAT publishes per-survey flat files at `download.bls.gov/pub/time.series/{survey}/`. The relevant files are `{survey}.series` (series-level index: seriesID, title, area, item, seasonal flag) and the survey's code-mapping files (e.g., `cu.area`, `cu.item`). The `{survey}.data.*` observation files are NOT needed and can be hundreds of MB — skip them. Download series + map files at build time; load into memory at startup. Enables full-text + structured search with zero API quota cost. Rebuild on a monthly schedule or on demand. The BLS FAQ explicitly notes there is no API catalog endpoint ("We do not currently have a catalogue of series IDs"), confirming the offline approach is the only path.
+**`BlsCatalogService`:** BLS LABSTAT publishes per-survey flat files at `download.bls.gov/pub/time.series/{survey}/`. The relevant files are `{survey}.series` (series-level index: seriesID, title, area, item, seasonal flag) and the survey's code-mapping files (e.g., `cu.area`, `cu.item`). The catalog index needs only `{survey}.series` + the code-map files — not the hundreds-of-MB `{survey}.data.*` observation files (those are ingested separately by the optional `BlsObservationsService` mirror, off by default). Series + map files are fetched and indexed in memory at startup, and persisted to an on-disk cache (`BLS_CATALOG_CACHE_PATH`) so the index survives restarts. Enables full-text + structured search with zero API quota cost. Rebuild on a monthly schedule or on demand. The BLS FAQ explicitly notes there is no API catalog endpoint ("We do not currently have a catalogue of series IDs"), confirming the offline approach is the only path.
 
 **`bls_list_surveys` backed by API:** `GET /surveys` returns all survey abbreviations and names; `GET /surveys/{abbr}` returns `allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`. This is a low-frequency call and can be cached aggressively (monthly TTL); it does not count toward the 500/day quota concern.
 
@@ -84,6 +85,12 @@ The core UX problem is SeriesID resolution: BLS identifiers (`LNS14000000`, `CES
 | `BLS_API_KEY` | Yes | BLS v2 API key (free, register at bls.gov/developers) |
 | `BLS_BASE_URL` | No | Override API base URL (default: `https://api.bls.gov/publicAPI/v2`) |
 | `BLS_CATALOG_BASE_URL` | No | Override LABSTAT flat-file base URL (default: `https://download.bls.gov/pub/time.series`) — useful for pointing at a local mirror |
+| `BLS_CATALOG_CACHE_PATH` | No | Path to persist the parsed catalog across restarts; empty disables. Default `.cache/bls-catalog.json`. |
+| `BLS_CATALOG_CACHE_TTL_HOURS` | No | Catalog cache freshness window in hours. Default `168` (7 days). |
+| `BLS_OBSERVATIONS_MIRROR_ENABLED` | No | Serve observations from the local SQLite mirror instead of the live API. Default `false`. Requires a one-time bootstrap. |
+| `BLS_OBSERVATIONS_MIRROR_PATH` | No | SQLite store path for the observation mirror. Default `.mirror/bls-observations.db`. |
+| `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` | No | Incremental refresh schedule (HTTP transport only). Default `0 6 * * 1` (Mon 06:00 UTC). |
+| `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE` | No | Fall back to the live API when the mirror is not ready or a series is missing. Default `true`. |
 | `CANVAS_PROVIDER_TYPE` | No | Set to `duckdb` to enable DataCanvas tabular spillover and dataframe tools (Node only; Cloudflare Workers fail closed). Default `none`. |
 | `BLS_DATASET_TTL_SECONDS` | No | Per-table TTL for canvas-registered dataframes. Sliding window touched on every dataframe op. Default `86400` (24 h). |
 | `BLS_DATAFRAME_DROP_ENABLED` | No | Set to `true` to expose `bls_dataframe_drop`. Off by default — TTL handles cleanup. |
