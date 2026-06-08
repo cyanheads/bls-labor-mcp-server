@@ -440,6 +440,7 @@ export class BlsCatalogService {
     const common = await this.store.getByIds(Object.keys(COMMON_SERIES));
     for (const row of common) candidates.set(row.series_id as string, toCatalog(row));
 
+    let ftsCapped = false;
     const tokens = query.match(/[a-z0-9]+/gi) ?? [];
     if (tokens.length > 0) {
       const match = tokens.map((t) => `"${t.toLowerCase()}"*`).join(' OR ');
@@ -456,6 +457,9 @@ export class BlsCatalogService {
         limit: CANDIDATE_LIMIT,
         offset: 0,
       });
+      // If the FTS query returned exactly CANDIDATE_LIMIT rows the full index likely
+      // has more matches — total will be a lower bound.
+      ftsCapped = rows.length >= CANDIDATE_LIMIT;
       for (const row of rows) candidates.set(row.series_id as string, toCatalog(row));
     }
 
@@ -515,7 +519,7 @@ export class BlsCatalogService {
     scored.sort((a, b) => b.score - a.score);
     const total = scored.length;
     const series = scored.slice(0, input.limit).map((x) => x.s);
-    return { series, total };
+    return { series, total, capped: ftsCapped };
   }
 
   /**

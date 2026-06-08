@@ -168,6 +168,39 @@ describe('BlsCatalogService.search', () => {
     expect(result.total).toBe(0);
   });
 
+  it('returns capped=false when fewer than CANDIDATE_LIMIT rows match', async () => {
+    const svc = await seedAndLoad(FIXTURES);
+    const result = await svc.search({
+      query: 'unemployment',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    // FIXTURES has only 3 entries — cannot hit the 1000-row FTS cap.
+    expect(result.capped).toBe(false);
+  });
+
+  it('returns capped=true when the FTS query fills the CANDIDATE_LIMIT bucket (#40)', async () => {
+    // Build exactly CANDIDATE_LIMIT (1000) + 1 entries that all match "series data" so
+    // the FTS query returns 1000 rows and the service sets capped=true.
+    const many: CatalogSeries[] = Array.from({ length: 1001 }, (_, i) => ({
+      seriesId: `CAPTEST${String(i).padStart(5, '0')}`,
+      title: `Series ${i} data`,
+      surveyAbbr: 'LN',
+      seasonal: true,
+    }));
+    const svc = await seedAndLoad(many);
+    const result = await svc.search({
+      query: 'series data',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+    });
+    expect(result.capped).toBe(true);
+  });
+
   it('filters by area name', async () => {
     const svc = await seedAndLoad(FIXTURES);
     const result = await svc.search({

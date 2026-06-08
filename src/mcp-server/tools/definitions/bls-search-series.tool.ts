@@ -70,9 +70,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
               .describe('BLS SeriesID — pass to bls_get_series or bls_get_latest to fetch data.'),
             title: z.string().describe('Plain-language series name.'),
             survey: z.string().describe('Survey abbreviation (e.g. CU, CE, LN).'),
-            areaName: z.string().optional().describe('Geographic area name, when decoded.'),
-            itemName: z.string().optional().describe('Item or subject name, when decoded.'),
-            seasonal: z.boolean().describe('True when seasonally adjusted.'),
+            area: z.string().optional().describe('Geographic area name, when decoded.'),
+            item: z.string().optional().describe('Item or subject name, when decoded.'),
+            seasonal: z
+              .string()
+              .describe(
+                'Seasonality descriptor matching the data-tool form: "Seasonally Adjusted" or "Not Seasonally Adjusted".',
+              ),
           })
           .describe('A matching BLS series entry.'),
       )
@@ -80,7 +84,16 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
   }),
 
   enrichment: {
-    totalFound: z.number().describe('Total matches in the catalog before the limit was applied.'),
+    totalFound: z
+      .number()
+      .describe(
+        'Total candidates scored before the limit was applied. A lower bound when capped is true — the catalog index may contain more matching series.',
+      ),
+    capped: z
+      .boolean()
+      .describe(
+        'True when the FTS candidate pool reached the internal cap (~1000). totalFound is then a lower bound, not an exact match count. Narrow the query, add survey/area filters, or use a direct SeriesID to get an exact count.',
+      ),
     catalogSize: z
       .number()
       .describe(
@@ -146,6 +159,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
 
     ctx.enrich({
       totalFound: result.total,
+      capped: result.capped,
       catalogSize: service.totalSeries,
       limitApplied: input.limit,
       ...(input.survey !== undefined && { surveyFilter: input.survey }),
@@ -172,9 +186,9 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
         seriesId: s.seriesId,
         title: s.title,
         survey: s.surveyAbbr,
-        ...(s.areaName ? { areaName: s.areaName } : {}),
-        ...(s.itemName ? { itemName: s.itemName } : {}),
-        seasonal: s.seasonal,
+        ...(s.areaName ? { area: s.areaName } : {}),
+        ...(s.itemName ? { item: s.itemName } : {}),
+        seasonal: s.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted',
       })),
     };
   },
@@ -187,11 +201,11 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     for (const s of result.series) {
       const parts: string[] = [`**${s.seriesId}**`];
       parts.push(`— ${s.title}`);
-      if (s.areaName) parts.push(`· ${s.areaName}`);
-      parts.push(s.seasonal ? '(seasonal adj.)' : '(not seasonal adj.)');
+      if (s.area) parts.push(`· ${s.area}`);
+      if (s.seasonal) parts.push(`(${s.seasonal})`);
       parts.push(`[${s.survey}]`);
       lines.push(parts.join(' '));
-      if (s.itemName) lines.push(`  _${s.itemName}_`);
+      if (s.item) lines.push(`  _${s.item}_`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },
