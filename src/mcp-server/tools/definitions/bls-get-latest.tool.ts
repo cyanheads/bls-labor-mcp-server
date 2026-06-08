@@ -67,13 +67,13 @@ export const blsGetLatestTool = tool('bls_get_latest', {
               .string()
               .optional()
               .describe('Seasonality indicator when returned by the API.'),
-            latestObservation: ObservationSchema.optional().describe(
-              'Most recent observation. Absent when the series returned no data.',
-            ),
+            latestObservation: ObservationSchema.optional().describe('Most recent observation.'),
           })
           .describe('Latest observation result for one BLS series.'),
       )
-      .describe('Latest observation for each requested series, in request order.'),
+      .describe(
+        'Successfully fetched series with their latest observations. Series that failed appear in failed[] instead.',
+      ),
     succeeded: z.number().describe('Number of series with a successfully fetched observation.'),
     failed: z
       .array(
@@ -117,7 +117,6 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       })),
     );
 
-    // results preserves request order: results[i] corresponds to series_ids[i].
     const results: Array<{
       seriesId: string;
       title?: string;
@@ -147,7 +146,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         }
         const errorMsg = err instanceof Error ? err.message : String(err);
         failed.push({ seriesId: requestedId, error: errorMsg });
-        results.push({ seriesId: requestedId });
+        // Failed series go into failed[] only — not results[].
         continue;
       }
 
@@ -157,7 +156,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         const errorMsg =
           'No observations returned — series may exist but has no data for the current period.';
         failed.push({ seriesId, error: errorMsg });
-        results.push({ seriesId });
+        // No-observation series go into failed[] only — not results[].
         continue;
       }
 
@@ -217,7 +216,8 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         lines.push(`- ${f.seriesId}: ${f.error}`);
       }
     }
-    lines.push(`_${result.succeeded} of ${result.results.length} series returned data._`);
+    const total = result.results.length + result.failed.length;
+    lines.push(`_${result.succeeded} of ${total} series returned data._`);
     return [{ type: 'text', text: lines.join('\n').trimEnd() }];
   },
 });

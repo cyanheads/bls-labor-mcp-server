@@ -82,7 +82,7 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were capped by row_limit — e.g. to use register_as to persist all rows or increase row_limit. Absent when all rows fit in the response.',
+        'Guidance when results were capped by preview or row_limit — names which parameter was the binding limiter and suggests how to retrieve the rest. Absent when all rows fit in the response.',
       ),
   },
 
@@ -109,9 +109,16 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
     });
 
     if (result.rowCount > result.rows.length) {
-      ctx.enrich.notice(
-        `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by row_limit=${input.row_limit}). Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`,
-      );
+      // preview is the binding cap when it's set and smaller than row_limit.
+      if (input.preview !== undefined && input.preview < input.row_limit) {
+        ctx.enrich.notice(
+          `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${input.preview}). Increase preview or use register_as to persist all rows to canvas.`,
+        );
+      } else {
+        ctx.enrich.notice(
+          `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by row_limit=${input.row_limit}). Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`,
+        );
+      }
     }
 
     return {

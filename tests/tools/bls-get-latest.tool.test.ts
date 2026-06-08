@@ -145,20 +145,20 @@ describe('blsGetLatestTool — additional coverage', () => {
     expect(result.succeeded).toBe(1);
     expect(result.failed).toHaveLength(1);
     expect(result.failed[0]!.seriesId).toBe('INVALID000');
-    // results must mirror request order: results[0] = LNS14000000, results[1] = INVALID000
+    // Failed series are in failed[] only — results[] contains only successful entries.
+    expect(result.results).toHaveLength(1);
     expect(result.results[0]!.seriesId).toBe('LNS14000000');
     expect(result.results[0]!.latestObservation).toBeDefined();
-    expect(result.results[1]!.seriesId).toBe('INVALID000');
-    expect(result.results[1]!.latestObservation).toBeUndefined();
 
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('bls_search_series');
   });
 
-  it('preserves request order when invalid series precedes valid series', async () => {
-    // Regression: previously results were [...succeeded, ...failed], so a failed[0] would
-    // appear at results[1] instead of results[0]. This test puts the invalid ID first.
+  it('failed series are excluded from results and appear only in failed[]', async () => {
+    // Previously failed stubs appeared in both results[] and failed[]. This test
+    // verifies that a rejected fetch for the first ID leaves results[] with only
+    // the successful second entry, not a bare stub for the invalid first.
     fetchLatestMock
       .mockRejectedValueOnce(new Error('Series does not exist'))
       .mockResolvedValueOnce(MOCK_SERIES);
@@ -172,11 +172,27 @@ describe('blsGetLatestTool — additional coverage', () => {
     expect(result.succeeded).toBe(1);
     expect(result.failed).toHaveLength(1);
     expect(result.failed[0]!.seriesId).toBe('ZZZZZZZ_INVALID');
-    // results[0] must be the invalid (first requested), results[1] the valid (second requested)
-    expect(result.results[0]!.seriesId).toBe('ZZZZZZZ_INVALID');
-    expect(result.results[0]!.latestObservation).toBeUndefined();
-    expect(result.results[1]!.seriesId).toBe('LNS14000000');
-    expect(result.results[1]!.latestObservation?.value).toBe('4.1');
+    // Only the valid series is in results — failed entries do not appear there.
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]!.seriesId).toBe('LNS14000000');
+    expect(result.results[0]!.latestObservation?.value).toBe('4.1');
+  });
+
+  it('format footer counts results + failed as the total requested', () => {
+    // results[] has 1 success, failed[] has 1 failure → "1 of 2 series returned data."
+    const output = {
+      results: [
+        {
+          seriesId: 'LNS14000000',
+          latestObservation: { year: '2024', period: 'M12', value: '4.1' },
+        },
+      ],
+      succeeded: 1,
+      failed: [{ seriesId: 'INVALID000', error: 'series_not_found' }],
+    };
+    const blocks = blsGetLatestTool.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('1 of 2 series returned data');
   });
 
   it('rejects empty series_ids array', () => {
@@ -189,11 +205,9 @@ describe('blsGetLatestTool — additional coverage', () => {
   });
 
   it('formats output with failed series listed', () => {
+    // results[] contains only successful entries; failed[] carries the errors.
     const output = {
-      results: [
-        { seriesId: 'LNS14000000' }, // succeeded but no latestObservation — format skips it
-        { seriesId: 'INVALID000' },
-      ],
+      results: [],
       succeeded: 0,
       failed: [{ seriesId: 'INVALID000', error: 'series_not_found' }],
     };

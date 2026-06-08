@@ -56,7 +56,7 @@ describe('blsDataframeQueryTool', () => {
     expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
-  it('enriches with notice when rows were capped by row_limit', async () => {
+  it('enriches with notice naming row_limit when it is the binding cap', async () => {
     canvasBridgeEnabled = true;
     mockQuery.mockResolvedValue({
       result: {
@@ -74,6 +74,32 @@ describe('blsDataframeQueryTool', () => {
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('row_limit');
+    expect(enriched.notice).not.toContain('preview');
+  });
+
+  it('enriches with notice naming preview when it is the binding cap (not row_limit)', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['series_id'],
+        rowCount: 5000,
+        rows: Array.from({ length: 3 }, (_, i) => ({ series_id: `S${i}` })),
+      },
+      meta: undefined,
+    });
+
+    const ctx = createMockContext();
+    // preview=3 is below row_limit default (1000) — preview is the binding cap.
+    const input = blsDataframeQueryTool.input.parse({
+      sql: 'SELECT series_id FROM df_AAAAA',
+      preview: 3,
+    });
+    await blsDataframeQueryTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.notice).toBeDefined();
+    expect(enriched.notice).toContain('preview=3');
+    expect(enriched.notice).not.toContain('row_limit');
   });
 
   it('formats query results as markdown table', () => {
