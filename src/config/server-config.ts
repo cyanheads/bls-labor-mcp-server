@@ -40,9 +40,8 @@ const ServerConfigSchema = z.object({
       'Catalog freshness window in hours — re-harvest into the SQLite index once its last completion is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). The existing index stays queryable throughout a refresh.',
     ),
   catalogIncludeOes: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true')
+    .stringbool()
+    .default(false)
     .describe(
       'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.2 GB (32× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index. OES series stay fetchable by ID via bls_get_series when off.',
     ),
@@ -59,16 +58,14 @@ const ServerConfigSchema = z.object({
     .default(86400)
     .describe('Per-table TTL for canvas-registered dataframes, in seconds (default 24 h)'),
   dataframeDropEnabled: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true')
+    .stringbool()
+    .default(false)
     .describe('Expose bls_dataframe_drop when true — off by default; TTL handles cleanup'),
 
   // ── Observations mirror ───────────────────────────────────────────────
   observationsMirrorEnabled: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true')
+    .stringbool()
+    .default(false)
     .describe(
       'Enable the local LABSTAT observation mirror. Off by default — requires a one-time bootstrap (bls-observations-init) before serving mirror traffic.',
     ),
@@ -85,9 +82,8 @@ const ServerConfigSchema = z.object({
       'Cron expression for incremental observation refreshes (HTTP transport only). Default: Monday 06:00 UTC. Stdio operators run refreshes out-of-band.',
     ),
   observationsMirrorFallbackLive: z
-    .enum(['true', 'false'])
-    .default('true')
-    .transform((v) => v === 'true')
+    .stringbool()
+    .default(true)
     .describe(
       'Fall back to the live BLS API when the mirror is not ready or a series has no mirror rows. When false, a not-ready mirror returns an error.',
     ),
