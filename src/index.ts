@@ -34,6 +34,8 @@ const dropTool = cfg.dataframeDropEnabled
     });
 
 await createApp({
+  name: 'bls-labor-mcp-server',
+  title: 'bls-labor-mcp-server',
   landing: { requireAuth: false },
   tools: [
     blsListSurveysTool,

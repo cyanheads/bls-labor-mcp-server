@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/bls-labor-mcp-server",
-  "version": "0.2.1",
+  "version": "0.4.4",
   "description": "Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -13,7 +13,7 @@
   "keywords": ["bls", "bureau-of-labor-statistics", "cpi", "unemployment", "wages", "jolts", "mcp", "mcp-server", "model-context-protocol"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/bls-labor-mcp-server",
+    "displayName": "bls-labor-mcp-server",
     "shortDescription": "Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP.",
     "longDescription": "",
     "developerName": "cyanheads",
