@@ -1,9 +1,10 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-06-08 12:42:23
+Generated on: 2026-06-12 07:31:04
 
 ```text
 bls-labor-mcp-server/
+├── .agents/
 ├── .cache/
 ├── .claude/
 ├── .claude-plugin/
@@ -35,6 +36,7 @@ bls-labor-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -122,6 +124,10 @@ bls-labor-mcp-server/
 │   │   └── SKILL.md
 │   ├── setup/
 │   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
+│   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── src/
@@ -154,8 +160,7 @@ bls-labor-mcp-server/
 │   │   │   ├── subprocess.ts
 │   │   │   └── types.ts
 │   │   └── canvas-bridge/
-│   │       ├── canvas-bridge.ts
-│   │       └── sql-gate-extras.ts
+│   │       └── canvas-bridge.ts
 │   └── index.ts
 ├── tests/
 │   ├── prompts/
@@ -170,7 +175,6 @@ bls-labor-mcp-server/
 │   │   │   ├── ingester.test.ts
 │   │   │   └── subprocess.test.ts
 │   │   └── canvas-bridge/
-│   │       └── sql-gate-extras.test.ts
 │   └── tools/
 │       ├── bls-dataframe-describe.tool.test.ts
 │       ├── bls-dataframe-drop.tool.test.ts

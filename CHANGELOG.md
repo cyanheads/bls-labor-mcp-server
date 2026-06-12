@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-06-12
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6: framework SQL system-catalog gate, stringbool env flags, enrich.total/truncated helpers. MCPB bundle hygiene: clean-mcpb.ts strips dependency agent-docs, lint-packaging bundle-content + identity checks. Dockerfile healthcheck + version label.
+
 ## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-06-08 · ⚠️ Breaking
 
 BREAKING: bls_search_series output renamed (areaName→area, itemName→item, seasonal boolean→string); bls_get_latest double-list fix; dataframe-query cap notice fix; search capped flag
