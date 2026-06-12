@@ -60,8 +60,9 @@ describe('blsSearchSeriesTool', () => {
     expect(result.series[0]!.seriesId).toBe('LNS14000000');
 
     const enriched = getEnrichment(ctx);
-    expect(enriched.totalFound).toBe(1);
+    expect(enriched.totalCount).toBe(1);
     expect(enriched.capped).toBe(false);
+    expect(enriched.truncated).toBeUndefined();
     expect(enriched.catalogSize).toBe(847000);
     expect(enriched.notice).toBeUndefined();
     // echo: query + applied limit, no filters passed (#29)
@@ -81,7 +82,10 @@ describe('blsSearchSeriesTool', () => {
 
     const enriched = getEnrichment(ctx);
     expect(enriched.capped).toBe(true);
-    expect(enriched.totalFound).toBe(1000);
+    expect(enriched.totalCount).toBe(1000);
+    // total (1000) exceeds the returned list — truncation disclosed
+    expect(enriched.truncated).toBe(true);
+    expect(enriched.cap).toBe(10);
   });
 
   it('echoes applied survey/area/seasonal filters in enrichment', async () => {
@@ -116,7 +120,7 @@ describe('blsSearchSeriesTool', () => {
 
     const enriched = getEnrichment(ctx);
     expect(enriched.notice).toBeDefined();
-    expect(enriched.totalFound).toBe(0);
+    expect(enriched.totalCount).toBe(0);
   });
 
   it('formats output including seasonal field', () => {

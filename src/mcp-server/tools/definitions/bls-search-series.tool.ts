@@ -84,15 +84,21 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
   }),
 
   enrichment: {
-    totalFound: z
+    totalCount: z
       .number()
       .describe(
         'Total candidates scored before the limit was applied. A lower bound when capped is true — the catalog index may contain more matching series.',
       ),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe('True when more candidates matched than the limit returned.'),
+    shown: z.number().optional().describe('Number of series returned in this response.'),
+    cap: z.number().optional().describe('The result limit that capped the returned list.'),
     capped: z
       .boolean()
       .describe(
-        'True when the FTS candidate pool reached the internal cap (~1000). totalFound is then a lower bound, not an exact match count. Narrow the query, add survey/area filters, or use a direct SeriesID to get an exact count.',
+        'True when the FTS candidate pool reached the internal cap (~1000). totalCount is then a lower bound, not an exact match count. Narrow the query, add survey/area filters, or use a direct SeriesID to get an exact count.',
       ),
     catalogSize: z
       .number()
@@ -158,7 +164,6 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     });
 
     ctx.enrich({
-      totalFound: result.total,
       capped: result.capped,
       catalogSize: service.totalSeries,
       limitApplied: input.limit,
@@ -168,6 +173,10 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
         seasonalFilter: input.seasonal_adjustment,
       }),
     });
+    ctx.enrich.total(result.total);
+    if (result.total > result.series.length) {
+      ctx.enrich.truncated({ shown: result.series.length, cap: input.limit });
+    }
     ctx.enrich.echo(input.query);
     if (result.series.length === 0) {
       const hasFilters =
