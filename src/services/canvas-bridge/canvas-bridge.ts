@@ -17,7 +17,6 @@ import {
 } from '@cyanheads/mcp-ts-core/canvas';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { assertNoSystemCatalogAccess } from './sql-gate-extras.js';
 
 /** Per-table provenance + TTL metadata persisted in `ctx.state`. */
 export interface DataframeMeta {
@@ -72,7 +71,10 @@ const CANVAS_ID_KEY = 'canvas-id';
 const TABLE_NAME_CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 export function deriveAllNullableSchema(rows: Record<string, unknown>[]): ColumnSchema[] {
-  return inferSchemaFromRows(rows).map((col) => ({ ...col, nullable: true }));
+  // inferSchemaFromRows emits nullable: true for every column (mcp-ts-core ≥ 0.10.4),
+  // so sparse BLS columns never trip a NOT NULL appender rollback when this schema is
+  // passed explicitly to registerTable.
+  return inferSchemaFromRows(rows);
 }
 
 export class CanvasBridge {
@@ -149,7 +151,6 @@ export class CanvasBridge {
     sql: string,
     options: BridgeQueryOptions = {},
   ): Promise<{ result: QueryResult; meta?: DataframeMeta }> {
-    assertNoSystemCatalogAccess(sql);
     await this.sweepExpired(ctx);
     const instance = await this.acquireSharedCanvas(ctx);
 
@@ -158,6 +159,7 @@ export class CanvasBridge {
       ...(options.preview !== undefined && { preview: options.preview }),
       ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
       ...(registerAs !== undefined && { registerAs }),
+      denySystemCatalogs: true,
       signal: ctx.signal,
     });
 

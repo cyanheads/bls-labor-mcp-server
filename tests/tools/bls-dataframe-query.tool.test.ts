@@ -192,4 +192,23 @@ describe('blsDataframeQueryTool', () => {
     expect(() => blsDataframeQueryTool.input.parse({ sql: injectionSql })).not.toThrow();
     // The actual denial happens in the canvas bridge / framework SQL gate, not the Zod schema
   });
+
+  // Security: system catalog access is denied via denySystemCatalogs: true in the bridge
+  // (delegated to framework sqlGate since 0.10.4). The tool must propagate the
+  // system_catalog_access reason code unchanged — no swallowing or rewrapping.
+  it('propagates system_catalog_access reason code from the bridge gate', async () => {
+    canvasBridgeEnabled = true;
+    const catalogError = Object.assign(new Error('system catalog denied'), {
+      data: { reason: 'system_catalog_access', catalog: 'information_schema' },
+    });
+    mockQuery.mockRejectedValue(catalogError);
+
+    const ctx = createMockContext();
+    const input = blsDataframeQueryTool.input.parse({
+      sql: 'SELECT * FROM information_schema.tables',
+    });
+    await expect(blsDataframeQueryTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'system_catalog_access' },
+    });
+  });
 });
