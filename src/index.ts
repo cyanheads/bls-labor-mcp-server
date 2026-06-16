@@ -36,6 +36,8 @@ const dropTool = cfg.dataframeDropEnabled
 await createApp({
   name: 'bls-labor-mcp-server',
   title: 'bls-labor-mcp-server',
+  instructions:
+    'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. Large results spill to a DataCanvas dataframe queryable via bls_dataframe_query.',
   landing: { requireAuth: false },
   tools: [
     blsListSurveysTool,
