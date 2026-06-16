@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-06-15
+
+Server-level instructions on createApp() orient agents to the bls_* workflow and quota model. Plugin manifests unscope their display identity to the repo name. Dev-dependency refresh.
+
 ## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-06-12
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6: framework SQL system-catalog gate, stringbool env flags, enrich.total/truncated helpers. MCPB bundle hygiene: clean-mcpb.ts strips dependency agent-docs, lint-packaging bundle-content + identity checks. Dockerfile healthcheck + version label.
