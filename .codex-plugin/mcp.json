@@ -1,5 +1,5 @@
 {
-  "@cyanheads/bls-labor-mcp-server": {
+  "bls-labor-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/bls-labor-mcp-server"],
     "env": {
