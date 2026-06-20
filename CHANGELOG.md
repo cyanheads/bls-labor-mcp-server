@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.6](changelog/0.4.x/0.4.6.md) — 2026-06-20
+
+Adopt @cyanheads/mcp-ts-core ^0.10.9 — clearer bls_dataframe_query SQL-gate errors, qualified DataCanvas describe() filters, and two new devcheck gates (floating dependency specifiers, plugin-manifest correctness). Dependency refresh; codex plugin longDescription filled.
+
 ## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-06-15
 
 Server-level instructions on createApp() orient agents to the bls_* workflow and quota model. Plugin manifests unscope their display identity to the repo name. Dev-dependency refresh.

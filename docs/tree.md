@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-06-12 07:31:04
+Generated on: 2026-06-20 10:36:04
 
 ```text
 bls-labor-mcp-server/
@@ -32,6 +32,7 @@ bls-labor-mcp-server/
 ├── scripts/
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
