@@ -1,6 +1,6 @@
 {
   "name": "bls-labor-mcp-server",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "bls-labor-mcp-server",
     "shortDescription": "Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP.",
-    "longDescription": "",
+    "longDescription": "bls-labor-mcp-server wraps the US Bureau of Labor Statistics public API v2 — the source for CPI, unemployment, wages, JOLTS, PPI, and occupational employment data. Because BLS identifiers are opaque positional codes (LNS14000000, CES0000000001) that encode survey, area, item, and seasonal flag, the workflow starts with bls_search_series, an offline catalog search that resolves plain-language concepts to SeriesIDs without spending API quota. From there, bls_get_series fetches time-series history for up to 50 series and bls_get_latest returns the most recent observation. Large result sets spill to a DuckDB-backed dataframe queryable with SQL through bls_dataframe_query. Runs over STDIO or Streamable HTTP; a free BLS_API_KEY raises the rate limit from 25 to 500 requests per day.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],
