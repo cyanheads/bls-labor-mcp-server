@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.8](changelog/0.4.x/0.4.8.md) — 2026-07-17
+
+quota_exceeded and the new request_rejected reason now fail fast instead of retrying (#48, #47); bls_get_series surfaces BLS's 3- and 6-month net/percent changes (#50); .mcpbignore excludes /.cache/, fixing an oversized .mcpb bundle (#52).
+
 ## [0.4.7](changelog/0.4.x/0.4.7.md) — 2026-07-17
 
 Survey-catalog corrections: bls_list_surveys category map (#44), catalog harvest sa→ap Average Price fix (#43), and one canonical survey list shared by the catalog and observations ingester (#49). Adopts mcp-ts-core ^0.10.14 supply-chain hardening (minimumReleaseAge, Socket scanner, SECURITY.md); Bun 1.3.14; dependency refresh.
