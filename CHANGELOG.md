@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.10](changelog/0.4.x/0.4.10.md) — 2026-07-17
+
+bls_get_series forced annual-average rows into observations[] whenever a year range was passed; annual_average is now an explicit opt-in (default false, decoupled from start_year/end_year). The mirror's queryLatest also let a year's mean win bls_get_latest via lexical period comparison; fixed via isLaterObservation().
+
 ## [0.4.9](changelog/0.4.x/0.4.9.md) — 2026-07-17
 
 SURVEY_CAPABILITIES rebuilt from a live sweep of all 70 BLS surveys, correcting 12 wrong entries and 51 that silently defaulted to no calculation support (#39); bls_get_series now surfaces zero-observation series (#45) and canvas registration failures (#46) instead of returning silently; bls_search_series resolves CW (CPI-W) series (#51).
