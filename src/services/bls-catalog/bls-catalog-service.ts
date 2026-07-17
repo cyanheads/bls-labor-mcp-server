@@ -29,7 +29,7 @@ import type {
  */
 const SURVEYS: SurveyDefinition[] = [
   { abbr: 'cu', name: 'CPI - All Urban Consumers', codeTables: ['area', 'item', 'periodicity'] },
-  { abbr: 'sa', name: 'CPI - Average Retail Prices', codeTables: ['area', 'item'] },
+  { abbr: 'ap', name: 'Consumer Price Index - Average Price Data', codeTables: ['area', 'item'] },
   {
     abbr: 'ce',
     name: 'CES - Employment, Hours, and Earnings',
@@ -69,6 +69,15 @@ const SURVEYS: SurveyDefinition[] = [
   { abbr: 'pr', name: 'Productivity - Business', codeTables: ['measure', 'sector'] },
   { abbr: 'mp', name: 'Productivity - Major Sector', codeTables: ['measure', 'sector'] },
 ];
+
+/**
+ * Canonical harvest order of LABSTAT survey abbreviations, derived from
+ * `SURVEYS`. The observations ingester imports this rather than restating the
+ * list, so a survey correction lands in one place and the two harvests cannot
+ * drift apart. Order is load-bearing: the ingester's resume cursor encodes a
+ * survey's index into this array.
+ */
+export const SURVEY_ABBRS: readonly string[] = SURVEYS.map((s) => s.abbr);
 
 /**
  * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.2 GB, 32× every

@@ -1,11 +1,12 @@
 /**
  * @fileoverview Tests for the LABSTAT observation ingester — tab-delimited parsing,
- * readme discovery, cursor encoding, and page batching.
+ * readme discovery, cursor encoding, page batching, and the canonical survey list.
  * @module tests/services/bls-observations/ingester.test
  */
 
 import type { SyncContext } from '@cyanheads/mcp-ts-core/mirror';
 import { describe, expect, it } from 'vitest';
+import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
 import { observationsSync } from '@/services/bls-observations/ingester.js';
 
 // ---------------------------------------------------------------------------
@@ -454,5 +455,36 @@ describe('observationsSync — cancellation', () => {
 
     // Should have yielded 0 pages (aborted immediately)
     expect(pages.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — canonical survey list (single source of truth)
+// ---------------------------------------------------------------------------
+
+describe('SURVEY_ABBRS — canonical survey list (#49)', () => {
+  // The ingester imports this list from the catalog service and keeps no copy of
+  // its own, so asserting it here asserts exactly what the ingester harvests —
+  // one binding shared by both harvests, which is what stops them drifting apart.
+  it('carries the ap Average Price survey, not the sa SIC-employment survey', () => {
+    expect(SURVEY_ABBRS).toContain('ap');
+    expect(SURVEY_ABBRS).not.toContain('sa');
+  });
+
+  it('pins the canonical harvest order — the resume cursor encodes these indices', () => {
+    expect([...SURVEY_ABBRS]).toEqual([
+      'cu',
+      'ap',
+      'ce',
+      'ln',
+      'la',
+      'pc',
+      'wp',
+      'jt',
+      'oe',
+      'ec',
+      'pr',
+      'mp',
+    ]);
   });
 });

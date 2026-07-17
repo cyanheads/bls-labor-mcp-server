@@ -458,4 +458,42 @@ describe('BlsCatalogService.load (cold harvest)', () => {
     await onSvc.load(1);
     expect(urls.some((u) => u.includes('/oe/oe.series'))).toBe(true);
   });
+
+  it('harvests the ap Average Price survey, never the sa employment survey, and labels rows with the ap name (#43)', async () => {
+    // Production ap.series carries series_title per row; this fixture omits it so the
+    // fallback title synthesis fires and the survey name becomes observable.
+    const AP_SERIES = 'series_id\tarea_code\titem_code\nAPU0000701111\t0000\t701111\n';
+    const AP_AREA = 'area_code\tarea_name\n0000\tU.S. city average\n';
+    const AP_ITEM = 'item_code\titem_name\n701111\tFlour, white, all purpose, per lb.\n';
+    const urls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes('/ap/ap.series'))
+        return Promise.resolve(new Response(AP_SERIES, { status: 200 }));
+      if (u.includes('/ap/ap.area')) return Promise.resolve(new Response(AP_AREA, { status: 200 }));
+      if (u.includes('/ap/ap.item')) return Promise.resolve(new Response(AP_ITEM, { status: 200 }));
+      // Every other survey contributes nothing, isolating the ap harvest.
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const svc = new BlsCatalogService(BASE_URL, 'ua/1.0', join(tmpDir, 'ap.db'), 168, false);
+    await svc.load(1);
+
+    // abbr fix: the harvest fetches the ap flat files and never the sa ones.
+    expect(urls.some((u) => u.includes('/ap/ap.series'))).toBe(true);
+    expect(urls.some((u) => u.includes('/sa/'))).toBe(false);
+
+    // name fix: the ap survey name flows into the synthesized title (row had no series_title).
+    const result = await svc.search({
+      query: 'APU0000701111',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 5,
+    });
+    expect(result.series.length).toBeGreaterThan(0);
+    expect(result.series[0]!.seriesId).toBe('APU0000701111');
+    expect(result.series[0]!.title).toContain('Consumer Price Index - Average Price Data');
+  });
 });

@@ -13,10 +13,8 @@
  */
 
 import type { MirrorRow, SyncContext, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
+import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { ObservationRow } from './types.js';
-
-/** Surveys mirrored — same set the catalog service covers. */
-const SURVEYS = ['cu', 'sa', 'ce', 'ln', 'la', 'pc', 'wp', 'jt', 'oe', 'ec', 'pr', 'mp'];
 
 /** Rows yielded per page — controls memory peak during bulk ingest. */
 const PAGE_SIZE = 5_000;
@@ -35,7 +33,7 @@ const NULL_VALUE = '-';
 // ---------------------------------------------------------------------------
 
 interface IngestCursor {
-  /** Index into SURVEYS array. */
+  /** Index into SURVEY_ABBRS array. */
   abbrIdx: number;
   /** Index into the survey's data file list. */
   fileIdx: number;
@@ -223,7 +221,7 @@ export async function* observationsSync(
 
   let maxLastModified = priorCheckpoint ?? '';
 
-  for (const [abbrIdx, abbr] of SURVEYS.entries()) {
+  for (const [abbrIdx, abbr] of SURVEY_ABBRS.entries()) {
     if (signal.aborted) break;
     if (abbrIdx < resume.abbrIdx) continue;
     const baseDir = `${catalogBaseUrl}/${abbr}`;
@@ -276,7 +274,7 @@ export async function* observationsSync(
 
         const isLastBatch = rowOffset + PAGE_SIZE >= allRows.length;
         const isLastFile = fileIdx === dataFiles.length - 1;
-        const isLastSurvey = abbrIdx === SURVEYS.length - 1;
+        const isLastSurvey = abbrIdx === SURVEY_ABBRS.length - 1;
 
         // Cursor: records progress through surveys/files/rows for interrupt resume
         // On the last page of a file, advance to the next file
