@@ -611,3 +611,212 @@ describe('blsGetSeriesTool', () => {
     expect(serialized).not.toMatch(/apikey/i);
   });
 });
+
+describe('blsGetSeriesTool — annual averages (#53)', () => {
+  /** CPI over 2023–2024: 24 real monthly rows plus the two M13 rows BLS injects. */
+  const CPI_WITH_M13: SeriesData = {
+    seriesId: 'CUUR0000SA0',
+    title: 'CPI-U All Items',
+    observations: [
+      { year: '2024', period: 'M13', periodName: 'Annual', value: '313.689' },
+      { year: '2024', period: 'M12', periodName: 'December', value: '315.605' },
+      { year: '2023', period: 'M13', periodName: 'Annual', value: '304.702' },
+      { year: '2023', period: 'M12', periodName: 'December', value: '306.746' },
+    ],
+  };
+
+  beforeEach(() => {
+    canvasBridge = undefined;
+    registerDataframeMock.mockReset();
+    fetchSeriesMock.mockReset();
+  });
+
+  it('defaults annual_average to false and does not ask the service for averages', async () => {
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(input.annual_average).toBe(false);
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ annualAverage: false }),
+      ctx,
+    );
+  });
+
+  it('does not couple annual averages to a year range', async () => {
+    // Requesting a range must not change what a row means (#53's root cause).
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['CUUR0000SA0'],
+      start_year: 2023,
+      end_year: 2024,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ annualAverage: false, startYear: 2023 }),
+      ctx,
+    );
+  });
+
+  it('forwards annual_average to the service when opted in', async () => {
+    fetchSeriesMock.mockResolvedValue([CPI_WITH_M13]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['CUUR0000SA0'],
+      annual_average: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ annualAverage: true }),
+      ctx,
+    );
+  });
+
+  it('asserts annualAverageApplied:false and omits the count on the default path', async () => {
+    // The positive assertion is the point: a consumer can reduce observations[]
+    // without knowing BLS period codes.
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.annualAverageApplied).toBe(false);
+    expect(enriched.annualAverageRows).toBeUndefined();
+    expect(enriched.notice).toBeUndefined();
+  });
+
+  it('counts annual-average rows and warns against double-counting when opted in', async () => {
+    fetchSeriesMock.mockResolvedValue([CPI_WITH_M13]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['CUUR0000SA0'],
+      annual_average: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.annualAverageApplied).toBe(true);
+    expect(enriched.annualAverageRows).toBe(2);
+    expect(enriched.totalObservations).toBe(4);
+    expect(enriched.notice).toContain('M13');
+    expect(enriched.notice).toMatch(/mean of that year/i);
+  });
+
+  it('counts Q05 and S03 rows, not just M13', async () => {
+    fetchSeriesMock.mockResolvedValue([
+      { seriesId: 'PRS30006011', observations: [{ year: '2024', period: 'Q05', value: '-1.0' }] },
+      {
+        seriesId: 'CUUS0000SA0',
+        observations: [{ year: '2024', period: 'S03', value: '313.689' }],
+      },
+      { seriesId: 'LNS14000000', observations: [{ year: '2024', period: 'M12', value: '4.1' }] },
+    ]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['PRS30006011', 'CUUS0000SA0', 'LNS14000000'],
+      annual_average: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx).annualAverageRows).toBe(2);
+  });
+
+  it('reports zero rows for a survey that publishes no annual averages, without a notice', async () => {
+    // LN reports hasAnnualAverages:true yet returns no M13 row — the count is the
+    // only honest signal of what actually came back.
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      annual_average: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.annualAverageApplied).toBe(true);
+    expect(enriched.annualAverageRows).toBe(0);
+    expect(enriched.notice).toBeUndefined();
+  });
+
+  it('marks annual-average rows on canvas rows so SQL can exclude them', async () => {
+    const many = Array.from({ length: 900 }, (_, i) => ({
+      year: String(2000 + Math.floor(i / 13)),
+      period: i % 13 === 12 ? 'M13' : `M${String((i % 13) + 1).padStart(2, '0')}`,
+      periodName: i % 13 === 12 ? 'Annual' : 'January',
+      value: String(300 + i),
+      footnotes: ['P: Preliminary figure subject to revision in a later release'],
+    }));
+    fetchSeriesMock.mockResolvedValue([{ seriesId: 'CUUR0000SA0', observations: many }]);
+    registerDataframeMock.mockResolvedValue({
+      tableName: 'df_EEEEE_FFFFF',
+      rowCount: 900,
+      expiresAt: '2026-07-18T00:00:00.000Z',
+      columnSchema: [],
+    });
+    canvasBridge = { registerDataframe: registerDataframeMock };
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['CUUR0000SA0'],
+      annual_average: true,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const rows = registerDataframeMock.mock.calls[0]![1].rows as Array<Record<string, unknown>>;
+    const averages = rows.filter((r) => r.is_annual_average === true);
+    const reals = rows.filter((r) => r.is_annual_average === false);
+
+    expect(averages).toHaveLength(69);
+    expect(averages.every((r) => r.period === 'M13')).toBe(true);
+    expect(reals.every((r) => r.period !== 'M13')).toBe(true);
+    // The opt-in warning must survive composition with the spill notice.
+    expect(getEnrichment(ctx).notice).toContain('is_annual_average');
+  });
+
+  it('renders an annual-average row with its "Annual" label in content[]', async () => {
+    // Different clients read structuredContent vs content[] — the M13 marker has
+    // to reach both.
+    const blocks = blsGetSeriesTool.format!({
+      series: [
+        {
+          seriesId: 'CUUR0000SA0',
+          observationCount: 2,
+          observations: [
+            { year: '2024', period: 'M13', periodName: 'Annual', value: '313.689' },
+            { year: '2024', period: 'M12', periodName: 'December', value: '315.605' },
+          ],
+        },
+      ],
+      spilled: false as const,
+    });
+    const text = (blocks[0] as { text: string }).text;
+
+    expect(text).toContain('Annual 2024');
+    expect(text).toContain('M13');
+    expect(text).toContain('313.689');
+  });
+
+  // Security: verify API key never appears in tool output
+  it('does not include API key or env values in output', async () => {
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+    const serialized = JSON.stringify(result);
+    // process.env.BLS_API_KEY is typically empty/undefined in tests — confirm no secret leakage pattern
+    expect(serialized).not.toMatch(/registrationkey/i);
+    expect(serialized).not.toMatch(/apikey/i);
+  });
+});

@@ -92,7 +92,9 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
               ),
             hasAnnualAverages: z
               .boolean()
-              .describe('True when the survey publishes annual average observations.'),
+              .describe(
+                'True when BLS reports that the survey publishes annual average observations. Advisory only: it does not predict whether a given series returns annual-average rows for bls_get_series with annual_average=true — LN, CE, LA and SM report true yet return none. Read annualAverageRows on that response for what actually came back.',
+              ),
           })
           .describe('A BLS survey program entry.'),
       )

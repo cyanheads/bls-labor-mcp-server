@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** bls-labor-mcp-server
-**Version:** 0.4.9
+**Version:** 0.4.10
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.14`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **Zod:** ^4.4.3
@@ -225,6 +225,8 @@ src/
       ingester.ts                       # LABSTAT .data.* sync generator
       subprocess.ts                     # Event-loop-safe harvest subprocess (dual-role entry)
       types.ts                          # Observation row types
+    bls-periods/
+      period-codes.ts                   # Annual-average period semantics (M13/Q05/S03) — shared by the API and mirror paths
     canvas-bridge/
       canvas-bridge.ts                  # DataCanvas bridge (dataframe registration, SQL gate, lifecycle)
       sql-gate-extras.ts                # Bridge-layer SQL denial rules (system catalogs, DDL)

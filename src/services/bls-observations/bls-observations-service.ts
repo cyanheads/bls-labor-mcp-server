@@ -22,11 +22,39 @@ import {
 } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { getServerConfig } from '@/config/server-config.js';
+import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
 import { observationsSync } from './ingester.js';
-import type { MirrorSeriesResult } from './types.js';
+import type { MirrorSeriesResult, ObservationRow } from './types.js';
 
 /** Re-export MirrorRunOptions for callers (subprocess.ts). */
 export type { MirrorRunOptions };
+
+// ---------------------------------------------------------------------------
+// Latest-observation ordering
+// ---------------------------------------------------------------------------
+
+/**
+ * True when `row` is a better answer to "latest" than `existing`.
+ *
+ * A real observation always beats an annual average. Ordering on (year, period)
+ * alone would not: an average shares the year it summarizes and lexically
+ * outranks the periods it is built from (`"M13" > "M12"`, `"Q05" > "Q04"`,
+ * `"S03" > "S02"`), so the year's mean would be served as the current reading.
+ * An average wins only against another average — for a series holding nothing
+ * else, it is that series' only observation.
+ *
+ * Year is compared before period, and BLS years are 4-digit strings, so lexical
+ * order is chronological. Within a series the real periods share a cadence
+ * prefix (M01–M12, Q01–Q04, S01–S02), so lexical order is chronological there
+ * too.
+ */
+function isLaterObservation(row: ObservationRow, existing: ObservationRow): boolean {
+  const rowIsAverage = isAnnualAveragePeriod(row.period);
+  const existingIsAverage = isAnnualAveragePeriod(existing.period);
+  if (rowIsAverage !== existingIsAverage) return existingIsAverage;
+
+  return row.year > existing.year || (row.year === existing.year && row.period > existing.period);
+}
 
 // ---------------------------------------------------------------------------
 // Service class
@@ -85,13 +113,19 @@ export class BlsObservationsService {
    * Query observations for the given series IDs. Returns rows for all IDs that
    * have mirror data, and records which IDs had zero rows (for live fallback).
    * Optional year/period filter narrows results.
+   *
+   * Annual-average rows are dropped unless `annualAverage` is set. LABSTAT bakes
+   * them into the bulk files unconditionally — no flag involved, unlike the live
+   * API — so without this the mirror would answer an identical request with
+   * extra rows the live path never returns.
    */
   async queryBySeries(opts: {
+    annualAverage?: boolean;
+    endYear?: number;
     seriesIds: string[];
     startYear?: number;
-    endYear?: number;
   }): Promise<MirrorSeriesResult> {
-    const { seriesIds, startYear, endYear } = opts;
+    const { seriesIds, startYear, endYear, annualAverage = false } = opts;
 
     const filters: QueryFilter[] = [{ column: 'series_id', op: 'in', value: seriesIds }];
     if (startYear !== undefined) {
@@ -108,20 +142,31 @@ export class BlsObservationsService {
       offset: 0,
     });
 
-    // Determine which requested IDs are covered
+    /**
+     * Coverage is judged before the annual-average filter: a series the mirror
+     * holds is covered even if the filter empties it for this range, so a live
+     * fetch isn't spent re-asking for rows the caller declined.
+     */
     const foundIds = new Set(rows.map((r) => r.series_id as string));
     const missedIds = seriesIds.filter((id) => !foundIds.has(id));
 
+    const observations = rows as unknown as ObservationRow[];
+
     return {
-      observations: rows as unknown as import('./types.js').ObservationRow[],
+      observations: annualAverage
+        ? observations
+        : observations.filter((r) => !isAnnualAveragePeriod(r.period)),
       complete: missedIds.length === 0,
       missedIds,
     };
   }
 
   /**
-   * Query the single most recent observation for each series ID.
-   * Returns the latest row per ID (highest year+period lexicographically).
+   * Query the single most recent real observation for each series ID.
+   *
+   * Mirrors the live API's `?latest=true`, which never sends `annualaverage` and
+   * so never answers with a year's mean. There is no opt-in here: an annual
+   * average is not a candidate for "latest" — see {@link isLaterObservation}.
    */
   async queryLatest(seriesIds: string[]): Promise<MirrorSeriesResult> {
     const { rows } = await this.mirror.query({
@@ -131,19 +176,12 @@ export class BlsObservationsService {
       offset: 0,
     });
 
-    // Pick the most recent row per series_id by (year, period). The store sorts on
-    // year only, so the latest period within the newest year must be compared
-    // explicitly — within a series all periods share a prefix (e.g. M01..M12), so
-    // lexical comparison is correct.
-    const latestBySeriesId = new Map<string, import('./types.js').ObservationRow>();
+    // The store sorts on year only, so the winning row per series is chosen here.
+    const latestBySeriesId = new Map<string, ObservationRow>();
     for (const raw of rows) {
-      const row = raw as unknown as import('./types.js').ObservationRow;
+      const row = raw as unknown as ObservationRow;
       const existing = latestBySeriesId.get(row.series_id);
-      if (
-        !existing ||
-        row.year > existing.year ||
-        (row.year === existing.year && row.period > existing.period)
-      ) {
+      if (!existing || isLaterObservation(row, existing)) {
         latestBySeriesId.set(row.series_id, row);
       }
     }

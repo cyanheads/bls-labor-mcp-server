@@ -231,6 +231,49 @@ describe('fetchSeries — mirror READY', () => {
     fetchSpy.mockRestore();
   });
 
+  it('forwards annual_average to the mirror so both paths answer alike (#53)', async () => {
+    // LABSTAT bakes annual-average rows in unconditionally; without the flag the
+    // mirror would answer an identical request with rows the live path omits.
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+    await svc.fetchSeries({ seriesIds: ['LNS14000000'], annualAverage: true }, ctx);
+
+    expect(getMirror().queryBySeries).toHaveBeenCalledWith(
+      expect.objectContaining({ annualAverage: true }),
+    );
+  });
+
+  it('tells the mirror annualAverage:false when the caller did not ask', async () => {
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+    await svc.fetchSeries({ seriesIds: ['LNS14000000'], startYear: 2023 }, ctx);
+
+    expect(getMirror().queryBySeries).toHaveBeenCalledWith(
+      expect.objectContaining({ annualAverage: false }),
+    );
+  });
+
+  it('carries annual_average into the live fallback for missed IDs', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: MIRROR_OBS,
+      complete: false,
+      missedIds: ['CUUR0000SA0'],
+    });
+    let body: Record<string, unknown> = {};
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementationOnce((_url, init) => {
+      body = JSON.parse(init?.body as string) as Record<string, unknown>;
+      return Promise.resolve(okJson(LIVE_CES_RESPONSE));
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+    await svc.fetchSeries({ seriesIds: ['LNS14000000', 'CUUR0000SA0'], annualAverage: true }, ctx);
+
+    expect(body.annualaverage).toBe(true);
+
+    fetchSpy.mockRestore();
+  });
+
   it('falls back to live for missed IDs when mirror is partially complete', async () => {
     getMirror().queryBySeries.mockResolvedValue({
       observations: MIRROR_OBS,

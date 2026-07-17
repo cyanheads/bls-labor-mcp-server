@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-07-17 09:08:41
+Generated on: 2026-07-17 09:40:11
 
 ```text
 bls-labor-mcp-server/
@@ -162,6 +162,8 @@ bls-labor-mcp-server/
 │   │   │   ├── ingester.ts
 │   │   │   ├── subprocess.ts
 │   │   │   └── types.ts
+│   │   ├── bls-periods/
+│   │   │   └── period-codes.ts
 │   │   └── canvas-bridge/
 │   │       └── canvas-bridge.ts
 │   └── index.ts
@@ -176,8 +178,11 @@ bls-labor-mcp-server/
 │   │   │   └── bls-catalog-service.test.ts
 │   │   ├── bls-observations/
 │   │   │   ├── bls-observations-routing.test.ts
+│   │   │   ├── bls-observations-service.test.ts
 │   │   │   ├── ingester.test.ts
 │   │   │   └── subprocess.test.ts
+│   │   ├── bls-periods/
+│   │   │   └── period-codes.test.ts
 │   │   └── canvas-bridge/
 │   │       └── canvas-bridge.test.ts
 │   └── tools/

@@ -141,6 +141,12 @@ const SURVEY_CAPABILITIES: Record<
 };
 
 export interface BatchFetchOptions {
+  /**
+   * Request BLS's annual-average rows (period M13/Q05/S03) alongside the real
+   * periods. Off unless asked: the rows are a year's mean, not an extra period,
+   * so a caller reducing `observations` would double-count each year.
+   */
+  annualAverage?: boolean;
   calculations?: boolean;
   endYear?: number;
   seriesIds: string[];
@@ -172,12 +178,17 @@ export class BlsApiService {
         ctx.log.debug('fetchSeries: routing via observations mirror', {
           seriesCount: options.seriesIds.length,
         });
-        const queryOpts: { seriesIds: string[]; startYear?: number; endYear?: number } = {
+        /**
+         * LABSTAT bakes annual-average rows into the bulk files unconditionally,
+         * so the flag has to travel to the mirror too — otherwise enabling the
+         * mirror would silently change what an identical request returns.
+         */
+        const mirrorResult = await mirror.queryBySeries({
           seriesIds: options.seriesIds,
+          annualAverage: options.annualAverage ?? false,
           ...(options.startYear !== undefined ? { startYear: options.startYear } : {}),
           ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
-        };
-        const mirrorResult = await mirror.queryBySeries(queryOpts);
+        });
 
         const mirrorSeries = await this.mirrorRowsToSeriesData(mirrorResult.observations);
 
@@ -186,13 +197,10 @@ export class BlsApiService {
           ctx.log.notice('fetchSeries: mirror miss, falling back to live API', {
             missedIds: mirrorResult.missedIds,
           });
-          const liveOptions: BatchFetchOptions = {
-            seriesIds: mirrorResult.missedIds,
-            ...(options.startYear !== undefined ? { startYear: options.startYear } : {}),
-            ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
-            ...(options.calculations !== undefined ? { calculations: options.calculations } : {}),
-          };
-          const liveSeries = await this.fetchSeriesLive(liveOptions, ctx);
+          const liveSeries = await this.fetchSeriesLive(
+            { ...options, seriesIds: mirrorResult.missedIds },
+            ctx,
+          );
           return [...mirrorSeries, ...liveSeries];
         }
 
@@ -232,8 +240,7 @@ export class BlsApiService {
         if (options.startYear !== undefined) body.startyear = String(options.startYear);
         if (options.endYear !== undefined) body.endyear = String(options.endYear);
         if (options.calculations) body.calculations = true;
-        if (options.startYear !== undefined || options.endYear !== undefined)
-          body.annualaverage = true;
+        if (options.annualAverage) body.annualaverage = true;
 
         const response = await fetch(`${this.baseUrl}/timeseries/data`, {
           method: 'POST',

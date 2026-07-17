@@ -10,6 +10,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { type BatchFetchOptions, getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
+import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
 import { getCanvasBridge, toDatasetField } from '@/services/canvas-bridge/canvas-bridge.js';
 
 /** Inline budget in characters of JSON. ~25k tokens ≈ 100,000 chars. */
@@ -17,7 +18,11 @@ const INLINE_BUDGET_CHARS = 100_000;
 
 const ObservationSchema = z.object({
   year: z.string().describe('Observation year.'),
-  period: z.string().describe('Period code (e.g. M01–M13, Q01–Q05, A01).'),
+  period: z
+    .string()
+    .describe(
+      'BLS period code: M01–M12 are months, Q01–Q04 quarters, S01–S02 semiannual halves. M13, Q05 and S03 are not further periods — each is the mean of that year\'s real observations, named "Annual", and appears only when annual_average is true. Exclude them from any sum or average over observations.',
+    ),
   periodName: z.string().optional().describe('Human-readable period name.'),
   value: z
     .string()
@@ -67,7 +72,7 @@ const CALC_COLUMNS = [
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    'Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.',
+    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). Observations cover real periods only and are safe to sum or average as returned; set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -160,6 +165,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .describe(
         'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports and omits the rest — CPI and PPI return percent change only (the inflation rate), and a survey that supports neither simply returns its observations without calculation fields. Requesting calculations never fails, so it is always safe to set; consult bls_list_surveys (allowsNetChange / allowsPercentChange) only to predict which fields will come back. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset.',
       ),
+    annual_average: z
+      .boolean()
+      .default(false)
+      .describe(
+        'When true, add each year\'s annual-average row to the observations. An annual average is the mean of that year\'s real periods, returned as an extra row named "Annual" with period M13 (monthly series), Q05 (quarterly) or S03 (semiannual) — not an additional month or quarter, so it must be excluded from any sum or average over observations. Defaults to false, which returns real periods only and is safe to aggregate directly. Independent of start_year/end_year. Surveys that publish no annual averages return the same rows either way; enrichment.annualAverageRows reports how many rows were actually added.',
+      ),
   }),
 
   output: z.object({
@@ -230,6 +241,17 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe('Whether BLS net/percent-change calculations were requested.'),
+    annualAverageApplied: z
+      .boolean()
+      .describe(
+        'Whether annual-average rows were requested. When false, observations hold real periods only and can be summed or averaged directly.',
+      ),
+    annualAverageRows: z
+      .number()
+      .optional()
+      .describe(
+        'How many observations across all series are annual-average rows (period M13/Q05/S03). Present only when annual_average is true; 0 means none of the requested surveys publish annual averages.',
+      ),
     notice: z
       .string()
       .optional()
@@ -244,6 +266,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       startYear: input.start_year,
       endYear: input.end_year,
       calculations: input.calculations,
+      annualAverage: input.annual_average,
     });
 
     if (
@@ -271,7 +294,10 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     }
 
     const service = getBlsApiService();
-    const fetchOptions: BatchFetchOptions = { seriesIds: input.series_ids };
+    const fetchOptions: BatchFetchOptions = {
+      seriesIds: input.series_ids,
+      annualAverage: input.annual_average,
+    };
     if (input.start_year !== undefined) fetchOptions.startYear = input.start_year;
     if (input.end_year !== undefined) fetchOptions.endYear = input.end_year;
     if (input.calculations !== undefined) fetchOptions.calculations = input.calculations;
@@ -283,12 +309,15 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const shouldSpill = inlineJson.length > INLINE_BUDGET_CHARS;
 
     const totalObservations = allRows.length;
+    const annualAverageRows = allRows.filter((r) => r.is_annual_average === true).length;
     ctx.enrich({
       totalObservations,
       seriesRequested: input.series_ids.length,
+      annualAverageApplied: input.annual_average,
       ...(input.start_year !== undefined && { startYearApplied: input.start_year }),
       ...(input.end_year !== undefined && { endYearApplied: input.end_year }),
       ...(input.calculations !== undefined && { calculationsApplied: input.calculations }),
+      ...(input.annual_average && { annualAverageRows }),
     });
 
     /**
@@ -307,6 +336,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       const ranged = input.start_year !== undefined || input.end_year !== undefined;
       notices.push(
         `No observations returned for ${emptySeriesIds.join(', ')}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
+      );
+    }
+    if (input.annual_average && annualAverageRows > 0) {
+      notices.push(
+        `${annualAverageRows} of ${totalObservations} observations are annual-average rows (period M13/Q05/S03, named "Annual"): each is the mean of that year's real periods, not an additional one. Exclude them from any sum or average over observations, or via is_annual_average when querying the canvas table.`,
       );
     }
 
@@ -336,6 +370,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           start_year: input.start_year,
           end_year: input.end_year,
           calculations: input.calculations,
+          annual_average: input.annual_average,
         },
       });
       const dataset = { ...toDatasetField(registered), truncated: false };
@@ -440,6 +475,8 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
         year: obs.year,
         period: obs.period,
         period_name: obs.periodName ?? null,
+        // SQL discriminator — an aggregate query that ignores it double-counts each year.
+        is_annual_average: isAnnualAveragePeriod(obs.period),
         value: obs.value,
         footnotes: obs.footnotes?.join('; ') ?? null,
         net_change_1m: obs.netChange1Month ?? null,

@@ -48,6 +48,66 @@ const SUCCESS_RESPONSE = {
   },
 };
 
+/** Capture the JSON body of the next POST /timeseries/data request. */
+async function captureBody(
+  options: Parameters<BlsApiService['fetchSeries']>[0],
+): Promise<Record<string, unknown>> {
+  let body: Record<string, unknown> = {};
+  const spy = vi.spyOn(globalThis, 'fetch').mockImplementationOnce((_url, init) => {
+    body = JSON.parse(init?.body as string) as Record<string, unknown>;
+    return Promise.resolve(okJson(SUCCESS_RESPONSE));
+  });
+  const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+  await svc.fetchSeries(options, createMockContext());
+  spy.mockRestore();
+  return body;
+}
+
+describe('BlsApiService.fetchSeries — annualaverage flag (#53)', () => {
+  it('omits annualaverage for a ranged request that did not ask for it', async () => {
+    // The flag was previously derived from the presence of a year bound, so a
+    // ranged request silently returned annual-average rows nobody asked for.
+    const body = await captureBody({
+      seriesIds: ['CUUR0000SA0'],
+      startYear: 2023,
+      endYear: 2024,
+    });
+
+    expect(body.startyear).toBe('2023');
+    expect(body.endyear).toBe('2024');
+    expect(body).not.toHaveProperty('annualaverage');
+  });
+
+  it('sends annualaverage without a year range — the two are independent', async () => {
+    const body = await captureBody({ seriesIds: ['CUUR0000SA0'], annualAverage: true });
+
+    expect(body.annualaverage).toBe(true);
+    expect(body).not.toHaveProperty('startyear');
+  });
+
+  it('sends annualaverage alongside a year range when both are requested', async () => {
+    const body = await captureBody({
+      seriesIds: ['CUUR0000SA0'],
+      startYear: 2023,
+      endYear: 2024,
+      annualAverage: true,
+    });
+
+    expect(body.annualaverage).toBe(true);
+    expect(body.startyear).toBe('2023');
+  });
+
+  it('omits annualaverage when explicitly false', async () => {
+    const body = await captureBody({
+      seriesIds: ['CUUR0000SA0'],
+      startYear: 2023,
+      annualAverage: false,
+    });
+
+    expect(body).not.toHaveProperty('annualaverage');
+  });
+});
+
 describe('BlsApiService.fetchSeries', () => {
   it('sends User-Agent on series fetch', async () => {
     let capturedHeaders: Record<string, string> | undefined;
