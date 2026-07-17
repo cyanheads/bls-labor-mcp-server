@@ -68,6 +68,16 @@ const SURVEYS: SurveyDefinition[] = [
   },
   { abbr: 'pr', name: 'Productivity - Business', codeTables: ['measure', 'sector'] },
   { abbr: 'mp', name: 'Productivity - Major Sector', codeTables: ['measure', 'sector'] },
+  /**
+   * Appended rather than grouped with the CPI family above: `SURVEY_ABBRS`
+   * indices are load-bearing for the observations ingester's resume cursor
+   * (see below), so new surveys go on the end to leave existing indices fixed.
+   */
+  {
+    abbr: 'cw',
+    name: 'CPI-W - Urban Wage Earners and Clerical Workers',
+    codeTables: ['area', 'item', 'periodicity'],
+  },
 ];
 
 /**

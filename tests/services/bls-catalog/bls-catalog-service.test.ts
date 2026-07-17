@@ -496,4 +496,51 @@ describe('BlsCatalogService.load (cold harvest)', () => {
     expect(result.series[0]!.seriesId).toBe('APU0000701111');
     expect(result.series[0]!.title).toContain('Consumer Price Index - Average Price Data');
   });
+
+  it('harvests the cw CPI-W survey so CWUR series resolve by exact SeriesID (#51)', async () => {
+    // Mirrors production cw.series, which does carry series_title per row.
+    const CW_SERIES =
+      'series_id\tarea_code\titem_code\tseasonal\tperiodicity_code\tbase_code\tbase_period\tseries_title\n' +
+      'CWUR0000SA0\t0000\tSA0\tU\tR\tS\t1982-84=100\tAll items in U.S. city average, urban wage earners and clerical workers, not seasonally adjusted\n';
+    const CW_AREA = 'area_code\tarea_name\n0000\tU.S. city average\n';
+    const CW_ITEM = 'item_code\titem_name\nSA0\tAll items\n';
+    const urls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes('/cw/cw.series'))
+        return Promise.resolve(new Response(CW_SERIES, { status: 200 }));
+      if (u.includes('/cw/cw.area')) return Promise.resolve(new Response(CW_AREA, { status: 200 }));
+      if (u.includes('/cw/cw.item')) return Promise.resolve(new Response(CW_ITEM, { status: 200 }));
+      // Every other survey contributes nothing, isolating the cw harvest.
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const svc = new BlsCatalogService(BASE_URL, 'ua/1.0', join(tmpDir, 'cw.db'), 168, false);
+    await svc.load(1);
+
+    expect(urls.some((u) => u.includes('/cw/cw.series'))).toBe(true);
+
+    // The reported repro: an exact SeriesID lookup returned zero results.
+    const exact = await svc.search({
+      query: 'CWUR0000SA0',
+      survey: undefined,
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 5,
+    });
+    expect(exact.series[0]!.seriesId).toBe('CWUR0000SA0');
+    expect(exact.series[0]!.surveyAbbr).toBe('CW');
+
+    // ...as did a survey-filtered concept query.
+    const filtered = await svc.search({
+      query: 'all items',
+      survey: 'CW',
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 5,
+    });
+    expect(filtered.series.length).toBeGreaterThan(0);
+    expect(filtered.series[0]!.seriesId).toBe('CWUR0000SA0');
+  });
 });

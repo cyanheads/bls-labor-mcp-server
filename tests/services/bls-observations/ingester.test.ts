@@ -384,19 +384,21 @@ describe('observationsSync — cursor and checkpoint', () => {
   });
 
   it('cursor is not emitted on the very last page of the last survey', async () => {
-    // Mock: only the last survey (mp) returns data; all others return 404
+    // Serve only whichever survey is last in SURVEY_ABBRS; all others 404. Read
+    // from the list rather than naming a survey, so appending one keeps testing
+    // the completion signal instead of silently testing a mid-list survey.
+    const lastAbbr = SURVEY_ABBRS.at(-1);
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      // Only serve mp
-      if (u.includes('/mp/') && u.includes('.readme')) {
+      if (u.includes(`/${lastAbbr}/`) && u.includes('.readme')) {
         return Promise.resolve(
-          new Response('mp.data.1.AllData\n', {
+          new Response(`${lastAbbr}.data.1.AllData\n`, {
             status: 200,
             headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
           }),
         );
       }
-      if (u.includes('/mp/') && u.includes('.data.')) {
+      if (u.includes(`/${lastAbbr}/`) && u.includes('.data.')) {
         return Promise.resolve(
           new Response(DATA_FILE_CONTENT, {
             status: 200,
@@ -471,7 +473,15 @@ describe('SURVEY_ABBRS — canonical survey list (#49)', () => {
     expect(SURVEY_ABBRS).not.toContain('sa');
   });
 
+  it('carries the cw CPI-W survey alongside the other CPI-family surveys (#51)', () => {
+    // Without cw in the list, bls_search_series can never resolve a CWUR…/CWSR…
+    // SeriesID — the survey is absent from the index, not merely ranked low.
+    expect(SURVEY_ABBRS).toContain('cw');
+  });
+
   it('pins the canonical harvest order — the resume cursor encodes these indices', () => {
+    // Append-only: a cursor persisted mid-init stores each survey's index, so a
+    // new survey goes on the end rather than beside its family.
     expect([...SURVEY_ABBRS]).toEqual([
       'cu',
       'ap',
@@ -485,6 +495,7 @@ describe('SURVEY_ABBRS — canonical survey list (#49)', () => {
       'ec',
       'pr',
       'mp',
+      'cw',
     ]);
   });
 });
