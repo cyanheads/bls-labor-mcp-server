@@ -15,6 +15,7 @@ import {
   inferSchemaFromRows,
   type QueryResult,
 } from '@cyanheads/mcp-ts-core/canvas';
+import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -80,17 +81,20 @@ export function deriveAllNullableSchema(rows: Record<string, unknown>[]): Column
 export class CanvasBridge {
   constructor(private readonly canvas: DataCanvas) {}
 
+  /**
+   * Register `options.rows` as a canvas table and return its handle.
+   *
+   * Throws on failure rather than returning a sentinel. Callers register a
+   * dataframe precisely because the rows do not fit inline, so a swallowed
+   * failure would leave them returning a truncated preview that reads as a
+   * complete result. `canvas_registration_failed` is deliberately distinct from
+   * `canvas_unavailable`: canvas is configured here — only this call failed, so
+   * "enable canvas" is the wrong recovery to hand back.
+   */
   async registerDataframe(
     ctx: Context,
     options: RegisterDataframeOptions,
-  ): Promise<RegisterDataframeResult | undefined> {
-    if (options.rows.length === 0) {
-      ctx.log.debug('Skipping dataframe registration — no rows', {
-        sourceTool: options.sourceTool,
-      });
-      return;
-    }
-
+  ): Promise<RegisterDataframeResult> {
     try {
       await this.sweepExpired(ctx);
       const instance = await this.acquireSharedCanvas(ctx);
@@ -131,7 +135,16 @@ export class CanvasBridge {
         error: error instanceof Error ? error.message : String(error),
         sourceTool: options.sourceTool,
       });
-      return;
+      throw serviceUnavailable(
+        `Canvas is configured but registering the ${options.rows.length}-row dataframe for ${options.sourceTool} failed, so the full result set cannot be returned.`,
+        {
+          reason: 'canvas_registration_failed',
+          sourceTool: options.sourceTool,
+          rowCount: options.rows.length,
+          ...ctx.recoveryFor('canvas_registration_failed'),
+        },
+        { cause: error },
+      );
     }
   }
 

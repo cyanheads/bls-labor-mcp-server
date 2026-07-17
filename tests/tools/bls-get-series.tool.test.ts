@@ -4,7 +4,7 @@
  */
 
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetSeriesTool } from '@/mcp-server/tools/definitions/bls-get-series.tool.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
 
@@ -26,12 +26,45 @@ vi.mock('@/services/bls-api/bls-api-service.js', () => ({
   getBlsApiService: () => ({ fetchSeries: fetchSeriesMock }),
 }));
 
+/**
+ * The bridge is swappable per test: `undefined` models canvas being unconfigured,
+ * an object models canvas configured — whose `registerDataframe` can resolve a
+ * handle or throw. `toDatasetField` keeps its real shape so the spilled `dataset`
+ * assertions exercise the actual mapping rather than a stub.
+ */
+const registerDataframeMock = vi.fn();
+let canvasBridge: { registerDataframe: typeof registerDataframeMock } | undefined;
+
 vi.mock('@/services/canvas-bridge/canvas-bridge.js', () => ({
-  getCanvasBridge: () => undefined,
-  toDatasetField: vi.fn(),
+  getCanvasBridge: () => canvasBridge,
+  toDatasetField: (r: { tableName: string; rowCount: number; expiresAt: string }) => ({
+    name: r.tableName,
+    row_count: r.rowCount,
+    expires_at: r.expiresAt,
+  }),
 }));
 
+/** Enough observations to push the inline JSON past INLINE_BUDGET_CHARS (100k). */
+function bulkySeries(seriesId = 'LNS14000000'): SeriesData {
+  return {
+    seriesId,
+    title: 'Unemployment Rate',
+    observations: Array.from({ length: 900 }, (_, i) => ({
+      year: String(2000 + Math.floor(i / 12)),
+      period: `M${String((i % 12) + 1).padStart(2, '0')}`,
+      periodName: 'December',
+      value: String(4 + (i % 10) / 10),
+      footnotes: ['P: Preliminary figure subject to revision in a later release'],
+    })),
+  };
+}
+
 describe('blsGetSeriesTool', () => {
+  beforeEach(() => {
+    canvasBridge = undefined;
+    registerDataframeMock.mockReset();
+  });
+
   it('returns inline series data within budget and enriches with total observations', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
@@ -146,6 +179,67 @@ describe('blsGetSeriesTool', () => {
 
     expect(result.series[0]!.observationCount).toBe(0);
     expect(result.series[0]!.observations).toHaveLength(0);
+    // The zero-obs series must be announced in structuredContent, not just format() (#45)
+    expect(getEnrichment(ctx).notice).toContain('SPARSE000');
+  });
+
+  it('notices a zero-observation series and names it, on the non-spilled path (#45)', async () => {
+    // The empty series is still present in series[], so series.length === seriesRequested
+    // even though one series returned nothing — the notice is the only structured signal.
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES, { seriesId: 'NOTREAL999', observations: [] }]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000', 'NOTREAL999'],
+    });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(result.spilled).toBe(false);
+    expect(result.series).toHaveLength(enriched.seriesRequested as number);
+    expect(enriched.notice).toContain('NOTREAL999');
+    expect(enriched.notice).toContain('bls_search_series');
+    // The series that did return data must not be named as empty.
+    expect(enriched.notice).not.toContain('LNS14000000');
+  });
+
+  it('notices a SeriesID the mirror omitted from series[] entirely (#45)', async () => {
+    // The observations mirror groups by returned rows, so a series with no rows is
+    // absent rather than present-and-empty. Reconciling against the requested IDs
+    // catches that shape too.
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000', 'ABSENT001'],
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toContain('ABSENT001');
+  });
+
+  it('points an empty ranged request at the year range as well as the SeriesID (#45)', async () => {
+    fetchSeriesMock.mockResolvedValue([{ seriesId: 'ECS10001I', observations: [] }]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['ECS10001I'],
+      start_year: 2023,
+      end_year: 2024,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toMatch(/start_year\/end_year/);
+  });
+
+  it('sets no notice when every requested series returned data', async () => {
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('formats output with period code column', () => {
@@ -425,6 +519,84 @@ describe('blsGetSeriesTool', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('No observations');
     expect(text).toContain('bls_search_series');
+  });
+
+  it('throws canvas_unavailable when the result spills and canvas is not configured', async () => {
+    fetchSeriesMock.mockResolvedValue([bulkySeries()]);
+    canvasBridge = undefined;
+
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+
+    await expect(blsGetSeriesTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'canvas_unavailable' },
+    });
+  });
+
+  it('returns a dataset handle when the result spills and registration succeeds', async () => {
+    fetchSeriesMock.mockResolvedValue([bulkySeries()]);
+    registerDataframeMock.mockResolvedValue({
+      tableName: 'df_AAAAA_BBBBB',
+      rowCount: 900,
+      expiresAt: '2026-07-18T00:00:00.000Z',
+      columnSchema: [],
+    });
+    canvasBridge = { registerDataframe: registerDataframeMock };
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+
+    expect(result.spilled).toBe(true);
+    expect(result.dataset?.name).toBe('df_AAAAA_BBBBB');
+    expect(result.dataset?.row_count).toBe(900);
+    // Preview only inline, but the true count stays visible.
+    expect(result.series[0]!.observations).toHaveLength(3);
+    expect(result.series[0]!.observationCount).toBe(900);
+    expect(getEnrichment(ctx).notice).toContain('df_AAAAA_BBBBB');
+  });
+
+  it('throws canvas_registration_failed when canvas is configured but registration fails (#46)', async () => {
+    // Previously this returned isError:false with a 3-observation preview, no dataset
+    // handle, and a notice pointing at a canvas table that was never created.
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    fetchSeriesMock.mockResolvedValue([bulkySeries()]);
+    registerDataframeMock.mockRejectedValue(
+      serviceUnavailable('registration blew up', { reason: 'canvas_registration_failed' }),
+    );
+    canvasBridge = { registerDataframe: registerDataframeMock };
+
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+
+    await expect(blsGetSeriesTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'canvas_registration_failed' },
+    });
+  });
+
+  it('composes the empty-series notice with the spill notice (#45, #46)', async () => {
+    // ctx.enrich.notice is last-wins, so both signals must arrive as one string.
+    fetchSeriesMock.mockResolvedValue([
+      bulkySeries(),
+      { seriesId: 'NOTREAL999', observations: [] },
+    ]);
+    registerDataframeMock.mockResolvedValue({
+      tableName: 'df_CCCCC_DDDDD',
+      rowCount: 900,
+      expiresAt: '2026-07-18T00:00:00.000Z',
+      columnSchema: [],
+    });
+    canvasBridge = { registerDataframe: registerDataframeMock };
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000', 'NOTREAL999'],
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('NOTREAL999');
+    expect(notice).toContain('df_CCCCC_DDDDD');
   });
 
   // Security: verify API key never appears in tool output

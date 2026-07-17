@@ -47,36 +47,97 @@ import type {
 const SURVEY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
- * Hardcoded capability flags for known surveys. The bulk `/surveys` endpoint
- * only returns `survey_abbreviation` and `survey_name` — capability fields are
- * only available on the per-survey `/surveys/{code}` endpoint. Fetching all
- * ~70 surveys individually on every list call would consume significant quota
- * and latency. This table covers the surveys most relevant to the tool surface
- * and is merged at list time. Sourced from BLS `/surveys/{code}` responses.
+ * Capability flags for every BLS survey, keyed by `survey_abbreviation`.
+ *
+ * The bulk `/surveys` endpoint returns only `survey_abbreviation` and
+ * `survey_name`; the flags live exclusively on the per-survey `/surveys/{code}`
+ * endpoint. Fetching ~70 surveys individually at runtime would spend an eighth
+ * of the 500/day quota on metadata every time the process-local cache lapsed,
+ * so the sweep is done once at development time and its result baked in here.
+ *
+ * Covers all 70 abbreviations the bulk endpoint returns, so `listSurveys()`
+ * never has to guess. To re-derive after BLS adds or changes a survey:
+ * `GET /surveys` for the abbreviation list, then `GET /surveys/{abbr}` for each.
+ *
+ * Verified 2026-07-17 against `/surveys/{abbr}`, and cross-checked for 17
+ * surveys against a live `POST /timeseries/data` with `calculations: true` —
+ * the flags predicted which calculations the API actually returned in every
+ * case, including the percent-only and neither-supported surveys.
  */
 const SURVEY_CAPABILITIES: Record<
   string,
   { allowsNetChange: boolean; allowsPercentChange: boolean; hasAnnualAverages: boolean }
 > = {
-  AP: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  AP: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  BD: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  BG: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  BP: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  CA: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  CB: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  CC: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: true },
+  CD: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
   CE: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
-  CI: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  CF: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  CH: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  CI: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  CM: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  CS: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
   CU: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
-  EC: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
+  CW: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  CX: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  EB: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  EC: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  EE: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
   EI: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
-  IP: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
-  JT: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
-  LA: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: true },
+  EN: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  EP: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  EW: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  FA: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  FI: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  FM: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  FW: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  GG: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  GP: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  HC: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  HS: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  II: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  IN: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  IP: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  IS: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  JL: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  JT: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  KV: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  LA: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  LE: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  LF: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  LI: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
   LN: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
-  MP: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
-  NW: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
+  LU: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  ML: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  MP: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  MU: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  MW: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  NB: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  NC: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  ND: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  NW: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
   OE: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
-  PC: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
-  PR: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
-  SA: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
+  OR: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  PC: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  PD: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  PF: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  PI: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
+  PR: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: true },
+  SA: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  SH: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  SI: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
   SM: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
+  SU: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
   TU: { allowsNetChange: false, allowsPercentChange: false, hasAnnualAverages: false },
-  WP: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: false },
+  WD: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  WM: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: false },
+  WP: { allowsNetChange: false, allowsPercentChange: true, hasAnnualAverages: true },
+  WS: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
 };
 
 export interface BatchFetchOptions {
@@ -369,9 +430,11 @@ export class BlsApiService {
           return {
             surveyAbbreviation: s.survey_abbreviation,
             surveyName: s.survey_name,
-            // Bulk endpoint omits capability flags; merge from hardcoded table.
-            // Per-survey endpoint has them but fetching ~70 surveys individually
-            // wastes quota. Fall back to false for surveys not in the table.
+            // The bulk endpoint omits capability flags, so merge them from the
+            // swept table, which covers every abbreviation BLS currently lists.
+            // The fallbacks only engage for a survey added upstream since the
+            // last sweep: prefer the bulk payload if it ever carries the flags,
+            // else report false rather than inventing support.
             allowsNetChange: caps?.allowsNetChange ?? s.allowsNetChange === 'true',
             allowsPercentChange: caps?.allowsPercentChange ?? s.allowsPercentChange === 'true',
             hasAnnualAverages: caps?.hasAnnualAverages ?? s.hasAnnualAverages === 'true',

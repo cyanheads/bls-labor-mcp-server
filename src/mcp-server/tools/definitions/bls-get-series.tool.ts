@@ -67,7 +67,7 @@ const CALC_COLUMNS = [
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    'Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports — CPI and PPI return percent change only, the inflation rate — so check bls_list_surveys first). When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.',
+    'Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.',
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -119,6 +119,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       recovery:
         'Narrow start_year/end_year to reduce the result set, or enable canvas by setting CANVAS_PROVIDER_TYPE=duckdb.',
     },
+    {
+      reason: 'canvas_registration_failed',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The result set exceeds the inline budget and canvas is configured, but registering the dataframe failed.',
+      recovery:
+        'Retry the request — the failure is usually transient. If it persists, narrow start_year/end_year so the result fits inline.',
+    },
   ],
 
   input: z.object({
@@ -151,7 +158,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports: CPI and PPI return percent change only (the inflation rate), with no error. Only surveys that support neither net nor percent change (e.g. AP average price data) return an error — check bls_list_surveys first. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset.',
+        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports and omits the rest — CPI and PPI return percent change only (the inflation rate), and a survey that supports neither simply returns its observations without calculation fields. Requesting calculations never fails, so it is always safe to set; consult bls_list_surveys (allowsNetChange / allowsPercentChange) only to predict which fields will come back. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset.',
       ),
   }),
 
@@ -209,7 +216,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     seriesRequested: z
       .number()
       .describe(
-        'Number of SeriesIDs requested. Compare against the returned series[] length to detect series that returned no data.',
+        'Number of SeriesIDs requested. Do not compare it against series[] length to find empty series — a SeriesID that returned no data is still listed in series[] with observationCount 0. Check observationCount per entry, or read notice, which names every SeriesID that came back empty.',
       ),
     startYearApplied: z
       .number()
@@ -227,7 +234,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .string()
       .optional()
       .describe(
-        'Guidance for agents — e.g. when results spilled to canvas and SQL is needed for full access. Absent when all observations fit inline.',
+        'Guidance for agents — names any SeriesID that returned zero observations, and reports when results spilled to canvas and SQL is needed for full access. Absent when every requested series returned data and it all fit inline.',
       ),
   },
 
@@ -284,6 +291,25 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       ...(input.calculations !== undefined && { calculationsApplied: input.calculations }),
     });
 
+    /**
+     * Empty series are invisible in the payload alone: the live API echoes a
+     * requested SeriesID back with `data: []`, while the observations mirror
+     * omits it entirely. Reconciling against the requested IDs catches both.
+     * `ctx.enrich.notice` is last-wins, so every notice this handler emits is
+     * composed into one string below.
+     */
+    const byId = new Map(allSeries.map((s) => [s.seriesId, s]));
+    const emptySeriesIds = input.series_ids.filter(
+      (id) => (byId.get(id)?.observations.length ?? 0) === 0,
+    );
+    const notices: string[] = [];
+    if (emptySeriesIds.length > 0) {
+      const ranged = input.start_year !== undefined || input.end_year !== undefined;
+      notices.push(
+        `No observations returned for ${emptySeriesIds.join(', ')}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
+      );
+    }
+
     if (shouldSpill) {
       const bridge = getCanvasBridge();
 
@@ -301,6 +327,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         );
       }
 
+      // Registration throws if it fails, so a spilled result always has a handle.
       const registered = await bridge.registerDataframe(ctx, {
         rows: allRows,
         sourceTool: 'bls_get_series',
@@ -311,11 +338,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           calculations: input.calculations,
         },
       });
-      const dataset = registered ? { ...toDatasetField(registered), truncated: false } : undefined;
+      const dataset = { ...toDatasetField(registered), truncated: false };
 
-      ctx.enrich.notice(
-        `${totalObservations} total observations across ${allSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset?.name ?? '(unavailable)'}; use bls_dataframe_query for SQL access.`,
+      notices.push(
+        `${totalObservations} total observations across ${allSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset.name}; use bls_dataframe_query for SQL access.`,
       );
+      ctx.enrich.notice(notices.join(' '));
 
       // Still return preview rows inline — first 3 observations per series
       const seriesPreview = allSeries.map((s) => ({
@@ -329,10 +357,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       }));
       return {
         series: seriesPreview,
-        ...(dataset !== undefined && { dataset }),
+        dataset,
         spilled: true as const,
       };
     }
+
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       series: allSeries.map((s) => ({

@@ -445,6 +445,79 @@ describe('BlsApiService.listSurveys', () => {
     expect(ce!.allowsNetChange).toBe(true);
   });
 
+  it('reports capability flags matching live BLS behavior (#39)', async () => {
+    /**
+     * Each expectation is anchored to `GET /surveys/{abbr}` and cross-checked
+     * against a live `POST /timeseries/data` with `calculations: true`:
+     * AP/JT/LA return net + percent change, CU/CW/SU return percent change only
+     * (`net_changes` comes back an empty object), and IP/MP return neither.
+     * The bulk `/surveys` payload carries no flags, so every value below comes
+     * from the merged table rather than this fixture.
+     */
+    const expected = [
+      { abbr: 'AP', net: true, pct: true, annual: false },
+      { abbr: 'JT', net: true, pct: true, annual: true },
+      { abbr: 'CW', net: false, pct: true, annual: true },
+      { abbr: 'CU', net: false, pct: true, annual: true },
+      { abbr: 'SU', net: false, pct: true, annual: true },
+      { abbr: 'LA', net: true, pct: true, annual: true },
+      { abbr: 'IP', net: false, pct: false, annual: false },
+      { abbr: 'MP', net: false, pct: false, annual: false },
+    ];
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 50,
+        message: [],
+        Results: {
+          survey: expected.map((e) => ({
+            survey_abbreviation: e.abbr,
+            survey_name: `${e.abbr} survey`,
+          })),
+        },
+      }),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.listSurveys(createMockContext());
+
+    for (const { abbr, net, pct, annual } of expected) {
+      const survey = result.find((s) => s.surveyAbbreviation === abbr);
+      expect(survey, `${abbr} missing from listSurveys output`).toBeDefined();
+      expect(survey!.allowsNetChange, `${abbr} allowsNetChange`).toBe(net);
+      expect(survey!.allowsPercentChange, `${abbr} allowsPercentChange`).toBe(pct);
+      expect(survey!.hasAnnualAverages, `${abbr} hasAnnualAverages`).toBe(annual);
+    }
+  });
+
+  it('covers every survey the bulk endpoint lists, so none defaults to false (#39)', async () => {
+    // A survey absent from the table silently reports false/false/false — the
+    // original bug. The table is swept from all 70 abbreviations BLS returns.
+    const allAbbrs = `AP BD BG BP CA CB CC CD CE CF CH CI CM CS CU CW CX EB EC EE EI EN EP EW FA FI
+      FM FW GG GP HC HS II IN IP IS JL JT KV LA LE LF LI LN LU ML MP MU MW NB NC ND NW OE OR PC PD
+      PF PI PR SA SH SI SM SU TU WD WM WP WS`.split(/\s+/);
+    expect(allAbbrs).toHaveLength(70);
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 50,
+        message: [],
+        Results: {
+          survey: allAbbrs.map((a) => ({ survey_abbreviation: a, survey_name: `${a} survey` })),
+        },
+      }),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.listSurveys(createMockContext());
+
+    // 50 of the 70 support at least one calculation; a survey missing from the
+    // table would silently report false, so a lower count means a gap reopened.
+    const withCalcSupport = result.filter((s) => s.allowsNetChange || s.allowsPercentChange);
+    expect(withCalcSupport).toHaveLength(50);
+  });
+
   it('uses in-memory cache on second call without fetching', async () => {
     // Count only the fetches made inside this test by checking before/after
     let callCount = 0;

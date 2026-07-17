@@ -49,7 +49,7 @@ The core UX problem is SeriesID resolution: BLS identifiers (`LNS14000000`, `CES
 - 500 queries/day per API key; 50 series per request; up to 20 years history per request
 - Read-only access — BLS API has no write endpoints
 - SeriesID catalog sourced from LABSTAT flat files at `download.bls.gov/pub/time.series/{survey}/` — one `{survey}.series` file + code-mapping files per survey (e.g., `cu.series` = 1.3MB, `ce.series` = 3.9MB, `ln.series` = 15MB). Only the `{survey}.series` and `{survey}.map` files are needed, not the `{survey}.data.*` observation files (those are hundreds of MB). Download and bundle at build time; total series-index footprint is estimated 50–100MB across all ~60 surveys; `bls_search_series` operates entirely offline against this index
-- Period-over-period calculations via BLS v2 `calculations: true` boolean; a single flag (you cannot select an individual calculation type), but the API returns whichever the survey supports — each survey's `allowsNetChange` / `allowsPercentChange` fields (from `GET /surveys/{abbr}`) indicate which, and a survey supporting neither returns an error
+- Period-over-period calculations via BLS v2 `calculations: true` boolean; a single flag (you cannot select an individual calculation type), but the API returns whichever the survey supports and never fails — a survey supporting neither still returns `REQUEST_SUCCEEDED` with its observations and an informational message, no calculation fields; each survey's `allowsNetChange` / `allowsPercentChange` fields (from `GET /surveys/{abbr}`) predict which will come back
 - `api-canvas` / DataCanvas available for tabular spillover when series count × observation count exceeds context budget
 
 ---
@@ -141,7 +141,8 @@ Series catalog resolution is handled entirely offline from LABSTAT flat files �
 | `bls_get_series` | `no_data_for_period` | `InvalidParams` | API returns "No Data Available for Series" for the requested year range | No — adjust `start_year`/`end_year` |
 | `bls_get_series` | `calculations_not_supported` | `InvalidParams` | `calculations: true` requested for a survey that doesn't support it | No — remove calculations flag |
 | `bls_search_series` | `catalog_unavailable` | `InternalError` | Catalog index not loaded (startup failure or build-time skip) | No — server restart needed |
-| `bls_dataframe_describe`, `bls_dataframe_query`, `bls_dataframe_drop` | `canvas_unavailable` | `ServiceUnavailable` | `CANVAS_PROVIDER_TYPE` is not `duckdb` | No — set env var and restart |
+| `bls_get_series`, `bls_dataframe_describe`, `bls_dataframe_query`, `bls_dataframe_drop` | `canvas_unavailable` | `ServiceUnavailable` | `CANVAS_PROVIDER_TYPE` is not `duckdb`. On `bls_get_series`, only when the result also exceeds the inline budget | No — set env var and restart |
+| `bls_get_series` | `canvas_registration_failed` | `ServiceUnavailable` | Result exceeds the inline budget and canvas is configured, but `registerDataframe` failed | Yes — usually transient; else narrow the year range |
 
 ---
 
@@ -180,6 +181,8 @@ Canvas SQL is quota-free — only the upstream `bls_get_series` call counts agai
 
 Both `bls_get_series` and `bls_get_latest` return structured data that must appear in full in both `structuredContent` (Claude Code) and the `format()` markdown twin (Claude Desktop). The `format()` implementation must render all observation values, not just a count or summary. `bls_search_series` similarly must render decoded series components (survey, area, item, seasonal flag, plain-language name) in `format()` — not just a count of matches.
 
+A series that returns no data must be reported on both surfaces too. `bls_get_series` keeps the SeriesID in `series[]` with `observationCount: 0` — it is never dropped, so `series[].length` always equals `seriesRequested` and cannot be used to detect it — and names every empty SeriesID in `enrichment.notice`, which reaches `structuredContent` as well as the `content[]` trailer. `format()`'s per-series "no observations" line alone is not sufficient: it never reaches `structuredContent` consumers.
+
 ---
 
 ## Known Limitations
@@ -188,7 +191,8 @@ Both `bls_get_series` and `bls_get_latest` return structured data that must appe
 - **20-year history window.** BLS v2 caps history at 20 years per request. Longer time series require multiple calls.
 - **SeriesID catalog freshness.** The bundled catalog reflects BLS flat files at build time. New series or geographic area changes won't appear until a rebuild. `bls_search_series` may miss very recently added series.
 - **No geographic geocoding.** Area code resolution maps string names to BLS FIPS/area codes from the catalog — it's a lookup, not a geocoder. Unusual MSA names or abbreviations may not match.
-- **Calculations are BLS-server-side, requested via a single flag.** `calculations: true` requests both net change and percent change — individual types cannot be selected — but the API returns whichever the survey supports (CPI/PPI return percent change only, with no error). The `allowsNetChange`/`allowsPercentChange` fields from the surveys API indicate per-survey support. A survey that supports neither returns an error rather than silently ignoring the flag.
+- **Calculations are BLS-server-side, requested via a single flag.** `calculations: true` requests both net change and percent change — individual types cannot be selected — but the API returns whichever the survey supports (CPI/PPI return percent change only). Requesting calculations never fails: a survey that supports neither still returns `REQUEST_SUCCEEDED` with its observations, adding an informational `message[]` entry ("BLS does not produce calculations for Series …") and no calculation fields. The `allowsNetChange`/`allowsPercentChange` flags are therefore predictive only — `bls_get_series` passes the flag through unconditionally and never gates on them.
+- **Survey capability flags are a baked-in table, not a live read.** Only `GET /surveys/{abbr}` carries `allowsNetChange`/`allowsPercentChange`/`hasAnnualAverages`; the bulk `GET /surveys` omits them. Reading them live would cost ~70 queries whenever the process-local survey cache lapsed, so `SURVEY_CAPABILITIES` in `bls-api-service.ts` holds a swept snapshot of all 70 abbreviations, merged at list time. It needs a re-sweep only when BLS adds or changes a survey.
 - **Dataframe tools require `CANVAS_PROVIDER_TYPE=duckdb`.** DuckDB has no V8-isolate build; setting this on Cloudflare Workers fails closed with a `ConfigurationError` at init time. Node.js only. When canvas is disabled, all three dataframe tools throw `canvas_unavailable` (`ServiceUnavailable`).
 
 ---
