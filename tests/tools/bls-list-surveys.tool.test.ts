@@ -207,3 +207,64 @@ describe('blsListSurveysTool — error contracts', () => {
     });
   });
 });
+
+describe('blsListSurveysTool — CATEGORY_MAP correctness (#44)', () => {
+  // Only `listSurveys` is mocked — the real CATEGORY_MAP does the category
+  // filtering, so these assertions exercise the actual map, not a copy of it.
+  // The fixture spans exactly the abbreviations under test; each survey code was
+  // verified against the live BLS /surveys response.
+  const mk = (surveyAbbreviation: string, surveyName: string) => ({
+    surveyAbbreviation,
+    surveyName,
+    allowsNetChange: false,
+    allowsPercentChange: false,
+    hasAnnualAverages: false,
+  });
+
+  const CATEGORY_FIXTURE = [
+    // Injury/illness family members + the wrongly-categorized IN.
+    mk('IN', 'International Labor Comparison'),
+    mk('IS', 'Occupational injuries and illnesses industry data'),
+    mk('CF', 'Census of Fatal Occupational Injuries'),
+    mk('HC', 'Nonfatal cases involving days away from work: Selected Characteristics (2002)'),
+    // Employment + the phantom IC (absent from the live /surveys list).
+    mk('CE', 'Employment, Hours, and Earnings from the Current Employment Statistics survey'),
+    mk('IC', 'Phantom code — not present in the BLS /surveys response'),
+    // Productivity: real PR/PI/PF + the phantom DI.
+    mk('PR', 'Major Sector Productivity and Costs'),
+    mk('PI', 'Industry Productivity Index'),
+    mk('PF', 'Federal Government Productivity Index'),
+    mk('DI', 'Phantom code — not present in the BLS /surveys response'),
+  ];
+
+  beforeEach(() => {
+    listSurveysMock.mockResolvedValue(CATEGORY_FIXTURE);
+  });
+
+  const abbrsFor = async (category: 'injuries' | 'employment' | 'productivity') => {
+    const ctx = createMockContext();
+    const input = blsListSurveysTool.input.parse({ category });
+    const result = await blsListSurveysTool.handler(input, ctx);
+    return result.surveys.map((s) => s.abbreviation);
+  };
+
+  it('injuries returns the injury/illness family and excludes IN (International Labor Comparison)', async () => {
+    const abbrs = await abbrsFor('injuries');
+    // Real injury/illness surveys (fatal CFOI + nonfatal IIF/SOII, incl. vintage HC).
+    expect(abbrs).toEqual(expect.arrayContaining(['IS', 'CF', 'HC']));
+    // IN is International Labor Comparison, not injuries — the pre-fix map returned it.
+    expect(abbrs).not.toContain('IN');
+  });
+
+  it('employment excludes the phantom IC code', async () => {
+    const abbrs = await abbrsFor('employment');
+    expect(abbrs).toContain('CE');
+    expect(abbrs).not.toContain('IC');
+  });
+
+  it('productivity includes PI and PF and excludes the phantom DI code', async () => {
+    const abbrs = await abbrsFor('productivity');
+    expect(abbrs).toEqual(expect.arrayContaining(['PR', 'PI', 'PF']));
+    expect(abbrs).not.toContain('DI');
+  });
+});

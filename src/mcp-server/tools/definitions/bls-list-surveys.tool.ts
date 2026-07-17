@@ -9,13 +9,34 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
-/** Survey category tags used to group BLS programs for filtering. */
+/**
+ * Survey category tags used to group BLS programs for filtering. Codes are the
+ * two-letter `survey_abbreviation` values from the BLS /surveys list. The
+ * injuries family is partitioned by measure and year-vintage (CFOI fatal +
+ * IIF/SOII nonfatal, across historical ranges), so it spans many codes.
+ */
 const CATEGORY_MAP: Record<string, string[]> = {
   prices: ['CU', 'PC', 'WP', 'AP', 'EI'],
-  employment: ['CE', 'LN', 'LA', 'SM', 'SA', 'OE', 'IC', 'JT'],
+  employment: ['CE', 'LN', 'LA', 'SM', 'SA', 'OE', 'JT'],
   wages: ['OE', 'EC', 'CI', 'NW'],
-  productivity: ['PR', 'MP', 'IP', 'DI'],
-  injuries: ['IS', 'IN'],
+  productivity: ['PR', 'MP', 'IP', 'PI', 'PF'],
+  injuries: [
+    'CA',
+    'CB',
+    'CD',
+    'CF',
+    'CH',
+    'CS',
+    'FA',
+    'FI',
+    'FW',
+    'HC',
+    'HS',
+    'II',
+    'IS',
+    'SH',
+    'SI',
+  ],
   time_use: ['TU'],
 };
 
