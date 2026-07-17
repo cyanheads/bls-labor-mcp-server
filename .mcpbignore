@@ -1,5 +1,6 @@
 .env*
 .mcpregistry_*
+/.cache/
 /.claude/
 /.agents/
 /skills/
