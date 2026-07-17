@@ -1,5 +1,6 @@
 /**
- * @fileoverview Tests for BlsApiService — quota handling and series-not-found parsing.
+ * @fileoverview Tests for BlsApiService — quota handling, invalid-key
+ * classification, upstream-message redaction, and series-not-found parsing.
  * @module tests/services/bls-api/bls-api-service.test
  */
 
@@ -26,6 +27,35 @@ function okJson(payload: unknown): Response {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/** A fake key, shaped like a real one. Never put a live key in a fixture. */
+const FAKE_KEY = 'FAKE0000000000000000000000000001';
+
+/**
+ * BLS's answer to an unregistered key, verbatim but for the key itself (captured
+ * 2026-07-17). Byte-identical across `POST /timeseries/data`,
+ * `GET /timeseries/data/{id}?latest=true` and `GET /surveys` — note it echoes the
+ * submitted key straight back at us.
+ */
+function invalidKeyResponse(key: string) {
+  return {
+    status: 'REQUEST_NOT_PROCESSED',
+    responseTime: 0,
+    message: [
+      `The key:${key} provided by the User is invalid. Please provide a proper key for the operation to be successful`,
+    ],
+    Results: {},
+  };
+}
+
+/**
+ * Everything an MCP client can see of a thrown error: `content[]` renders the
+ * message, `structuredContent.error` carries the message and `data`.
+ */
+function clientVisible(error: unknown): string {
+  const { message, data } = error as { message?: string; data?: unknown };
+  return JSON.stringify({ message, data });
 }
 
 const SUCCESS_RESPONSE = {
@@ -479,6 +509,130 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
   });
 });
 
+describe('BlsApiService — invalid API key and message redaction (#56)', () => {
+  it('classifies the invalid-key message as invalid_api_key, not quota_exceeded', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS14000000'] }, createMockContext())
+      .catch((e: unknown) => e);
+
+    // BLS answers a bad key and an exhausted quota with the same status, so
+    // reading the status alone billed a config error as a day-long outage.
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ConfigurationError,
+      data: { reason: 'invalid_api_key', retryable: false },
+    });
+  });
+
+  it('classifies the invalid-key message from the fetchLatest GET endpoint', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc
+      .fetchLatest('LNS14000000', createMockContext())
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'invalid_api_key', retryable: false } });
+  });
+
+  it('keeps the key out of every client-visible surface of the error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS14000000'] }, createMockContext())
+      .catch((e: unknown) => e);
+
+    expect(clientVisible(error)).not.toContain(FAKE_KEY);
+  });
+
+  it('resolves the invalid_api_key recovery hint from the calling tool contract', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const ctx = createMockContext({
+      errors: [
+        {
+          reason: 'invalid_api_key',
+          code: JsonRpcErrorCode.ConfigurationError,
+          when: 'BLS rejected the configured BLS_API_KEY as invalid.',
+          recovery: 'Set BLS_API_KEY to a valid key and restart the server.',
+        },
+      ] as const,
+    });
+
+    // The hint is the point of the fix: it has to name the env var rather than
+    // send the operator off to wait for a quota reset that will never come.
+    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'invalid_api_key',
+        recovery: { hint: 'Set BLS_API_KEY to a valid key and restart the server.' },
+      },
+    });
+  });
+
+  it('redacts the key at every throw site, not only the invalid-key branch', async () => {
+    // Redaction happens where the messages are read, so it does not depend on
+    // BLS's wording — this branch has nothing to do with authentication, and a
+    // key echoed here reaches both `data.messages` and the error message text.
+    const notFoundWithKey = {
+      status: 'REQUEST_FAILED_ERROR',
+      responseTime: 10,
+      message: [`Series LNS99999999 does not exist for key:${FAKE_KEY}`],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(notFoundWithKey));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS99999999'] }, createMockContext())
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'series_not_found' } });
+    expect(clientVisible(error)).not.toContain(FAKE_KEY);
+    expect(clientVisible(error)).toContain('[REDACTED]');
+  });
+
+  it('leaves messages untouched when no key is configured', async () => {
+    // BLS serves unregistered callers on a 25/day tier, so the key is optional.
+    // Redacting an empty key would splice the placeholder between every character.
+    const notFoundResponse = {
+      status: 'REQUEST_FAILED_ERROR',
+      responseTime: 10,
+      message: ['Series LNS99999999 does not exist'],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(notFoundResponse));
+
+    const svc = new BlsApiService('', baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS99999999'] }, createMockContext())
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({
+      data: { reason: 'series_not_found', messages: ['Series LNS99999999 does not exist'] },
+    });
+  });
+
+  it('still reports an unrecognized REQUEST_NOT_PROCESSED as quota_exceeded', async () => {
+    // BLS's real quota text is unverified and undocumented, so quota stays the
+    // catch-all for this status. Guessing a second pattern would be worse.
+    const unknownRejection = {
+      status: 'REQUEST_NOT_PROCESSED',
+      responseTime: 0,
+      message: ['A rejection BLS has never documented'],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownRejection));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS14000000'] }, createMockContext())
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'quota_exceeded', retryable: false } });
+  });
+});
+
 describe('BlsApiService.listSurveys', () => {
   const SURVEYS_RESPONSE = {
     status: 'REQUEST_SUCCEEDED',
@@ -642,24 +796,47 @@ describe('BlsApiService.listSurveys', () => {
     await expect(svc.listSurveys(ctx)).rejects.toThrow();
   });
 
-  it('does not expose apiKey in any error message', async () => {
-    const errorResponse = {
+  it('classifies an invalid key from /surveys as invalid_api_key (#56)', async () => {
+    // /surveys authenticates like the data endpoints, so a bad key lands here
+    // too — reported as a config error rather than a BLS outage.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc.listSurveys(createMockContext()).catch((e: unknown) => e);
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ConfigurationError,
+      data: { reason: 'invalid_api_key', retryable: false },
+    });
+  });
+
+  it('does not expose apiKey in any error surface (#56)', async () => {
+    // listSurveys interpolates upstream messages into the thrown error's message
+    // string, which renders in content[] for every client — so the fixture has to
+    // be the real shape, with the key embedded the way BLS embeds it.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));
+
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc.listSurveys(createMockContext()).catch((e: unknown) => e);
+
+    expect(clientVisible(error)).not.toContain(FAKE_KEY);
+  });
+
+  it('redacts the key from an unrecognized /surveys rejection (#56)', async () => {
+    // The generic branch joins messages into the error text. BLS documents none
+    // of its wording, so redaction covers this path without matching on it.
+    const rejectionWithKey = {
       status: 'REQUEST_NOT_PROCESSED',
       responseTime: 10,
-      message: ['Daily limit exceeded'],
+      message: [`Daily threshold reached for registration key ${FAKE_KEY}`],
     };
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(errorResponse));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(rejectionWithKey));
 
-    const svc = new BlsApiService('SECRET_KEY_12345', baseUrl, userAgent);
-    const ctx = createMockContext();
+    const svc = new BlsApiService(FAKE_KEY, baseUrl, userAgent);
+    const error = await svc.listSurveys(createMockContext()).catch((e: unknown) => e);
 
-    let errorMessage = '';
-    try {
-      await svc.listSurveys(ctx);
-    } catch (e) {
-      errorMessage = e instanceof Error ? e.message : String(e);
-    }
-
-    expect(errorMessage).not.toContain('SECRET_KEY_12345');
+    expect(error).toMatchObject({ data: { reason: 'service_unavailable' } });
+    expect(clientVisible(error)).not.toContain(FAKE_KEY);
+    expect((error as Error).message).toContain('[REDACTED]');
   });
 });

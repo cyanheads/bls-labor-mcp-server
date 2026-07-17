@@ -46,6 +46,16 @@ const LOCKED_RESPONSE = {
   message: ['The database is locked for this series'],
 };
 
+/** BLS rejects an unregistered key identically on every endpoint, /surveys included. */
+const INVALID_KEY_RESPONSE = {
+  status: 'REQUEST_NOT_PROCESSED',
+  responseTime: 0,
+  message: [
+    'The key:FAKE0000000000000000000000000001 provided by the User is invalid. Please provide a proper key for the operation to be successful',
+  ],
+  Results: {},
+};
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -94,6 +104,23 @@ describe('BlsApiService — retry behavior (real withRetry)', () => {
 
     await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
       data: { reason: 'request_rejected', retryable: false },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails fast on an invalid key from listSurveys — exactly one request (#56)', async () => {
+    // listSurveys used to bucket this as a generic serviceUnavailable — a
+    // transient code, so withRetry re-sent a key that cannot start working.
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(okJson(INVALID_KEY_RESPONSE)));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+
+    await expect(svc.listSurveys(ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_api_key', retryable: false },
     });
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);

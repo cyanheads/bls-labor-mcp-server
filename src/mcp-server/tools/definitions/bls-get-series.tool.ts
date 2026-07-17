@@ -77,6 +77,14 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
   errors: [
     {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'BLS rejected the configured BLS_API_KEY as invalid.',
+      retryable: false,
+      recovery:
+        'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
+    },
+    {
       reason: 'quota_exceeded',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS API 500 query/day limit has been reached.',

@@ -10,6 +10,14 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
+/**
+ * Failures that are verdicts on the request rather than on one series. Every leg
+ * of the fan-out below meets them identically, so they surface as the tool's own
+ * error instead of as N copies buried in `failed[]` — a rejected API key read as
+ * a per-series problem sends the caller hunting for bad SeriesIDs.
+ */
+const REQUEST_LEVEL_REASONS = new Set(['invalid_api_key', 'quota_exceeded', 'series_locked']);
+
 const ObservationSchema = z.object({
   year: z.string().describe('Observation year (e.g. "2024").'),
   period: z.string().describe('Observation period code (e.g. "M12" for December, "Q01" for Q1).'),
@@ -29,6 +37,14 @@ export const blsGetLatestTool = tool('bls_get_latest', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
+    {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'BLS rejected the configured BLS_API_KEY as invalid.',
+      retryable: false,
+      recovery:
+        'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
+    },
     {
       reason: 'quota_exceeded',
       code: JsonRpcErrorCode.ServiceUnavailable,
@@ -140,10 +156,9 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       const requestedId = input.series_ids[i] ?? '';
       if (settlement.status === 'rejected') {
         const err: unknown = settlement.reason;
-        // Rethrow request-level failures — quota and lock affect all series, not just this one.
         if (err instanceof McpError) {
           const reason = (err.data as Record<string, unknown> | undefined)?.reason;
-          if (reason === 'quota_exceeded' || reason === 'series_locked') throw err;
+          if (typeof reason === 'string' && REQUEST_LEVEL_REASONS.has(reason)) throw err;
         }
         const errorMsg = err instanceof Error ? err.message : String(err);
         failed.push({ seriesId: requestedId, error: errorMsg });

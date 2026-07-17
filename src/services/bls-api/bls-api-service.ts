@@ -2,12 +2,17 @@
  * @fileoverview BLS API v2 service. Wraps `POST /timeseries/data` (batch series
  * fetch with optional calculations), `GET /timeseries/data/{id}?latest=true`
  * (single-series latest observation), and `GET /surveys` / `GET /surveys/{abbr}`
- * (survey metadata). Applies retry with 1–2s backoff. Surfaces quota exhaustion,
- * series-not-found, locked-series, no-data, calculations-not-supported, and
- * otherwise-unrecognized request rejections as typed error data so calling tools
- * can produce the right `ctx.fail` reason. Deterministic failures (quota
- * exhaustion, request rejection) carry `retryable: false` so the framework's
- * `withRetry` fails fast instead of burning quota on doomed attempts.
+ * (survey metadata). Applies retry with 1–2s backoff. Surfaces an invalid API
+ * key, quota exhaustion, series-not-found, locked-series, no-data,
+ * calculations-not-supported, and otherwise-unrecognized request rejections as
+ * typed error data so calling tools can produce the right `ctx.fail` reason.
+ * Deterministic failures (quota exhaustion, request rejection) carry
+ * `retryable: false` so the framework's `withRetry` fails fast instead of
+ * burning quota on doomed attempts.
+ *
+ * Every upstream message is redacted as it is read: BLS echoes the submitted key
+ * back when it rejects one, and these messages flow into thrown errors' `data`
+ * and message strings, both of which reach the client.
  *
  * When `BLS_OBSERVATIONS_MIRROR_ENABLED=true` and the mirror has completed at
  * least one full sync, `fetchSeries` and `fetchLatest` are routed through the
@@ -20,6 +25,8 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
+  configurationError,
+  type McpError,
   notFound,
   serializationError,
   serviceUnavailable,
@@ -45,6 +52,24 @@ import type {
 
 /** In-memory survey cache TTL — 30 days. */
 const SURVEY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Stands in for the configured API key wherever BLS echoes it back to us. */
+const REDACTED_API_KEY = '[REDACTED]';
+
+/**
+ * BLS's rejection of a key it does not recognize. Verified 2026-07-17 against
+ * all three endpoints this service calls — `POST /timeseries/data`,
+ * `GET /timeseries/data/{id}?latest=true`, and `GET /surveys` — each of which
+ * answers an unregistered key with HTTP 200 and `REQUEST_NOT_PROCESSED` plus
+ * the single message `The key:<key> provided by the User is invalid. Please
+ * provide a proper key for the operation to be successful`.
+ *
+ * Matched on the message rather than the status because `REQUEST_NOT_PROCESSED`
+ * is overloaded: quota exhaustion returns it too, and BLS documents neither
+ * message. Only the invalid-key phrasing is confirmed, so it is the one matched
+ * positively; everything else under that status stays quota.
+ */
+const INVALID_KEY_PATTERN = /provided by the User is invalid/i;
 
 /**
  * Capability flags for every BLS survey, keyed by `survey_abbreviation`.
@@ -426,10 +451,16 @@ export class BlsApiService {
           );
         }
         if (parsed.status !== 'REQUEST_SUCCEEDED') {
-          throw serviceUnavailable(
-            `BLS surveys API: ${parsed.message?.join('; ') ?? 'unknown error'}`,
-            { reason: 'service_unavailable' },
-          );
+          // `/surveys` authenticates like the data endpoints, so a bad key lands
+          // here too. The generic branch below would call it an upstream outage
+          // and — its code being transient — keep retrying the bad key.
+          const messages = this.redactMessages(parsed.message);
+          if (messages.some((m) => INVALID_KEY_PATTERN.test(m))) {
+            throw this.invalidApiKeyError(ctx);
+          }
+          throw serviceUnavailable(`BLS surveys API: ${messages.join('; ') || 'unknown error'}`, {
+            reason: 'service_unavailable',
+          });
         }
         return (parsed.Results?.survey ?? []).map((s): SurveyMeta => {
           const abbr = s.survey_abbreviation.toUpperCase();
@@ -459,6 +490,41 @@ export class BlsApiService {
     return surveys;
   }
 
+  /**
+   * Read BLS's message array with the configured key masked out of it.
+   *
+   * BLS embeds the submitted key verbatim when rejecting one, and callers
+   * forward these strings into error `data` and, in places, the error message
+   * itself — both reach the client. Redacting here, where the messages are read,
+   * covers every throw site and stays independent of BLS's wording: a key echoed
+   * in some future message is masked without a new pattern to match.
+   */
+  private redactMessages(raw: string[] | undefined): string[] {
+    const messages = raw ?? [];
+    // The key is optional (BLS serves unregistered callers on a 25/day tier).
+    // Splitting on an empty key would insert the placeholder between every
+    // character, so an absent key is simply nothing to redact.
+    if (!this.apiKey) return messages;
+    return messages.map((m) => m.replaceAll(this.apiKey, REDACTED_API_KEY));
+  }
+
+  /**
+   * The configured `BLS_API_KEY` is rejected — a configuration failure, not a
+   * quota or availability one: nothing upstream is wrong and no amount of waiting
+   * fixes it. `ConfigurationError` also sits outside `withRetry`'s transient set,
+   * so the request stops re-sending a key that cannot start working.
+   *
+   * The upstream message is deliberately not attached: beyond what `reason`
+   * already says, the key is all it carries.
+   */
+  private invalidApiKeyError(ctx: Context): McpError {
+    return configurationError('BLS rejected the configured BLS_API_KEY as invalid.', {
+      reason: 'invalid_api_key',
+      retryable: false,
+      ...ctx.recoveryFor('invalid_api_key'),
+    });
+  }
+
   private parseSeriesResponse(
     text: string,
     options: Pick<BatchFetchOptions, 'seriesIds'>,
@@ -478,8 +544,11 @@ export class BlsApiService {
     }
 
     // Check for known BLS error messages
-    const messages = parsed.message ?? [];
+    const messages = this.redactMessages(parsed.message);
     for (const msg of messages) {
+      // Ahead of the REQUEST_NOT_PROCESSED fallback, which would otherwise report
+      // a rejected key as a quota wall that clears at UTC midnight.
+      if (INVALID_KEY_PATTERN.test(msg)) throw this.invalidApiKeyError(ctx);
       if (/daily query limit|500 queries|limit reached/i.test(msg)) {
         // Deterministic until the UTC-midnight reset — retrying only burns more quota.
         throw serviceUnavailable('BLS API daily query limit (500/day) reached.', {
@@ -522,8 +591,10 @@ export class BlsApiService {
     }
 
     if (parsed.status === 'REQUEST_NOT_PROCESSED') {
-      // Quota exhausted — BLS returns this status when the key hits 500/day.
-      // The request was not processed at all, so retrying it unchanged cannot help.
+      // The catch-all for this status, not a positive quota match: BLS overloads
+      // it and documents none of its message text. Invalid keys are matched by
+      // message above; quota is the only other cause known to land here, and the
+      // wording below hedges accordingly. Retrying unchanged cannot help.
       throw serviceUnavailable(
         'BLS API request not processed. Daily quota (500 queries/day) may be exhausted — retry after UTC midnight.',
         { reason: 'quota_exceeded', retryable: false, messages },

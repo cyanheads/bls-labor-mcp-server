@@ -48,6 +48,14 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
 
   errors: [
     {
+      reason: 'invalid_api_key',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'BLS rejected the configured BLS_API_KEY as invalid.',
+      retryable: false,
+      recovery:
+        'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
+    },
+    {
       reason: 'service_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'BLS /surveys API is unreachable or returns a non-200 response.',

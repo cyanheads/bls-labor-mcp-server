@@ -136,7 +136,8 @@ Series catalog resolution is handled entirely offline from LABSTAT flat files �
 
 | Tool | reason | code | when | retryable? |
 |:-----|:-------|:-----|:-----|:-----------|
-| `bls_get_series`, `bls_get_latest` | `quota_exceeded` | `ServiceUnavailable` | 429 from API or daily 500-query limit hit | No (until next UTC day) |
+| `bls_get_series`, `bls_get_latest`, `bls_list_surveys` | `invalid_api_key` | `ConfigurationError` | API rejects `BLS_API_KEY` — returns `REQUEST_NOT_PROCESSED` with "provided by the User is invalid" | No — fix `BLS_API_KEY` and restart |
+| `bls_get_series`, `bls_get_latest` | `quota_exceeded` | `ServiceUnavailable` | 429 from API, daily 500-query limit hit, or any other unrecognized `REQUEST_NOT_PROCESSED` | No (until next UTC day) |
 | `bls_get_series`, `bls_get_latest` | `series_not_found` | `InvalidParams` | API returns "Series does not exist" message | No — fix the SeriesID |
 | `bls_get_series`, `bls_get_latest` | `series_locked` | `ServiceUnavailable` | API returns "Database is locked for Series" | Yes — transient, retry with backoff |
 | `bls_get_series` | `no_data_for_period` | `InvalidParams` | API returns "No Data Available for Series" for the requested year range | No — adjust `start_year`/`end_year` |
