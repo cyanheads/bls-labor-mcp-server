@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.11](changelog/0.4.x/0.4.11.md) — 2026-07-17 · 🛡️ Security
+
+Invalid BLS_API_KEY is now reported as a configuration error instead of quota_exceeded, and redacted from all error output
+
 ## [0.4.10](changelog/0.4.x/0.4.10.md) — 2026-07-17
 
 bls_get_series forced annual-average rows into observations[] whenever a year range was passed; annual_average is now an explicit opt-in (default false, decoupled from start_year/end_year). The mirror's queryLatest also let a year's mean win bls_get_latest via lexical period comparison; fixed via isLaterObservation().
