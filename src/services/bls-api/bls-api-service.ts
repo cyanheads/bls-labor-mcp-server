@@ -3,8 +3,11 @@
  * fetch with optional calculations), `GET /timeseries/data/{id}?latest=true`
  * (single-series latest observation), and `GET /surveys` / `GET /surveys/{abbr}`
  * (survey metadata). Applies retry with 1–2s backoff. Surfaces quota exhaustion,
- * series-not-found, locked-series, no-data, and calculations-not-supported as
- * typed error data so calling tools can produce the right `ctx.fail` reason.
+ * series-not-found, locked-series, no-data, calculations-not-supported, and
+ * otherwise-unrecognized request rejections as typed error data so calling tools
+ * can produce the right `ctx.fail` reason. Deterministic failures (quota
+ * exhaustion, request rejection) carry `retryable: false` so the framework's
+ * `withRetry` fails fast instead of burning quota on doomed attempts.
  *
  * When `BLS_OBSERVATIONS_MIRROR_ENABLED=true` and the mirror has completed at
  * least one full sync, `fetchSeries` and `fetchLatest` are routed through the
@@ -178,7 +181,7 @@ export class BlsApiService {
           signal: ctx.signal,
         });
 
-        return this.parseSeriesResponse(await response.text(), options);
+        return this.parseSeriesResponse(await response.text(), options, ctx);
       },
       {
         operation: 'BlsApiService.fetchSeries',
@@ -235,7 +238,7 @@ export class BlsApiService {
           signal: ctx.signal,
         });
         const text = await response.text();
-        const series = this.parseSeriesResponse(text, { seriesIds: [seriesId] });
+        const series = this.parseSeriesResponse(text, { seriesIds: [seriesId] }, ctx);
         const found = series.find((s) => s.seriesId === seriesId);
         if (!found) {
           throw notFound(`Series not found: ${seriesId}`, {
@@ -389,6 +392,7 @@ export class BlsApiService {
   private parseSeriesResponse(
     text: string,
     options: Pick<BatchFetchOptions, 'seriesIds'>,
+    ctx: Context,
   ): SeriesData[] {
     if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
       throw serviceUnavailable(
@@ -407,8 +411,10 @@ export class BlsApiService {
     const messages = parsed.message ?? [];
     for (const msg of messages) {
       if (/daily query limit|500 queries|limit reached/i.test(msg)) {
+        // Deterministic until the UTC-midnight reset — retrying only burns more quota.
         throw serviceUnavailable('BLS API daily query limit (500/day) reached.', {
           reason: 'quota_exceeded',
+          retryable: false,
           messages,
         });
       }
@@ -446,15 +452,25 @@ export class BlsApiService {
     }
 
     if (parsed.status === 'REQUEST_NOT_PROCESSED') {
-      // Quota exhausted — BLS returns this status when the key hits 500/day
+      // Quota exhausted — BLS returns this status when the key hits 500/day.
+      // The request was not processed at all, so retrying it unchanged cannot help.
       throw serviceUnavailable(
         'BLS API request not processed. Daily quota (500 queries/day) may be exhausted — retry after UTC midnight.',
-        { reason: 'quota_exceeded', messages },
+        { reason: 'quota_exceeded', retryable: false, messages },
       );
     }
 
     if (parsed.status !== 'REQUEST_SUCCEEDED') {
-      throw serviceUnavailable(`BLS API error: ${messages.join('; ') || parsed.status}`);
+      // BLS rejected the request with a message none of the branches above
+      // recognize (e.g. "Your request has failed. Please check your input
+      // parameters"). That is a verdict on the request, so identical parameters
+      // will be rejected again — fail fast and let the caller adjust them.
+      throw serviceUnavailable(`BLS API error: ${messages.join('; ') || parsed.status}`, {
+        reason: 'request_rejected',
+        retryable: false,
+        messages,
+        ...ctx.recoveryFor('request_rejected'),
+      });
     }
 
     return (parsed.Results?.series ?? []).map((raw): SeriesData => {
@@ -484,8 +500,12 @@ export class BlsApiService {
           .filter(Boolean),
       }),
       ...(nc?.['1'] && { netChange1Month: nc['1'] }),
+      ...(nc?.['3'] && { netChange3Month: nc['3'] }),
+      ...(nc?.['6'] && { netChange6Month: nc['6'] }),
       ...(nc?.['12'] && { netChange12Month: nc['12'] }),
       ...(pc?.['1'] && { pctChange1Month: pc['1'] }),
+      ...(pc?.['3'] && { pctChange3Month: pc['3'] }),
+      ...(pc?.['6'] && { pctChange6Month: pc['6'] }),
       ...(pc?.['12'] && { pctChange12Month: pc['12'] }),
     };
   }

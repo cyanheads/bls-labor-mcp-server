@@ -24,16 +24,45 @@ const ObservationSchema = z.object({
     .describe('Observation value as a string matching BLS output. Parse to float for arithmetic.'),
   footnotes: z.array(z.string()).optional().describe('Footnote codes and text, when present.'),
   netChange1Month: z.string().optional().describe('1-month net change (when calculations=true).'),
+  netChange3Month: z.string().optional().describe('3-month net change (when calculations=true).'),
+  netChange6Month: z.string().optional().describe('6-month net change (when calculations=true).'),
   netChange12Month: z.string().optional().describe('12-month net change (when calculations=true).'),
   pctChange1Month: z
     .string()
     .optional()
     .describe('1-month percent change (when calculations=true).'),
+  pctChange3Month: z
+    .string()
+    .optional()
+    .describe('3-month percent change (when calculations=true).'),
+  pctChange6Month: z
+    .string()
+    .optional()
+    .describe('6-month percent change (when calculations=true).'),
   pctChange12Month: z
     .string()
     .optional()
     .describe('12-month percent change (when calculations=true).'),
 });
+
+/**
+ * Calculation columns in BLS interval order, used to render only the intervals a
+ * survey actually returned. BLS emits 1/3/6/12-month net and percent change for
+ * monthly-cadence series; other cadences and surveys return a subset.
+ */
+const CALC_COLUMNS = [
+  { header: 'Net 1M', key: 'netChange1Month' },
+  { header: 'Net 3M', key: 'netChange3Month' },
+  { header: 'Net 6M', key: 'netChange6Month' },
+  { header: 'Net 12M', key: 'netChange12Month' },
+  { header: 'Pct 1M', key: 'pctChange1Month' },
+  { header: 'Pct 3M', key: 'pctChange3Month' },
+  { header: 'Pct 6M', key: 'pctChange6Month' },
+  { header: 'Pct 12M', key: 'pctChange12Month' },
+] as const satisfies ReadonlyArray<{
+  header: string;
+  key: keyof z.infer<typeof ObservationSchema>;
+}>;
 
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
@@ -46,8 +75,17 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       reason: 'quota_exceeded',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS API 500 query/day limit has been reached.',
+      retryable: false,
       recovery:
         'The daily quota resets at UTC midnight. Retry after midnight or reduce query volume.',
+    },
+    {
+      reason: 'request_rejected',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'BLS returned a non-success status with a message matching no known failure mode — e.g. a rejected combination of request parameters.',
+      retryable: false,
+      recovery:
+        'Retry with calculations omitted, or split series_ids into smaller batches to isolate the series BLS rejects.',
     },
     {
       reason: 'series_not_found',
@@ -113,7 +151,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports: CPI and PPI return percent change only (the inflation rate), with no error. Only surveys that support neither net nor percent change (e.g. AP average price data) return an error — check bls_list_surveys first.',
+        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports: CPI and PPI return percent change only (the inflation rate), with no error. Only surveys that support neither net nor percent change (e.g. AP average price data) return an error — check bls_list_surveys first. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset.',
       ),
   }),
 
@@ -330,27 +368,22 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       lines.push(`Observations: ${s.observationCount}${result.spilled ? ' (preview below)' : ''}`);
       lines.push('');
       if (s.observations.length > 0) {
-        const hasCalcs = s.observations.some(
-          (o) => o.netChange1Month || o.netChange12Month || o.pctChange1Month || o.pctChange12Month,
-        );
-        if (hasCalcs) {
-          lines.push('| Period | Code | Value | Net 1M | Net 12M | Pct 1M | Pct 12M | Notes |');
-          lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
-          for (const obs of s.observations) {
-            const periodLabel = obs.periodName ? `${obs.periodName} ${obs.year}` : `${obs.year}`;
-            const notes = obs.footnotes?.join('; ') ?? '';
-            lines.push(
-              `| ${periodLabel} | ${obs.period} | ${obs.value} | ${obs.netChange1Month ?? ''} | ${obs.netChange12Month ?? ''} | ${obs.pctChange1Month ?? ''} | ${obs.pctChange12Month ?? ''} | ${notes} |`,
-            );
-          }
-        } else {
-          lines.push('| Period | Code | Value | Notes |');
-          lines.push('| --- | --- | --- | --- |');
-          for (const obs of s.observations) {
-            const periodLabel = obs.periodName ? `${obs.periodName} ${obs.year}` : `${obs.year}`;
-            const notes = obs.footnotes?.join('; ') ?? '';
-            lines.push(`| ${periodLabel} | ${obs.period} | ${obs.value} | ${notes} |`);
-          }
+        // Render only the calculation intervals this survey actually returned —
+        // an all-empty column carries no information for the reader.
+        const calcs = CALC_COLUMNS.filter((c) => s.observations.some((o) => o[c.key]));
+        const headers = ['Period', 'Code', 'Value', ...calcs.map((c) => c.header), 'Notes'];
+        lines.push(`| ${headers.join(' | ')} |`);
+        lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+        for (const obs of s.observations) {
+          const periodLabel = obs.periodName ? `${obs.periodName} ${obs.year}` : `${obs.year}`;
+          const cells = [
+            periodLabel,
+            obs.period,
+            obs.value,
+            ...calcs.map((c) => obs[c.key] ?? ''),
+            obs.footnotes?.join('; ') ?? '',
+          ];
+          lines.push(`| ${cells.join(' | ')} |`);
         }
       } else {
         lines.push(
@@ -380,8 +413,12 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
         value: obs.value,
         footnotes: obs.footnotes?.join('; ') ?? null,
         net_change_1m: obs.netChange1Month ?? null,
+        net_change_3m: obs.netChange3Month ?? null,
+        net_change_6m: obs.netChange6Month ?? null,
         net_change_12m: obs.netChange12Month ?? null,
         pct_change_1m: obs.pctChange1Month ?? null,
+        pct_change_3m: obs.pctChange3Month ?? null,
+        pct_change_6m: obs.pctChange6Month ?? null,
         pct_change_12m: obs.pctChange12Month ?? null,
       });
     }
@@ -397,8 +434,12 @@ function normalizeObs(obs: SeriesData['observations'][number]) {
     ...(obs.periodName && { periodName: obs.periodName }),
     ...(obs.footnotes?.length && { footnotes: obs.footnotes }),
     ...(obs.netChange1Month && { netChange1Month: obs.netChange1Month }),
+    ...(obs.netChange3Month && { netChange3Month: obs.netChange3Month }),
+    ...(obs.netChange6Month && { netChange6Month: obs.netChange6Month }),
     ...(obs.netChange12Month && { netChange12Month: obs.netChange12Month }),
     ...(obs.pctChange1Month && { pctChange1Month: obs.pctChange1Month }),
+    ...(obs.pctChange3Month && { pctChange3Month: obs.pctChange3Month }),
+    ...(obs.pctChange6Month && { pctChange6Month: obs.pctChange6Month }),
     ...(obs.pctChange12Month && { pctChange12Month: obs.pctChange12Month }),
   };
 }

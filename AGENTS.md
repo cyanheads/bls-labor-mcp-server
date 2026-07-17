@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** bls-labor-mcp-server
-**Version:** 0.4.7
+**Version:** 0.4.8
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.14`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **Zod:** ^4.4.3
@@ -366,7 +366,7 @@ import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service
 - [ ] BLS wrapping: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Error contracts declared for quota_exceeded, series_not_found, series_locked, no_data_for_period, calculations_not_supported, catalog_unavailable (see design.md)
 - [ ] `calculations: true` only requested for surveys where `allowsNetChange`/`allowsPercentChange` is confirmed — guard or document
-- [ ] `bls_get_latest` issues N sequential GETs (one per SeriesID) — keep recommended limit ≤10 in docs
+- [ ] `bls_get_latest` issues N concurrent GETs (one per SeriesID, fanned out via `Promise.allSettled`) — keep recommended limit ≤10 in docs
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = package name; `interface.shortDescription` from `package.json` description

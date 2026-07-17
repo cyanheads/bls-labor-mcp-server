@@ -279,6 +279,114 @@ describe('blsGetSeriesTool', () => {
     expect(text).toContain('-0.3');
   });
 
+  it('surfaces all four calculation intervals through the handler (#50)', async () => {
+    const allIntervals: SeriesData = {
+      seriesId: 'APU0000708111',
+      title: 'Eggs, grade A, large, per doz.',
+      observations: [
+        {
+          year: '2024',
+          period: 'M12',
+          periodName: 'December',
+          value: '4.146',
+          netChange1Month: '0.497',
+          netChange3Month: '0.325',
+          netChange6Month: '1.431',
+          netChange12Month: '1.639',
+          pctChange1Month: '13.6',
+          pctChange3Month: '8.5',
+          pctChange6Month: '52.7',
+          pctChange12Month: '65.4',
+        },
+      ],
+    };
+    fetchSeriesMock.mockResolvedValue([allIntervals]);
+
+    const ctx = createMockContext();
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['APU0000708111'],
+      calculations: true,
+    });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+
+    const obs = result.series[0]!.observations[0]!;
+    expect(obs.netChange3Month).toBe('0.325');
+    expect(obs.netChange6Month).toBe('1.431');
+    expect(obs.pctChange3Month).toBe('8.5');
+    expect(obs.pctChange6Month).toBe('52.7');
+  });
+
+  it('formats all four calculation intervals as table columns (#50)', () => {
+    const output = {
+      series: [
+        {
+          seriesId: 'APU0000708111',
+          observationCount: 1,
+          observations: [
+            {
+              year: '2024',
+              period: 'M12',
+              value: '4.146',
+              netChange1Month: '0.497',
+              netChange3Month: '0.325',
+              netChange6Month: '1.431',
+              netChange12Month: '1.639',
+              pctChange1Month: '13.6',
+              pctChange3Month: '8.5',
+              pctChange6Month: '52.7',
+              pctChange12Month: '65.4',
+            },
+          ],
+        },
+      ],
+      spilled: false as const,
+    };
+    const blocks = blsGetSeriesTool.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+
+    for (const header of ['Net 1M', 'Net 3M', 'Net 6M', 'Net 12M']) {
+      expect(text).toContain(header);
+    }
+    for (const header of ['Pct 1M', 'Pct 3M', 'Pct 6M', 'Pct 12M']) {
+      expect(text).toContain(header);
+    }
+    // The 3/6-month values must reach content[], not just structuredContent.
+    expect(text).toContain('0.325');
+    expect(text).toContain('1.431');
+    expect(text).toContain('8.5');
+    expect(text).toContain('52.7');
+  });
+
+  it('omits calculation columns the survey did not return (#50)', () => {
+    // CPI returns percent change only — rendering empty Net columns would be noise.
+    const output = {
+      series: [
+        {
+          seriesId: 'CUUR0000SA0',
+          observationCount: 1,
+          observations: [
+            {
+              year: '2024',
+              period: 'M12',
+              value: '315.6',
+              pctChange1Month: '0.0',
+              pctChange12Month: '2.8',
+            },
+          ],
+        },
+      ],
+      spilled: false as const,
+    };
+    const blocks = blsGetSeriesTool.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+
+    expect(text).toContain('Pct 1M');
+    expect(text).toContain('Pct 12M');
+    expect(text).not.toContain('Net 1M');
+    expect(text).not.toContain('Pct 3M');
+    expect(text).not.toContain('Pct 6M');
+  });
+
   it('formats observations with footnotes', () => {
     const output = {
       series: [

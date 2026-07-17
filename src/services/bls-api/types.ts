@@ -39,12 +39,21 @@ export interface BlsApiResponse {
   status: 'REQUEST_SUCCEEDED' | 'REQUEST_NOT_PROCESSED' | 'REQUEST_FAILED_ERROR' | string;
 }
 
-/** Normalized observation for tool output. */
+/**
+ * Normalized observation for tool output. BLS returns net/percent change over
+ * 1, 3, 6, and 12-month intervals for monthly-cadence series when
+ * `calculations: true` is requested; a survey returns only the intervals and
+ * change types it supports, so every calculation field is optional.
+ */
 export interface Observation {
   footnotes?: string[];
   netChange1Month?: string;
+  netChange3Month?: string;
+  netChange6Month?: string;
   netChange12Month?: string;
   pctChange1Month?: string;
+  pctChange3Month?: string;
+  pctChange6Month?: string;
   pctChange12Month?: string;
   period: string;
   periodName?: string;

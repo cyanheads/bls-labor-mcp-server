@@ -3,6 +3,7 @@
  * @module tests/services/bls-api/bls-api-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { BlsApiService } from '@/services/bls-api/bls-api-service.js';
@@ -86,8 +87,10 @@ describe('BlsApiService.fetchSeries', () => {
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
 
+    // retryable: false opts out of withRetry's transient-code retry — see the
+    // retry-behavior suite for the attempt-count assertion (#47).
     await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
-      data: { reason: 'quota_exceeded' },
+      data: { reason: 'quota_exceeded', retryable: false },
     });
   });
 
@@ -180,7 +183,7 @@ describe('BlsApiService.fetchLatest', () => {
 });
 
 describe('BlsApiService.fetchSeries — error message parsing', () => {
-  it('throws serviceUnavailable on series_locked message', async () => {
+  it('throws serviceUnavailable on series_locked message without opting out of retry', async () => {
     const lockedResponse = {
       status: 'REQUEST_FAILED_ERROR',
       responseTime: 10,
@@ -191,9 +194,13 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
 
-    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
-      data: { reason: 'series_locked' },
-    });
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'series_locked' } });
+    // A BLS lock clears on its own, so this one must stay retryable (#47).
+    expect((error as { data?: Record<string, unknown> }).data?.retryable).toBeUndefined();
   });
 
   it('throws validationError on no_data_for_period message', async () => {
@@ -228,18 +235,76 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
     });
   });
 
-  it('throws serviceUnavailable on non-succeeded status with no known error message', async () => {
+  it('throws request_rejected on non-succeeded status with no known error message (#48)', async () => {
     const unknownError = {
       status: 'REQUEST_FAILED_ERROR',
       responseTime: 10,
-      message: ['Some unknown error'],
+      message: ['Your request has failed. Please check your input parameters, and try again.'],
     };
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
 
-    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toThrow();
+    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'request_rejected',
+        retryable: false,
+        messages: ['Your request has failed. Please check your input parameters, and try again.'],
+      },
+    });
+  });
+
+  it('resolves the request_rejected recovery hint from the calling tool contract (#48)', async () => {
+    const unknownError = {
+      status: 'REQUEST_FAILED_ERROR',
+      responseTime: 10,
+      message: ['Your request has failed.'],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    // The service has no contract of its own — it spreads ctx.recoveryFor(), so the
+    // hint on the wire comes from whichever tool made the call.
+    const ctx = createMockContext({
+      errors: [
+        {
+          reason: 'request_rejected',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          when: 'BLS rejected the request with an unrecognized message.',
+          recovery: 'Retry with calculations omitted, or split series_ids into smaller batches.',
+        },
+      ] as const,
+    });
+
+    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'request_rejected',
+        recovery: {
+          hint: 'Retry with calculations omitted, or split series_ids into smaller batches.',
+        },
+      },
+    });
+  });
+
+  it('omits the recovery hint when the calling tool declares no matching reason (#48)', async () => {
+    const unknownError = {
+      status: 'REQUEST_FAILED_ERROR',
+      responseTime: 10,
+      message: ['Your request has failed.'],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+
+    const error = await svc
+      .fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)
+      .catch((e: unknown) => e);
+
+    // recoveryFor() returns {} with no contract attached — the spread stays safe.
+    expect(error).toMatchObject({ data: { reason: 'request_rejected' } });
+    expect((error as { data?: Record<string, unknown> }).data?.recovery).toBeUndefined();
   });
 
   it('throws serializationError on malformed JSON', async () => {
@@ -256,7 +321,9 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
     await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toThrow();
   });
 
-  it('normalizes observations with footnotes and calculation fields', async () => {
+  it('normalizes observations with footnotes and all four calculation intervals (#50)', async () => {
+    // Mirrors the real BLS shape for a monthly series: net/pct change over
+    // 1, 3, 6, and 12-month intervals, not just 1 and 12.
     const withCalcs = {
       status: 'REQUEST_SUCCEEDED',
       responseTime: 50,
@@ -264,18 +331,18 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
       Results: {
         series: [
           {
-            seriesID: 'LNS14000000',
-            catalog: { series_title: 'Unemployment Rate' },
+            seriesID: 'APU0000708111',
+            catalog: { series_title: 'Eggs, grade A, large, per doz.' },
             data: [
               {
                 year: '2024',
                 period: 'M12',
                 periodName: 'December',
-                value: '4.1',
+                value: '4.146',
                 footnotes: [{ code: 'P', text: 'Preliminary' }],
                 calculations: {
-                  net_changes: { '1': '-0.1', '12': '-0.3' },
-                  pct_changes: { '1': '-2.4', '12': '-6.8' },
+                  net_changes: { '1': '0.497', '3': '0.325', '6': '1.431', '12': '1.639' },
+                  pct_changes: { '1': '13.6', '3': '8.5', '6': '52.7', '12': '65.4' },
                 },
               },
             ],
@@ -287,14 +354,58 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
-    const result = await svc.fetchSeries({ seriesIds: ['LNS14000000'], calculations: true }, ctx);
+    const result = await svc.fetchSeries({ seriesIds: ['APU0000708111'], calculations: true }, ctx);
 
     const obs = result[0]!.observations[0]!;
     expect(obs.footnotes).toEqual(['P: Preliminary']);
-    expect(obs.netChange1Month).toBe('-0.1');
-    expect(obs.netChange12Month).toBe('-0.3');
-    expect(obs.pctChange1Month).toBe('-2.4');
-    expect(obs.pctChange12Month).toBe('-6.8');
+    expect(obs.netChange1Month).toBe('0.497');
+    expect(obs.netChange3Month).toBe('0.325');
+    expect(obs.netChange6Month).toBe('1.431');
+    expect(obs.netChange12Month).toBe('1.639');
+    expect(obs.pctChange1Month).toBe('13.6');
+    expect(obs.pctChange3Month).toBe('8.5');
+    expect(obs.pctChange6Month).toBe('52.7');
+    expect(obs.pctChange12Month).toBe('65.4');
+  });
+
+  it('omits calculation intervals the survey did not return (#50)', async () => {
+    // CPI (CU) supports percent change only, and quarterly/annual cadences return
+    // a narrower interval set — absent keys must stay absent, not become empty strings.
+    const pctOnly = {
+      status: 'REQUEST_SUCCEEDED',
+      responseTime: 50,
+      message: [],
+      Results: {
+        series: [
+          {
+            seriesID: 'CUUR0000SA0',
+            catalog: { series_title: 'CPI-U All Items' },
+            data: [
+              {
+                year: '2024',
+                period: 'M12',
+                periodName: 'December',
+                value: '315.6',
+                calculations: { pct_changes: { '1': '0.0', '12': '2.8' } },
+              },
+            ],
+          },
+        ],
+      },
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(pctOnly));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+    const result = await svc.fetchSeries({ seriesIds: ['CUUR0000SA0'], calculations: true }, ctx);
+
+    const obs = result[0]!.observations[0]!;
+    expect(obs.pctChange1Month).toBe('0.0');
+    expect(obs.pctChange12Month).toBe('2.8');
+    expect(obs.pctChange3Month).toBeUndefined();
+    expect(obs.pctChange6Month).toBeUndefined();
+    expect(obs.netChange1Month).toBeUndefined();
+    expect(obs.netChange12Month).toBeUndefined();
   });
 
   it('normalizes empty message array without throwing', async () => {

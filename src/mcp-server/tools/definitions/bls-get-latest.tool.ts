@@ -33,6 +33,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       reason: 'quota_exceeded',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS API 500 query/day limit has been reached.',
+      retryable: false,
       recovery:
         'The daily quota resets at UTC midnight. Retry after midnight or reduce query volume.',
     },
