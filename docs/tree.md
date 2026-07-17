@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-07-17 07:59:49
+Generated on: 2026-07-17 09:08:41
 
 ```text
 bls-labor-mcp-server/
@@ -179,6 +179,7 @@ bls-labor-mcp-server/
 │   │   │   ├── ingester.test.ts
 │   │   │   └── subprocess.test.ts
 │   │   └── canvas-bridge/
+│   │       └── canvas-bridge.test.ts
 │   └── tools/
 │       ├── bls-dataframe-describe.tool.test.ts
 │       ├── bls-dataframe-drop.tool.test.ts

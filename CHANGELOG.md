@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.9](changelog/0.4.x/0.4.9.md) — 2026-07-17
+
+SURVEY_CAPABILITIES rebuilt from a live sweep of all 70 BLS surveys, correcting 12 wrong entries and 51 that silently defaulted to no calculation support (#39); bls_get_series now surfaces zero-observation series (#45) and canvas registration failures (#46) instead of returning silently; bls_search_series resolves CW (CPI-W) series (#51).
+
 ## [0.4.8](changelog/0.4.x/0.4.8.md) — 2026-07-17
 
 quota_exceeded and the new request_rejected reason now fail fast instead of retrying (#48, #47); bls_get_series surfaces BLS's 3- and 6-month net/percent changes (#50); .mcpbignore excludes /.cache/, fixing an oversized .mcpb bundle (#52).
