@@ -26,44 +26,51 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
     },
   ],
 
-  input: z.object({
-    sql: z
-      .string()
-      .min(1)
-      .describe(
-        "Single-statement SELECT against df_<id> tables on the shared canvas. Reference dataframes by the names returned in bls_get_series responses or listed by bls_dataframe_describe. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Example: SELECT series_id, year, period, value FROM df_AAAAA_BBBBB WHERE year >= '2020' ORDER BY year DESC.",
-      ),
-    register_as: z
-      .string()
-      .optional()
-      .describe(
-        'When set, persist the query result as a new dataframe under this name. Fresh TTL — not inherited from parent tables. Use to chain analyses without re-running source SQL or consuming additional BLS quota.',
-      ),
-    preview: z
-      .number()
-      .int()
-      .min(0)
-      .max(10000)
-      .optional()
-      .describe(
-        'Inline row preview count. Defaults to row_limit. Set lower (e.g. 50) when chaining via register_as and only a sample is needed immediately.',
-      ),
-    row_limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(10000)
-      .default(1000)
-      .describe(
-        'Hard cap on rows materialized in the response (default 1000, max 10000). Full results live on-canvas under register_as when provided.',
-      ),
-  }),
+  input: z
+    .object({
+      sql: z
+        .string()
+        .min(1)
+        .describe(
+          "Single-statement SELECT against df_<id> tables on the shared canvas. Reference dataframes by the names returned in bls_get_series responses or listed by bls_dataframe_describe. Standard DuckDB SQL — joins, aggregates, window functions, CTEs all supported. Example: SELECT series_id, year, period, value FROM df_AAAAA_BBBBB WHERE year >= '2020' ORDER BY year DESC.",
+        ),
+      register_as: z
+        .string()
+        .optional()
+        .describe(
+          'When set, persist the query result as a new dataframe under this name. Fresh TTL — not inherited from parent tables. Use to chain analyses without re-running source SQL or consuming additional BLS quota.',
+        ),
+      preview: z
+        .number()
+        .int()
+        .min(0)
+        .max(10000)
+        .optional()
+        .describe(
+          'Inline row preview count. Defaults to row_limit. Set lower (e.g. 50) when chaining via register_as and only a sample is needed immediately.',
+        ),
+      row_limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(10000)
+        .default(1000)
+        .describe(
+          'Hard cap on rows materialized in the response (default 1000, max 10000). Full results live on-canvas under register_as when provided.',
+        ),
+    })
+    .refine(({ preview, row_limit }) => preview === undefined || preview <= row_limit, {
+      message: 'preview must be less than or equal to row_limit.',
+      path: ['preview'],
+    }),
 
   output: z.object({
     columns: z.array(z.string()).describe('Column names in projection order.'),
     row_count: z
       .number()
-      .describe('Total rows the query produced (may exceed rows.length when capped by row_limit).'),
+      .describe(
+        'Rows materialized by the query. Exact when register_as is used; otherwise equals row_limit when truncated is true.',
+      ),
     rows: z
       .array(z.record(z.string(), z.unknown()))
       .describe('Materialized rows, bounded by preview / row_limit.'),
@@ -78,6 +85,9 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
   }),
 
   enrichment: {
+    truncated: z.boolean().optional().describe('True when the returned rows were capped.'),
+    shown: z.number().optional().describe('Number of rows returned inline.'),
+    cap: z.number().optional().describe('The preview or row_limit cap that was applied.'),
     notice: z
       .string()
       .optional()
@@ -108,16 +118,26 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
       registeredAs: meta?.tableName,
     });
 
-    if (result.rowCount > result.rows.length) {
-      // preview is the binding cap when it's set and smaller than row_limit.
+    const capped = result.truncated === true || result.rowCount > result.rows.length;
+    if (capped) {
       if (input.preview !== undefined && input.preview < input.row_limit) {
-        ctx.enrich.notice(
-          `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${input.preview}). Increase preview or use register_as to persist all rows to canvas.`,
-        );
+        ctx.enrich.truncated({
+          shown: result.rows.length,
+          cap: input.preview,
+          guidance:
+            result.truncated === true
+              ? `Query output exceeded row_limit=${input.row_limit}; only ${result.rows.length} rows were returned (capped by preview=${input.preview}). Use register_as to persist all rows to canvas.`
+              : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${input.preview}). Increase preview or use register_as to persist all rows to canvas.`,
+        });
       } else {
-        ctx.enrich.notice(
-          `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by row_limit=${input.row_limit}). Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`,
-        );
+        ctx.enrich.truncated({
+          shown: result.rows.length,
+          cap: input.row_limit,
+          guidance:
+            result.truncated === true
+              ? `Query output exceeded row_limit=${input.row_limit}; only ${result.rows.length} rows were materialized. Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`
+              : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by row_limit=${input.row_limit}). Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`,
+        });
       }
     }
 

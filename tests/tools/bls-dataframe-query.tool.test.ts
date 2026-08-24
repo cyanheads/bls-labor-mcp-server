@@ -45,7 +45,7 @@ describe('blsDataframeQueryTool', () => {
       meta: undefined,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
     const input = blsDataframeQueryTool.input.parse({
       sql: 'SELECT series_id, value FROM df_AAAAA',
     });
@@ -61,17 +61,19 @@ describe('blsDataframeQueryTool', () => {
     mockQuery.mockResolvedValue({
       result: {
         columns: ['series_id'],
-        rowCount: 5000,
+        rowCount: 1000,
         rows: Array.from({ length: 1000 }, (_, i) => ({ series_id: `S${i}` })),
+        truncated: true,
       },
       meta: undefined,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
     const input = blsDataframeQueryTool.input.parse({ sql: 'SELECT series_id FROM df_AAAAA' });
     await blsDataframeQueryTool.handler(input, ctx);
 
     const enriched = getEnrichment(ctx);
+    expect(enriched).toMatchObject({ truncated: true, shown: 1000, cap: 1000 });
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('row_limit');
     expect(enriched.notice).not.toContain('preview');
@@ -82,13 +84,14 @@ describe('blsDataframeQueryTool', () => {
     mockQuery.mockResolvedValue({
       result: {
         columns: ['series_id'],
-        rowCount: 5000,
+        rowCount: 1000,
         rows: Array.from({ length: 3 }, (_, i) => ({ series_id: `S${i}` })),
+        truncated: true,
       },
       meta: undefined,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
     // preview=3 is below row_limit default (1000) — preview is the binding cap.
     const input = blsDataframeQueryTool.input.parse({
       sql: 'SELECT series_id FROM df_AAAAA',
@@ -97,9 +100,39 @@ describe('blsDataframeQueryTool', () => {
     await blsDataframeQueryTool.handler(input, ctx);
 
     const enriched = getEnrichment(ctx);
+    expect(enriched).toMatchObject({ truncated: true, shown: 3, cap: 3 });
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('preview=3');
-    expect(enriched.notice).not.toContain('row_limit');
+    expect(enriched.notice).toContain('row_limit=1000');
+  });
+
+  it('reports row_limit as the binding ceiling when preview equals it', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['series_id'],
+        rowCount: 25,
+        rows: Array.from({ length: 25 }, (_, i) => ({ series_id: `S${i}` })),
+        truncated: true,
+      },
+      meta: undefined,
+    });
+
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
+    const input = blsDataframeQueryTool.input.parse({
+      sql: 'SELECT series_id FROM df_AAAAA',
+      preview: 25,
+      row_limit: 25,
+    });
+    await blsDataframeQueryTool.handler(input, ctx);
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      ctx,
+      input.sql,
+      expect.objectContaining({ preview: 25, rowLimit: 25 }),
+    );
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 25, cap: 25 });
+    expect(getEnrichment(ctx).notice).toContain('row_limit=25');
   });
 
   it('formats query results as markdown table', () => {
@@ -160,6 +193,13 @@ describe('blsDataframeQueryTool', () => {
     expect(() => blsDataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: 10001 })).toThrow();
   });
 
+  it('rejects preview above row_limit', () => {
+    const input = { sql: 'SELECT 1', preview: 1001, row_limit: 1000 };
+    expect(() => blsDataframeQueryTool.input.parse(input)).toThrow(
+      'preview must be less than or equal to row_limit',
+    );
+  });
+
   it('formats rows with pipe-escaped cell values', () => {
     const output = {
       columns: ['label'],
@@ -203,7 +243,7 @@ describe('blsDataframeQueryTool', () => {
     });
     mockQuery.mockRejectedValue(catalogError);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
     const input = blsDataframeQueryTool.input.parse({
       sql: 'SELECT * FROM information_schema.tables',
     });
