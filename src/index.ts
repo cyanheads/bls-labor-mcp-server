@@ -6,7 +6,7 @@
  */
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
-import { requestContextService, schedulerService } from '@cyanheads/mcp-ts-core/utils';
+import { requestContextService, schedulerService, withExtra } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from './config/server-config.js';
 import { blsDataframeDescribeTool } from './mcp-server/tools/definitions/bls-dataframe-describe.tool.js';
 import { blsDataframeDropTool } from './mcp-server/tools/definitions/bls-dataframe-drop.tool.js';
@@ -83,16 +83,19 @@ await createApp({
         'bls-observations-refresh',
         cfg.observationsMirrorRefreshCron,
         async (jobCtx) => {
+          const logContext = (meta?: Readonly<Record<string, unknown>>) =>
+            meta ? withExtra(jobCtx, meta) : jobCtx;
           const mirrorLog = {
-            debug: (m: string, meta?: object) =>
-              core.logger.debug(m, { ...jobCtx, ...(meta ?? {}) }),
-            info: (m: string, meta?: object) => core.logger.info(m, { ...jobCtx, ...(meta ?? {}) }),
-            notice: (m: string, meta?: object) =>
-              core.logger.notice(m, { ...jobCtx, ...(meta ?? {}) }),
-            warning: (m: string, meta?: object) =>
-              core.logger.warning(m, { ...jobCtx, ...(meta ?? {}) }),
-            error: (m: string, meta?: object) =>
-              core.logger.error(m, { ...jobCtx, ...(meta ?? {}) }),
+            debug: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.debug(m, logContext(meta)),
+            info: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.info(m, logContext(meta)),
+            notice: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.notice(m, logContext(meta)),
+            warning: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.warning(m, logContext(meta)),
+            error: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.error(m, logContext(meta)),
           };
           // Offload to a subprocess — synchronous SQLite writes must not block
           // the server's event loop. WAL allows concurrent readers throughout.

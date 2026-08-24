@@ -52,7 +52,7 @@ describe('blsSearchSeriesTool', () => {
   it('returns series from catalog on happy path and enriches with totals', async () => {
     mockIsLoaded = true;
     mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1, capped: false });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment', limit: 5 });
     const result = await blsSearchSeriesTool.handler(input, ctx);
 
@@ -76,7 +76,7 @@ describe('blsSearchSeriesTool', () => {
   it('enriches capped=true when the FTS candidate pool hit the internal cap (#40)', async () => {
     mockIsLoaded = true;
     mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1000, capped: true });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'employment', limit: 10 });
     await blsSearchSeriesTool.handler(input, ctx);
 
@@ -92,7 +92,7 @@ describe('blsSearchSeriesTool', () => {
     mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({
       query: 'nonfarm',
       survey: 'CE',
@@ -114,7 +114,7 @@ describe('blsSearchSeriesTool', () => {
     mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'zzznotasurvey', limit: 5 });
     await blsSearchSeriesTool.handler(input, ctx);
 
@@ -173,7 +173,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({
       query: 'nonfarm',
       survey: 'CE',
@@ -201,7 +201,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     mockSearch.mockResolvedValueOnce({ series: seriesWithCodes, total: 1, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'CPI all items' });
     const result = await blsSearchSeriesTool.handler(input, ctx);
 
@@ -225,7 +225,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     mockSearch.mockResolvedValueOnce({ series: seriesNoArea, total: 1, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
     const result = await blsSearchSeriesTool.handler(input, ctx);
 
@@ -275,7 +275,7 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
     mockIsLoaded = true;
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: longQuery });
     await expect(blsSearchSeriesTool.handler(input, ctx)).resolves.toBeDefined();
   });

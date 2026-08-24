@@ -226,7 +226,12 @@ if (isMainEntry()) {
   getBlsObservationsService()
     .runSync({ mode, signal: controller.signal })
     .then((result) => {
-      log.info?.('Observations sync complete', result);
+      log.info?.('Observations sync complete', {
+        pagesFetched: result.pagesFetched,
+        recordsApplied: result.recordsApplied,
+        tombstonesApplied: result.tombstonesApplied,
+        total: result.total,
+      });
       process.exit(0);
     })
     .catch((err: unknown) => {

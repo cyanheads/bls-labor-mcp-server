@@ -68,7 +68,7 @@ describe('blsGetSeriesTool', () => {
   it('returns inline series data within budget and enriches with total observations', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetSeriesTool.handler(input, ctx);
 
@@ -91,7 +91,7 @@ describe('blsGetSeriesTool', () => {
   it('echoes requested params (series count, year range, calculations) in enrichment', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000', 'CES0000000001'],
       start_year: 2020,
@@ -122,7 +122,7 @@ describe('blsGetSeriesTool', () => {
   it('passes calculations flag only when set', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000'],
       calculations: true,
@@ -154,7 +154,7 @@ describe('blsGetSeriesTool', () => {
     };
     fetchSeriesMock.mockResolvedValue([pctOnly]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['CUUR0000SA0'],
       calculations: true,
@@ -173,7 +173,7 @@ describe('blsGetSeriesTool', () => {
     const sparse: SeriesData = { seriesId: 'SPARSE000', observations: [] };
     fetchSeriesMock.mockResolvedValue([sparse]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['SPARSE000'] });
     const result = await blsGetSeriesTool.handler(input, ctx);
 
@@ -188,7 +188,7 @@ describe('blsGetSeriesTool', () => {
     // even though one series returned nothing — the notice is the only structured signal.
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES, { seriesId: 'NOTREAL999', observations: [] }]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000', 'NOTREAL999'],
     });
@@ -209,7 +209,7 @@ describe('blsGetSeriesTool', () => {
     // catches that shape too.
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000', 'ABSENT001'],
     });
@@ -221,7 +221,7 @@ describe('blsGetSeriesTool', () => {
   it('points an empty ranged request at the year range as well as the SeriesID (#45)', async () => {
     fetchSeriesMock.mockResolvedValue([{ seriesId: 'ECS10001I', observations: [] }]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['ECS10001I'],
       start_year: 2023,
@@ -235,7 +235,7 @@ describe('blsGetSeriesTool', () => {
   it('sets no notice when every requested series returned data', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     await blsGetSeriesTool.handler(input, ctx);
 
@@ -312,7 +312,7 @@ describe('blsGetSeriesTool', () => {
 
   it('accepts exactly 19-year range without throwing validation error', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000'],
       start_year: 2005,
@@ -396,7 +396,7 @@ describe('blsGetSeriesTool', () => {
     };
     fetchSeriesMock.mockResolvedValue([allIntervals]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['APU0000708111'],
       calculations: true,
@@ -543,7 +543,7 @@ describe('blsGetSeriesTool', () => {
     });
     canvasBridge = { registerDataframe: registerDataframeMock };
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetSeriesTool.handler(input, ctx);
 
@@ -588,7 +588,7 @@ describe('blsGetSeriesTool', () => {
     });
     canvasBridge = { registerDataframe: registerDataframeMock };
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000', 'NOTREAL999'],
     });
@@ -602,7 +602,7 @@ describe('blsGetSeriesTool', () => {
   // Security: verify API key never appears in tool output
   it('does not include API key or env values in output', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetSeriesTool.handler(input, ctx);
     const serialized = JSON.stringify(result);
@@ -634,7 +634,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
   it('defaults annual_average to false and does not ask the service for averages', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     await blsGetSeriesTool.handler(input, ctx);
 
@@ -649,7 +649,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
     // Requesting a range must not change what a row means (#53's root cause).
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['CUUR0000SA0'],
       start_year: 2023,
@@ -666,7 +666,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
   it('forwards annual_average to the service when opted in', async () => {
     fetchSeriesMock.mockResolvedValue([CPI_WITH_M13]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['CUUR0000SA0'],
       annual_average: true,
@@ -684,7 +684,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
     // without knowing BLS period codes.
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     await blsGetSeriesTool.handler(input, ctx);
 
@@ -697,7 +697,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
   it('counts annual-average rows and warns against double-counting when opted in', async () => {
     fetchSeriesMock.mockResolvedValue([CPI_WITH_M13]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['CUUR0000SA0'],
       annual_average: true,
@@ -722,7 +722,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
       { seriesId: 'LNS14000000', observations: [{ year: '2024', period: 'M12', value: '4.1' }] },
     ]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['PRS30006011', 'CUUS0000SA0', 'LNS14000000'],
       annual_average: true,
@@ -737,7 +737,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
     // only honest signal of what actually came back.
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['LNS14000000'],
       annual_average: true,
@@ -767,7 +767,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
     });
     canvasBridge = { registerDataframe: registerDataframeMock };
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({
       series_ids: ['CUUR0000SA0'],
       annual_average: true,
@@ -811,7 +811,7 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
   // Security: verify API key never appears in tool output
   it('does not include API key or env values in output', async () => {
     fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetSeriesTool.handler(input, ctx);
     const serialized = JSON.stringify(result);

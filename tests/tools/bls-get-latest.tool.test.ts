@@ -27,7 +27,7 @@ describe('blsGetLatestTool', () => {
   it('returns latest observations for valid series with no notice', async () => {
     fetchLatestMock.mockResolvedValue(MOCK_SERIES);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
     const input = blsGetLatestTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetLatestTool.handler(input, ctx);
 
@@ -43,7 +43,7 @@ describe('blsGetLatestTool', () => {
   it('records failed series and enriches with notice', async () => {
     fetchLatestMock.mockRejectedValue(new Error('series_not_found'));
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
     const input = blsGetLatestTool.input.parse({ series_ids: ['INVALID000'] });
     const result = await blsGetLatestTool.handler(input, ctx);
 
@@ -61,7 +61,7 @@ describe('blsGetLatestTool', () => {
     const sparse: SeriesData = { seriesId: 'LNS14000000', observations: [] };
     fetchLatestMock.mockResolvedValue(sparse);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
     const input = blsGetLatestTool.input.parse({ series_ids: ['LNS14000000'] });
     const result = await blsGetLatestTool.handler(input, ctx);
 
@@ -136,7 +136,7 @@ describe('blsGetLatestTool — additional coverage', () => {
       .mockResolvedValueOnce(MOCK_SERIES)
       .mockRejectedValueOnce(new Error('series_not_found'));
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
     const input = blsGetLatestTool.input.parse({
       series_ids: ['LNS14000000', 'INVALID000'],
     });
@@ -163,7 +163,7 @@ describe('blsGetLatestTool — additional coverage', () => {
       .mockRejectedValueOnce(new Error('Series does not exist'))
       .mockResolvedValueOnce(MOCK_SERIES);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
     const input = blsGetLatestTool.input.parse({
       series_ids: ['ZZZZZZZ_INVALID', 'LNS14000000'],
     });

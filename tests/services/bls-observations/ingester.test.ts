@@ -5,7 +5,7 @@
  */
 
 import type { SyncContext } from '@cyanheads/mcp-ts-core/mirror';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
 import { observationsSync } from '@/services/bls-observations/ingester.js';
 
@@ -410,7 +410,7 @@ describe('observationsSync — cursor and checkpoint', () => {
     });
 
     const ctx = makeCtx();
-    const pages: Array<{ cursor?: string; records: unknown[] }> = [];
+    const pages: Array<{ cursor: string | undefined; records: unknown[] }> = [];
 
     for await (const page of observationsSync(ctx, {
       catalogBaseUrl: 'https://download.bls.gov/pub/time.series',

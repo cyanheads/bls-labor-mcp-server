@@ -406,9 +406,9 @@ describe('BlsCatalogService.load (cold harvest)', () => {
 
   it('sends the configured User-Agent and builds the index from a live harvest', async () => {
     const ua = 'test-bls-mcp/1.0 (casey@caseyjhand.com)';
-    const captured: HeadersInit[] = [];
+    const captured: Headers[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
-      if (init?.headers) captured.push(init.headers as HeadersInit);
+      if (init?.headers) captured.push(new Headers(init.headers));
       return Promise.resolve(new Response(SERIES_TEXT, { status: 200 }));
     });
 
@@ -420,7 +420,7 @@ describe('BlsCatalogService.load (cold harvest)', () => {
     expect(svc.totalSeries).toBeGreaterThan(0);
     expect(captured.length).toBeGreaterThan(0);
     for (const h of captured) {
-      expect((h as Record<string, string>)['User-Agent']).toBe(ua);
+      expect(h.get('User-Agent')).toBe(ua);
     }
   });
 

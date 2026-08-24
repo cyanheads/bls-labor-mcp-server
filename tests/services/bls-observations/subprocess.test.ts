@@ -60,9 +60,12 @@ describe('runObservationsSubprocess overlap guard', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
 
     // Resolve the first call by firing the captured 'exit' handler.
-    const exitHandler = (mockChild.on as ReturnType<typeof vi.fn>).mock.calls.find(
-      ([event]: [string]) => event === 'exit',
-    )?.[1] as ((code: number | null, signal: string | null) => void) | undefined;
+    const exitCall = (mockChild.on as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call) => call[0] === 'exit',
+    );
+    const exitHandler = exitCall?.[1] as
+      | ((code: number | null, signal: string | null) => void)
+      | undefined;
     exitHandler?.(0, null);
     await p1;
   });

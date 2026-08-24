@@ -43,7 +43,7 @@ describe('blsListSurveysTool', () => {
   });
 
   it('returns all surveys when no category filter is given', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({});
     const result = await blsListSurveysTool.handler(input, ctx);
 
@@ -56,7 +56,7 @@ describe('blsListSurveysTool', () => {
   });
 
   it('filters by employment category', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({ category: 'employment' });
     const result = await blsListSurveysTool.handler(input, ctx);
 
@@ -93,7 +93,7 @@ describe('blsListSurveysTool — additional coverage', () => {
 
   it('returns empty list when no surveys match the category filter', async () => {
     // MOCK_SURVEYS contains CE, CU, LN — none are in the time_use category (TU only)
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({ category: 'time_use' });
     const result = await blsListSurveysTool.handler(input, ctx);
 
@@ -102,7 +102,7 @@ describe('blsListSurveysTool — additional coverage', () => {
   });
 
   it('sorts surveys alphabetically by abbreviation', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({});
     const result = await blsListSurveysTool.handler(input, ctx);
 
@@ -142,7 +142,7 @@ describe('blsListSurveysTool — additional coverage', () => {
   });
 
   it('returns total equal to surveys array length', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({});
     const result = await blsListSurveysTool.handler(input, ctx);
 
@@ -242,7 +242,7 @@ describe('blsListSurveysTool — CATEGORY_MAP correctness (#44)', () => {
   });
 
   const abbrsFor = async (category: 'injuries' | 'employment' | 'productivity') => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
     const input = blsListSurveysTool.input.parse({ category });
     const result = await blsListSurveysTool.handler(input, ctx);
     return result.surveys.map((s) => s.abbreviation);
