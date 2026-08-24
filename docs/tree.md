@@ -1,12 +1,9 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-07-17 09:40:11
+Generated on: 2026-08-23 21:24:16
 
 ```text
 bls-labor-mcp-server/
-├── .agents/
-├── .cache/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -17,6 +14,8 @@ bls-labor-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/

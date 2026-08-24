@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.12](changelog/0.4.x/0.4.12.md) — 2026-08-23
+
+MCP 2026-07-28 support, explicit stateless HTTP, and accurate dataframe truncation disclosure.
+
 ## [0.4.11](changelog/0.4.x/0.4.11.md) — 2026-07-17 · 🛡️ Security
 
 Invalid BLS_API_KEY is now reported as a configuration error instead of quota_exceeded, and redacted from all error output
