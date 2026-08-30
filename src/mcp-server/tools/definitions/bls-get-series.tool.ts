@@ -2,7 +2,8 @@
  * @fileoverview Fetch time-series data for 1–50 BLS series by SeriesID. Sends
  * a single POST /timeseries/data request (one API query regardless of series
  * count). When total observations exceed the inline budget, spills to canvas
- * and returns a `dataset` field with a `df_<id>` handle for follow-up SQL.
+ * and returns a `dataset` field with a `df_<id>` handle for schema discovery
+ * and follow-up SQL.
  * @module mcp-server/tools/definitions/bls-get-series
  */
 
@@ -72,7 +73,7 @@ const CALC_COLUMNS = [
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). Observations cover real periods only and are safe to sum or average as returned; set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle for follow-up SQL via bls_dataframe_query. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
+    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). Observations cover real periods only and are safe to sum or average as returned; set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle. Call bls_dataframe_describe with that name to inspect the dataframe schema, then use the name in bls_dataframe_query SQL. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -212,18 +213,15 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .object({
         name: z
           .string()
-          .describe('Canvas table name (df_XXXXX_XXXXX). Pass to bls_dataframe_query.'),
+          .describe(
+            'Canvas table name (df_XXXXX_XXXXX). Pass to bls_dataframe_describe first to inspect column_schema, then use it in bls_dataframe_query SQL.',
+          ),
         row_count: z.number().describe('Total rows in the canvas table.'),
         expires_at: z.string().describe('ISO 8601 expiry timestamp (sliding 24h window).'),
-        truncated: z
-          .boolean()
-          .describe(
-            'True when the upstream response had more rows than the canvas materialization cap.',
-          ),
       })
       .optional()
       .describe(
-        'Canvas dataframe handle — present when the observation volume exceeded the inline budget. Use bls_dataframe_query with dataset.name to run SQL across the full data.',
+        'Canvas dataframe handle — present when the observation volume exceeded the inline budget. Call bls_dataframe_describe with dataset.name to inspect column_schema, then use that table name in bls_dataframe_query SQL across the full data.',
       ),
     spilled: z
       .boolean()
@@ -264,7 +262,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .string()
       .optional()
       .describe(
-        'Guidance for agents — names any SeriesID that returned zero observations, and reports when results spilled to canvas and SQL is needed for full access. Absent when every requested series returned data and it all fit inline.',
+        'Guidance for agents — names any SeriesID that returned zero observations, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data and it all fit inline.',
       ),
   },
 
@@ -381,10 +379,10 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           annual_average: input.annual_average,
         },
       });
-      const dataset = { ...toDatasetField(registered), truncated: false };
+      const dataset = toDatasetField(registered);
 
       notices.push(
-        `${totalObservations} total observations across ${allSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset.name}; use bls_dataframe_query for SQL access.`,
+        `${totalObservations} total observations across ${allSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset.name}; call bls_dataframe_describe with name=${dataset.name} to inspect column_schema, then use ${dataset.name} in bls_dataframe_query SQL.`,
       );
       ctx.enrich.notice(notices.join(' '));
 
@@ -426,10 +424,10 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
     if (result.spilled && result.dataset) {
       const ds = result.dataset;
+      lines.push(`**Spilled to canvas** — ${ds.row_count} total rows in \`${ds.name}\`.`);
       lines.push(
-        `**Spilled to canvas** — ${ds.row_count} total rows in \`${ds.name}\`${ds.truncated ? ' (truncated)' : ''}.`,
+        `Call \`bls_dataframe_describe\` with \`name=${ds.name}\` to inspect \`column_schema\`, then use table \`${ds.name}\` in \`bls_dataframe_query\` SQL.`,
       );
-      lines.push(`Use \`bls_dataframe_query\` with table \`${ds.name}\` for full SQL access.`);
       lines.push(`Expires: ${ds.expires_at}\n`);
     }
 

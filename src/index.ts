@@ -6,6 +6,7 @@
  */
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
+import { config } from '@cyanheads/mcp-ts-core/config';
 import { requestContextService, schedulerService, withExtra } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from './config/server-config.js';
 import { blsDataframeDescribeTool } from './mcp-server/tools/definitions/bls-dataframe-describe.tool.js';
@@ -25,27 +26,45 @@ import { runObservationsSubprocess } from './services/bls-observations/subproces
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
 
 const cfg = getServerConfig();
+const canvasEnabled = config.canvas.providerType === 'duckdb';
 
-const dropTool = cfg.dataframeDropEnabled
-  ? blsDataframeDropTool
-  : disabledTool(blsDataframeDropTool, {
-      reason: 'bls_dataframe_drop is disabled by default — TTL handles lifecycle.',
-      hint: 'BLS_DATAFRAME_DROP_ENABLED=true',
-    });
+const canvasDisabled = {
+  reason: 'DataCanvas is disabled in this deployment.',
+  hint: 'CANVAS_PROVIDER_TYPE=duckdb',
+};
+const describeTool = canvasEnabled
+  ? blsDataframeDescribeTool
+  : disabledTool(blsDataframeDescribeTool, canvasDisabled);
+const queryTool = canvasEnabled
+  ? blsDataframeQueryTool
+  : disabledTool(blsDataframeQueryTool, canvasDisabled);
+const dropTool = !canvasEnabled
+  ? disabledTool(blsDataframeDropTool, canvasDisabled)
+  : cfg.dataframeDropEnabled
+    ? blsDataframeDropTool
+    : disabledTool(blsDataframeDropTool, {
+        reason: 'bls_dataframe_drop is disabled by default — TTL handles lifecycle.',
+        hint: 'BLS_DATAFRAME_DROP_ENABLED=true',
+      });
+
+const instructions =
+  'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. ' +
+  (canvasEnabled
+    ? 'Large results spill to a DataCanvas dataframe. Call bls_dataframe_describe with dataset.name to inspect column_schema, then use that table name in bls_dataframe_query SQL.'
+    : 'DataCanvas is disabled. If a history request exceeds the inline budget, narrow start_year/end_year or enable CANVAS_PROVIDER_TYPE=duckdb and restart.');
 
 await createApp({
   name: 'bls-labor-mcp-server',
   title: 'bls-labor-mcp-server',
-  instructions:
-    'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. Large results spill to a DataCanvas dataframe queryable via bls_dataframe_query.',
+  instructions,
   landing: { requireAuth: false },
   tools: [
     blsListSurveysTool,
     blsSearchSeriesTool,
     blsGetLatestTool,
     blsGetSeriesTool,
-    blsDataframeDescribeTool,
-    blsDataframeQueryTool,
+    describeTool,
+    queryTool,
     dropTool,
   ],
   resources: [],

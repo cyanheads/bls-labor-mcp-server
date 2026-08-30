@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/bls-labor-mcp-server</h1>
   <p><b>Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools</div>
+  <div>4 Tools by default · 6 with DataCanvas · 7 with opt-in drop</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.12-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Tools
 
-Seven tools in two groups — four for BLS data access (survey discovery, SeriesID resolution, history, current values) and three for optional DataCanvas SQL analysis of large result sets:
+Four BLS data tools are always available. Setting `CANVAS_PROVIDER_TYPE=duckdb` adds two DataCanvas SQL tools; setting `BLS_DATAFRAME_DROP_ENABLED=true` as well adds the seventh, destructive cleanup tool.
 
 | Tool | Description |
 |:-----|:------------|
@@ -37,9 +37,9 @@ Seven tools in two groups — four for BLS data access (survey discovery, Series
 | `bls_search_series` | Search the BLS series catalog by natural language, survey, area, or keywords to resolve cryptic SeriesIDs. |
 | `bls_get_series` | Fetch time-series data for 1–50 BLS series by SeriesID, with optional year range and period-over-period calculations. |
 | `bls_get_latest` | Return the single most recent observation for one or more BLS series. |
-| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` — provenance, TTL, row count, column schema. Requires `CANVAS_PROVIDER_TYPE=duckdb`. |
-| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series`. Supports JOINs, aggregates, window functions, CTEs. Requires `CANVAS_PROVIDER_TYPE=duckdb`. |
-| `bls_dataframe_drop` | Drop a canvas dataframe by name. Opt-in via `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default. Requires `CANVAS_PROVIDER_TYPE=duckdb`. |
+| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` — provenance, TTL, row count, column schema. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
+| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series`. Supports JOINs, aggregates, window functions, CTEs. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
+| `bls_dataframe_drop` | Drop a canvas dataframe by name. Available when `CANVAS_PROVIDER_TYPE=duckdb` and `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default. |
 
 ### `bls_list_surveys`
 
@@ -74,7 +74,7 @@ Fetch historical time-series data for one or more BLS series.
 - Optional `calculations: true` for BLS-server-side net change and percent change — a survey returns whichever it supports (CPI/PPI return percent change only); check `bls_list_surveys` for per-survey support
 - Optional `annual_average: true` adds each year's annual-average row (period `M13`, `Q05` or `S03`) — the mean of that year's real periods, not an additional one. Off by default, so observations are safe to sum or average as returned; `enrichment.annualAverageRows` reports how many were added
 - Returns observations with series metadata (title, area, item, seasonality)
-- Spills to a DataCanvas dataframe when the observation count exceeds the inline context budget — response includes a `dataset.name` handle for SQL via `bls_dataframe_query`. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
+- With `CANVAS_PROVIDER_TYPE=duckdb`, spills to a DataCanvas dataframe when the observation count exceeds the inline context budget. Call `bls_dataframe_describe` with the returned `dataset.name` to inspect `column_schema`, then use that table name in `bls_dataframe_query` SQL. Without DataCanvas, narrow oversized requests with `start_year` / `end_year`.
 
 ---
 
@@ -93,6 +93,8 @@ Get the current value for one or more BLS series.
 
 Inspect canvas dataframes registered by `bls_get_series`.
 
+Available only when `CANVAS_PROVIDER_TYPE=duckdb`.
+
 - Lists all active dataframes for the current tenant: table name, source tool, query params, row count, column schema, TTL
 - Optionally describe a single dataframe by name
 - Lazy-sweeps expired entries before responding
@@ -103,6 +105,8 @@ Inspect canvas dataframes registered by `bls_get_series`.
 ### `bls_dataframe_query`
 
 Run SQL against canvas dataframes registered by `bls_get_series`.
+
+Available only when `CANVAS_PROVIDER_TYPE=duckdb`.
 
 - Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected
 - Supports JOINs, aggregates, window functions, and CTEs
@@ -117,7 +121,7 @@ Run SQL against canvas dataframes registered by `bls_get_series`.
 Drop a canvas dataframe by name. Idempotent — returns `dropped: false` when nothing matched.
 
 - Use to free canvas resources ahead of the per-table TTL when an analysis is complete
-- Must be explicitly enabled via `BLS_DATAFRAME_DROP_ENABLED=true` (TTL handles cleanup by default)
+- Requires `CANVAS_PROVIDER_TYPE=duckdb` and must be explicitly enabled via `BLS_DATAFRAME_DROP_ENABLED=true` (TTL handles cleanup by default)
 
 ## Features
 
@@ -136,7 +140,7 @@ BLS-specific:
 - Offline series catalog search against LABSTAT flat files — zero API quota for discovery
 - Typed error contracts for BLS-specific failure modes: quota exhaustion, locked database, calculations not supported
 - Period-over-period calculations via BLS server-side flag (consistent with BLS published numbers)
-- DataCanvas spillover (DuckDB) for large multi-series result sets — SQL access without re-querying the API
+- Optional DataCanvas spillover (DuckDB) for large multi-series result sets — schema discovery and SQL access without re-querying the API
 - Optional local observation mirror — sync LABSTAT bulk data into an embedded SQLite store to serve `bls_get_series` / `bls_get_latest` without the 500/day API cap (opt-in, off by default)
 - On-disk SQLite catalog index — the series catalog is parsed into an FTS5 SQLite store, queried on demand (not held in memory) and persisted across restarts; the OES/OEWS wage survey (~6M series) is opt-in via `BLS_CATALOG_INCLUDE_OES`
 

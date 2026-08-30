@@ -3,7 +3,7 @@
  * @module tests/tools/bls-dataframe-query.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsDataframeQueryTool } from '@/mcp-server/tools/definitions/bls-dataframe-query.tool.js';
 
@@ -104,6 +104,99 @@ describe('blsDataframeQueryTool', () => {
     expect(enriched.notice).toBeDefined();
     expect(enriched.notice).toContain('preview=3');
     expect(enriched.notice).toContain('row_limit=1000');
+  });
+
+  it('points preview-limited register_as results at the materialized dataframe (#57)', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['series_id'],
+        rowCount: 25,
+        rows: Array.from({ length: 3 }, (_, i) => ({ series_id: `S${i}` })),
+        tableName: 'analysis_result',
+      },
+      meta: {
+        tableName: 'analysis_result',
+        expiresAt: '2026-08-31T00:00:00.000Z',
+      },
+    });
+
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
+    const input = blsDataframeQueryTool.input.parse({
+      sql: 'SELECT series_id FROM df_AAAAA',
+      register_as: 'analysis_result',
+      preview: 3,
+    });
+    await blsDataframeQueryTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 3, cap: 3 });
+    expect(getEnrichment(ctx).notice).toContain('analysis_result');
+    expect(getEnrichment(ctx).notice).not.toContain('use register_as');
+  });
+
+  it('carries register_as recovery through structuredContent and content[] (#57)', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['series_id'],
+        rowCount: 25,
+        rows: [{ series_id: 'S0' }],
+        tableName: 'analysis_result',
+      },
+      meta: {
+        tableName: 'analysis_result',
+        expiresAt: '2026-08-31T00:00:00.000Z',
+      },
+    });
+
+    const result = await runToolContract(
+      blsDataframeQueryTool,
+      {
+        sql: 'SELECT series_id FROM df_AAAAA',
+        register_as: 'analysis_result',
+        preview: 1,
+      },
+      { context: { errors: blsDataframeQueryTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      registered_as: 'analysis_result',
+      truncated: true,
+      notice: expect.stringContaining('analysis_result'),
+    });
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('analysis_result');
+    expect(text).not.toContain('use register_as');
+  });
+
+  it('omits truncation guidance when register_as preview includes every row (#57)', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockResolvedValue({
+      result: {
+        columns: ['series_id'],
+        rowCount: 2,
+        rows: [{ series_id: 'S1' }, { series_id: 'S2' }],
+        tableName: 'analysis_result',
+      },
+      meta: {
+        tableName: 'analysis_result',
+        expiresAt: '2026-08-31T00:00:00.000Z',
+      },
+    });
+
+    const ctx = createMockContext({ errors: blsDataframeQueryTool.errors });
+    const input = blsDataframeQueryTool.input.parse({
+      sql: 'SELECT series_id FROM df_AAAAA',
+      register_as: 'analysis_result',
+      preview: 2,
+    });
+    await blsDataframeQueryTool.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
   it('reports row_limit as the binding ceiling when preview equals it', async () => {

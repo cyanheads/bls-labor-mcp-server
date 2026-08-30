@@ -47,13 +47,6 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
             created_at: z.string().describe('ISO 8601 creation timestamp.'),
             expires_at: z.string().describe('ISO 8601 expiry timestamp (sliding TTL).'),
             row_count: z.number().describe('Rows materialized in the dataframe.'),
-            truncated: z
-              .boolean()
-              .describe('True when the upstream had more rows than were materialized.'),
-            max_rows: z
-              .number()
-              .optional()
-              .describe('Materialization cap that produced truncated, when applicable.'),
             column_schema: z
               .array(
                 z
@@ -88,8 +81,6 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
         created_at: meta.createdAt,
         expires_at: meta.expiresAt,
         row_count: meta.rowCount,
-        truncated: meta.truncated,
-        ...(meta.maxRows !== undefined && { max_rows: meta.maxRows }),
         column_schema: meta.columnSchema.map((c) => ({
           name: c.name,
           type: c.type,
@@ -105,12 +96,9 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
     }
     const lines: string[] = [`**${result.dataframes.length} active dataframe(s):**\n`];
     for (const df of result.dataframes) {
-      const truncated = df.truncated
-        ? ` (truncated${df.max_rows ? ` at ${df.max_rows}` : ''})`
-        : '';
       lines.push(`### ${df.name}`);
       lines.push(`- Source: ${df.source_tool}`);
-      lines.push(`- Rows: ${df.row_count}${truncated}`);
+      lines.push(`- Rows: ${df.row_count}`);
       lines.push(`- Created: ${df.created_at} — Expires: ${df.expires_at}`);
       const params = Object.entries(df.query_params)
         .map(([k, v]) => `${k}=${JSON.stringify(v)}`)

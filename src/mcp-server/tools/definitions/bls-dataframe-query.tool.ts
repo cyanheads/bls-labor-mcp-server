@@ -121,13 +121,15 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
     const capped = result.truncated === true || result.rowCount > result.rows.length;
     if (capped) {
       if (input.preview !== undefined && input.preview < input.row_limit) {
+        const guidance = meta?.tableName
+          ? `The complete result is materialized in dataframe ${meta.tableName}; increase preview only to return more rows inline.`
+          : result.truncated === true
+            ? `Query output exceeded row_limit=${input.row_limit}; only ${result.rows.length} rows were returned (capped by preview=${input.preview}). Use register_as to persist all rows to canvas.`
+            : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${input.preview}). Increase preview or use register_as to persist all rows to canvas.`;
         ctx.enrich.truncated({
           shown: result.rows.length,
           cap: input.preview,
-          guidance:
-            result.truncated === true
-              ? `Query output exceeded row_limit=${input.row_limit}; only ${result.rows.length} rows were returned (capped by preview=${input.preview}). Use register_as to persist all rows to canvas.`
-              : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${input.preview}). Increase preview or use register_as to persist all rows to canvas.`,
+          guidance,
         });
       } else {
         ctx.enrich.truncated({

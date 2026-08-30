@@ -4,26 +4,28 @@
 
 ### Tools
 
-4 core tools + 3 dataframe tools (1 opt-in):
+Four core tools are always registered. `CANVAS_PROVIDER_TYPE=duckdb` adds describe and query; `BLS_DATAFRAME_DROP_ENABLED=true` adds drop only when canvas is also enabled.
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `bls_search_series` | Searches BLS series catalog by natural language query, survey, geographic area, or subject keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag) and plain-language names. Use this before `bls_get_series` when you have a concept but not a SeriesID. | `query` (natural language or keyword), `survey` (enum: CPS, CES, CPI, PPI, JOLTS, LAUS, OEWS, ECEC, …), `area` (state name / MSA / FIPS), `seasonal_adjustment` (bool), `limit` | `readOnlyHint: true`, `openWorldHint: true` |
-| `bls_get_series` | Fetches time-series data for 1–50 BLS series by SeriesID, with optional year range and BLS-computed period-over-period calculations. Returns observations with metadata (series name, unit, seasonality). When the total observation count exceeds the inline budget, spills to canvas and returns a `dataset` field with a `df_<id>` handle for follow-up SQL. Use when you already have SeriesIDs; use `bls_search_series` first if you don't. Calculations are a boolean flag (you can't select one type); the API returns whichever the survey supports — check `bls_list_surveys` if unsure. Annual-average rows are opt-in via `annual_average` and independent of the year range. | `series_ids` (array, 1–50), `start_year` (int), `end_year` (int), `calculations` (bool), `annual_average` (bool, default false) | `readOnlyHint: true`, `openWorldHint: true` |
+| `bls_get_series` | Fetches time-series data for 1–50 BLS series by SeriesID, with optional year range and BLS-computed period-over-period calculations. Returns observations with metadata (series name, unit, seasonality). With DataCanvas enabled, results above the inline budget spill and return a `dataset` handle: inspect it with `bls_dataframe_describe`, then query it with `bls_dataframe_query`. Without DataCanvas, oversized requests fail with guidance to narrow the year range or enable canvas. Use `bls_search_series` first if you need a SeriesID. Annual-average rows are opt-in via `annual_average` and independent of the year range. | `series_ids` (array, 1–50), `start_year` (int), `end_year` (int), `calculations` (bool), `annual_average` (bool, default false) | `readOnlyHint: true`, `openWorldHint: true` |
 | `bls_get_latest` | Returns the single most recent observation for one or more BLS series. For "what is X right now" questions — use when you need the current value, not history. Internally issues one GET request per series (no batch-latest endpoint exists in the BLS API); prefer `bls_get_series` with a 1-year window when fetching latest values for many series. | `series_ids` (array, 1–10 recommended; up to 50) | `readOnlyHint: true`, `openWorldHint: true`, `idempotentHint: true` |
 | `bls_list_surveys` | Lists BLS survey programs with their codes, descriptions, and geographic/subject coverage. Use to discover which survey covers a topic before calling `bls_search_series`. | `category` (enum: prices, employment, wages, productivity, injuries, time_use — optional filter) | `readOnlyHint: true`, `openWorldHint: false`, `idempotentHint: true` |
 | `bls_dataframe_describe` | List canvas dataframes materialized by `bls_get_series`, with provenance, TTL, row count, and column schema. Read-only. Requires `CANVAS_PROVIDER_TYPE=duckdb`. | `name` (optional — omit to list all) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `bls_dataframe_query` | Run a single-statement SELECT against canvas dataframes. Supports JOINs, aggregates, window functions, CTEs. Optional `register_as` persists the result as a new dataframe. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs denied at bridge layer. Requires `CANVAS_PROVIDER_TYPE=duckdb`. | `sql` (SELECT statement), `register_as` (optional), `preview` (optional row count), `row_limit` (default 1000, max 10000) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `bls_dataframe_drop` _(opt-in)_ | Drop a canvas dataframe by name. Idempotent. Opt-in via `BLS_DATAFRAME_DROP_ENABLED=true` — off by default since per-table TTL handles cleanup. | `name` (df_<id> to drop) | `readOnlyHint: false`, `idempotentHint: true`, `openWorldHint: false`, `destructiveHint: true` |
+| `bls_dataframe_drop` _(opt-in)_ | Drop a canvas dataframe by name. Idempotent. Requires canvas plus `BLS_DATAFRAME_DROP_ENABLED=true` — off by default since per-table TTL handles cleanup. | `name` (df_<id> to drop) | `readOnlyHint: false`, `idempotentHint: true`, `openWorldHint: false`, `destructiveHint: true` |
 
 ### `bls_dataframe_describe` / `bls_dataframe_query` / `bls_dataframe_drop`
 
-In-conversation SQL analytics over the dataframes that `bls_get_series` materializes on a shared DuckDB-backed canvas. When `bls_get_series` spills, the response includes a `dataset` field with a `df_<id>` handle; pass that handle to `bls_dataframe_query` for JOINs, GROUP BY area/industry, window functions (rolling avg, YoY computed locally rather than relying on BLS's `calculations` flag).
+In-conversation SQL analytics over the dataframes that `bls_get_series` materializes on a shared DuckDB-backed canvas. When `bls_get_series` spills, pass `dataset.name` to `bls_dataframe_describe` to inspect the authoritative snake_case `column_schema`, then use that table name in `bls_dataframe_query` for JOINs, GROUP BY area/industry, and window functions.
+
+The framework-owned `config.canvas.providerType` controls the startup surface. When it is `none`, all three dataframe definitions remain visible in operator metadata through `disabledTool` but are omitted from MCP `tools/list`; server instructions describe the narrow-request / enable-canvas recovery instead of a spill workflow. When it is `duckdb`, describe and query are registered, while drop remains independently gated by `BLS_DATAFRAME_DROP_ENABLED`.
 
 - **Read-only by default.** Writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected by the framework SQL gate. System catalogs (`information_schema`, `pg_catalog`, `sqlite_master`, `duckdb_*`) are denied at the bridge layer so callers can't enumerate dataframes they don't already hold a handle for. `bls_dataframe_drop` is the only destructive tool and is opt-in (`BLS_DATAFRAME_DROP_ENABLED=true`); TTL handles cleanup otherwise.
 - **Per-table TTL.** Each dataframe ages on its own clock (default 24 h, override with `BLS_DATASET_TTL_SECONDS`). The canvas itself uses the framework's sliding TTL.
 - **`register_as` chaining.** `bls_dataframe_query` can persist its result as a new dataframe with a fresh TTL — chain analyses without re-running the source query or consuming additional BLS API quota.
-- **`bls_get_series` output schema.** When spillover occurs, the response includes `dataset: { name: "df_<id>", row_count: N, truncated: bool }`. Pass `name` directly to `bls_dataframe_query` as the table name in the SELECT. When no spillover occurs, `dataset` is absent.
+- **`bls_get_series` output schema.** A successful spill registers every fetched observation and returns `dataset: { name: "df_<id>", row_count: N, expires_at: "…" }`. Inspect `name` with `bls_dataframe_describe`, then use it in `bls_dataframe_query`; when no spill occurs, `dataset` is absent. Registration failure is a typed error rather than a partial success.
 
 ### Resources
 
@@ -109,7 +111,7 @@ The core UX problem is SeriesID resolution: BLS identifiers (`LNS14000000`, `CES
 6. **`bls_get_latest`** — single API call path; simple response shape; test first
 7. **`bls_get_series`** — batch series with year range, calculations, and DataCanvas spillover; `dataset` field in output when spilled
 8. **`CanvasBridgeService`** — `df_<id>` minting, schema derivation, per-table TTL, system-catalog denial; mirrors `src/services/canvas-bridge/` from secedgar
-9. **Dataframe tools** — `bls_dataframe_describe`, `bls_dataframe_query`, `bls_dataframe_drop` (gate on `BLS_DATAFRAME_DROP_ENABLED`)
+9. **Dataframe tools** — gate all three on framework DataCanvas availability; independently gate `bls_dataframe_drop` on `BLS_DATAFRAME_DROP_ENABLED`
 
 Each step is independently testable.
 
@@ -173,7 +175,7 @@ Series catalog resolution is handled entirely offline from LABSTAT flat files �
 |:--|:-----|:--------|
 | 1 | `bls_search_series` | Resolve concepts → SeriesIDs across surveys or areas |
 | 2 | `bls_get_series` | Batch-fetch 1–50 series; result spills to canvas → `dataset: df_<id>` when large |
-| 3 | `bls_dataframe_describe` | Confirm schema and column names before writing SQL (optional) |
+| 3 | `bls_dataframe_describe` | Inspect the authoritative column schema before writing SQL |
 | 4 | `bls_dataframe_query` | JOIN multiple `df_<id>` tables, GROUP BY area/industry, apply window functions (rolling avg, YoY) — canvas SQL counts zero against BLS quota |
 | 5 | `bls_dataframe_query` + `register_as` | Persist an intermediate result as a new dataframe to chain further analysis without re-running source SQL |
 
@@ -195,7 +197,7 @@ A series that returns no data must be reported on both surfaces too. `bls_get_se
 - **No geographic geocoding.** Area code resolution maps string names to BLS FIPS/area codes from the catalog — it's a lookup, not a geocoder. Unusual MSA names or abbreviations may not match.
 - **Calculations are BLS-server-side, requested via a single flag.** `calculations: true` requests both net change and percent change — individual types cannot be selected — but the API returns whichever the survey supports (CPI/PPI return percent change only). Requesting calculations never fails: a survey that supports neither still returns `REQUEST_SUCCEEDED` with its observations, adding an informational `message[]` entry ("BLS does not produce calculations for Series …") and no calculation fields. The `allowsNetChange`/`allowsPercentChange` flags are therefore predictive only — `bls_get_series` passes the flag through unconditionally and never gates on them.
 - **Survey capability flags are a baked-in table, not a live read.** Only `GET /surveys/{abbr}` carries `allowsNetChange`/`allowsPercentChange`/`hasAnnualAverages`; the bulk `GET /surveys` omits them. Reading them live would cost ~70 queries whenever the process-local survey cache lapsed, so `SURVEY_CAPABILITIES` in `bls-api-service.ts` holds a swept snapshot of all 70 abbreviations, merged at list time. It needs a re-sweep only when BLS adds or changes a survey.
-- **Dataframe tools require `CANVAS_PROVIDER_TYPE=duckdb`.** DuckDB has no V8-isolate build; setting this on Cloudflare Workers fails closed with a `ConfigurationError` at init time. Node.js only. When canvas is disabled, all three dataframe tools throw `canvas_unavailable` (`ServiceUnavailable`).
+- **Dataframe tools require `CANVAS_PROVIDER_TYPE=duckdb`.** DuckDB has no V8-isolate build; setting this on Cloudflare Workers fails closed with a `ConfigurationError` at init time. Node.js only. When canvas is disabled, the dataframe definitions remain operator-visible but are omitted from MCP `tools/list`; an oversized `bls_get_series` request still returns `canvas_unavailable` with narrow-request / enable-canvas recovery.
 
 ---
 

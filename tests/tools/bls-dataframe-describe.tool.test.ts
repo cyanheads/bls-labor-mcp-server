@@ -40,7 +40,6 @@ describe('blsDataframeDescribeTool', () => {
           created_at: '2026-05-21T10:00:00.000Z',
           expires_at: '2026-05-22T10:00:00.000Z',
           row_count: 24,
-          truncated: false,
           column_schema: [
             { name: 'series_id', type: 'VARCHAR', nullable: true },
             { name: 'value', type: 'DOUBLE', nullable: true },
@@ -56,28 +55,6 @@ describe('blsDataframeDescribeTool', () => {
     expect(text).toContain('series_id');
   });
 
-  it('formats truncated dataframe with max_rows annotation', () => {
-    const output = {
-      dataframes: [
-        {
-          name: 'df_AAAAA_BBBBB',
-          source_tool: 'bls_get_series',
-          query_params: { series_ids: ['LNS14000000'] },
-          created_at: '2026-05-21T10:00:00.000Z',
-          expires_at: '2026-05-22T10:00:00.000Z',
-          row_count: 5000,
-          truncated: true,
-          max_rows: 5000,
-          column_schema: [{ name: 'value', type: 'DOUBLE', nullable: true }],
-        },
-      ],
-    };
-    const blocks = blsDataframeDescribeTool.format!(output);
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('truncated');
-    expect(text).toContain('5000');
-  });
-
   it('formats query_params as key=value pairs', () => {
     const output = {
       dataframes: [
@@ -88,7 +65,6 @@ describe('blsDataframeDescribeTool', () => {
           created_at: '2026-05-21T10:00:00.000Z',
           expires_at: '2026-05-22T10:00:00.000Z',
           row_count: 10,
-          truncated: false,
           column_schema: [],
         },
       ],

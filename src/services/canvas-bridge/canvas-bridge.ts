@@ -24,12 +24,10 @@ export interface DataframeMeta {
   columnSchema: ColumnSchema[];
   createdAt: string;
   expiresAt: string;
-  maxRows: number | undefined;
   queryParams: Record<string, unknown>;
   rowCount: number;
   sourceTool: string;
   tableName: string;
-  truncated: boolean;
 }
 
 export interface RegisterDataframeResult {
@@ -52,11 +50,9 @@ export function toDatasetField(registered: RegisterDataframeResult): {
 }
 
 export interface RegisterDataframeOptions {
-  maxRows?: number;
   queryParams: Record<string, unknown>;
   rows: Record<string, unknown>[];
   sourceTool: string;
-  truncated?: boolean;
 }
 
 export interface BridgeQueryOptions {
@@ -112,8 +108,6 @@ export class CanvasBridge {
         createdAt: new Date(now).toISOString(),
         expiresAt: new Date(now + ttlMs).toISOString(),
         rowCount: result.rowCount,
-        truncated: options.truncated ?? false,
-        maxRows: options.maxRows,
         columnSchema: schema,
       };
       await ctx.state.set(`${META_PREFIX}${result.tableName}`, meta);
@@ -187,8 +181,6 @@ export class CanvasBridge {
         createdAt: new Date(now).toISOString(),
         expiresAt: new Date(now + ttlMs).toISOString(),
         rowCount: result.rowCount,
-        truncated: false,
-        maxRows: undefined,
         columnSchema: result.columns.map((name) => ({
           name,
           type: 'VARCHAR',

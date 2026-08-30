@@ -261,7 +261,7 @@ describe('blsGetSeriesTool', () => {
     expect(text).toContain('4.1');
   });
 
-  it('formats spilled output with truncated flag', () => {
+  it('formats a complete spilled dataset with describe-before-query guidance (#54, #68)', () => {
     const output = {
       series: [
         {
@@ -274,14 +274,16 @@ describe('blsGetSeriesTool', () => {
         name: 'df_AAAAA_BBBBB',
         row_count: 100,
         expires_at: '2026-05-22T00:00:00.000Z',
-        truncated: true,
       },
       spilled: true as const,
     };
     const blocks = blsGetSeriesTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('df_AAAAA_BBBBB');
-    expect(text).toContain('truncated');
+    expect(text).not.toContain('truncated');
+    expect(text.indexOf('bls_dataframe_describe')).toBeLessThan(
+      text.indexOf('bls_dataframe_query'),
+    );
   });
 
   it('throws no_data_for_period when start_year > end_year', async () => {
@@ -550,10 +552,15 @@ describe('blsGetSeriesTool', () => {
     expect(result.spilled).toBe(true);
     expect(result.dataset?.name).toBe('df_AAAAA_BBBBB');
     expect(result.dataset?.row_count).toBe(900);
+    expect(result.dataset).not.toHaveProperty('truncated');
     // Preview only inline, but the true count stays visible.
     expect(result.series[0]!.observations).toHaveLength(3);
     expect(result.series[0]!.observationCount).toBe(900);
-    expect(getEnrichment(ctx).notice).toContain('df_AAAAA_BBBBB');
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('df_AAAAA_BBBBB');
+    expect(notice.indexOf('bls_dataframe_describe')).toBeLessThan(
+      notice.indexOf('bls_dataframe_query'),
+    );
   });
 
   it('throws canvas_registration_failed when canvas is configured but registration fails (#46)', async () => {
