@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-08-23 21:24:16
+Generated on: 2026-08-30 21:57:28
 
 ```text
 bls-labor-mcp-server/
@@ -26,6 +26,7 @@ bls-labor-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -167,6 +168,7 @@ bls-labor-mcp-server/
 │   │       └── canvas-bridge.ts
 │   └── index.ts
 ├── tests/
+│   ├── integration/
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/
@@ -184,14 +186,15 @@ bls-labor-mcp-server/
 │   │   │   └── period-codes.test.ts
 │   │   └── canvas-bridge/
 │   │       └── canvas-bridge.test.ts
-│   └── tools/
-│       ├── bls-dataframe-describe.tool.test.ts
-│       ├── bls-dataframe-drop.tool.test.ts
-│       ├── bls-dataframe-query.tool.test.ts
-│       ├── bls-get-latest.tool.test.ts
-│       ├── bls-get-series.tool.test.ts
-│       ├── bls-list-surveys.tool.test.ts
-│       └── bls-search-series.tool.test.ts
+│   ├── tools/
+│   │   ├── bls-dataframe-describe.tool.test.ts
+│   │   ├── bls-dataframe-drop.tool.test.ts
+│   │   ├── bls-dataframe-query.tool.test.ts
+│   │   ├── bls-get-latest.tool.test.ts
+│   │   ├── bls-get-series.tool.test.ts
+│   │   ├── bls-list-surveys.tool.test.ts
+│   │   └── bls-search-series.tool.test.ts
+│   └── server-registration.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

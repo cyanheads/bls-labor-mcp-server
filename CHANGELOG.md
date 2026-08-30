@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-08-30 · ⚠️ Breaking
+
+DataCanvas capability-gated tools, describe-before-query guidance, and a reduced complete-data spill schema.
+
 ## [0.4.12](changelog/0.4.x/0.4.12.md) — 2026-08-23
 
 MCP 2026-07-28 support, explicit stateless HTTP, and accurate dataframe truncation disclosure.
