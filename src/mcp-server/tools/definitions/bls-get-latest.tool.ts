@@ -25,8 +25,11 @@ const ObservationSchema = z.object({
   value: z
     .string()
     .describe(
-      'Observation value as a string, matching BLS API output. Parse to float for arithmetic.',
+      'Raw observation value from BLS. The literal "-" means unavailable; check available before arithmetic and read footnotes for the reason.',
     ),
+  available: z
+    .boolean()
+    .describe('False when BLS published the "-" missing-value sentinel for this period.'),
   footnotes: z.array(z.string()).optional().describe('Footnote codes and text, when present.'),
 });
 
@@ -145,11 +148,13 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         period: string;
         periodName?: string;
         value: string;
+        available: boolean;
         footnotes?: string[];
       };
     }> = [];
     const failed: Array<{ seriesId: string; error: string }> = [];
     let succeededCount = 0;
+    let unavailableCount = 0;
 
     for (const [i, settlement] of pairs.entries()) {
       // i is always within bounds — pairs is derived 1:1 from input.series_ids.
@@ -186,21 +191,30 @@ export const blsGetLatestTool = tool('bls_get_latest', {
           year: obs.year,
           period: obs.period,
           value: obs.value,
+          available: obs.available ?? obs.value !== '-',
           ...(obs.periodName && { periodName: obs.periodName }),
           ...(obs.footnotes?.length && { footnotes: obs.footnotes }),
         },
       });
+      if ((obs.available ?? obs.value !== '-') === false) unavailableCount++;
       succeededCount++;
     }
 
+    const notices: string[] = [];
     if (failed.length > 0) {
       const allFailed = succeededCount === 0;
-      ctx.enrich.notice(
+      notices.push(
         allFailed
           ? `All ${failed.length} series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.`
           : `${failed.length} of ${input.series_ids.length} series failed. Use bls_search_series to verify the failing SeriesIDs.`,
       );
     }
+    if (unavailableCount > 0) {
+      notices.push(
+        `${unavailableCount} latest observation(s) are unavailable in BLS data. Check latestObservation.available and read footnotes for the reason.`,
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       results,
@@ -218,7 +232,12 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       const periodStr = obs.periodName
         ? `${obs.periodName} ${obs.year}`
         : `${obs.period} ${obs.year}`;
-      lines.push(`Value: **${obs.value}** (${periodStr})`);
+      lines.push(
+        (obs.available ?? obs.value !== '-')
+          ? `Value: **${obs.value}** (${periodStr})`
+          : `Value: **Unavailable** (BLS raw value: \`${obs.value}\`; ${periodStr})`,
+      );
+      lines.push(`Available: ${(obs.available ?? obs.value !== '-') ? 'yes' : 'no'}`);
       lines.push(`Period: ${obs.period}`);
       if (obs.footnotes?.length) lines.push(`Footnotes: ${obs.footnotes.join('; ')}`);
       if (r.area) lines.push(`Area: ${r.area}`);

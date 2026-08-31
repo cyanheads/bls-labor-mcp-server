@@ -46,6 +46,8 @@ export interface BlsApiResponse {
  * change types it supports, so every calculation field is optional.
  */
 export interface Observation {
+  /** False when BLS published the `-` missing-value sentinel. */
+  available?: boolean;
   footnotes?: string[];
   netChange1Month?: string;
   netChange3Month?: string;
@@ -64,6 +66,11 @@ export interface Observation {
 /** Normalized series block for tool output. */
 export interface SeriesData {
   area?: string;
+  /** Per-series advisory attached to a successful mixed batch. */
+  failure?: {
+    message: string;
+    reason: 'no_data_for_period' | 'series_not_found';
+  };
   item?: string;
   observations: Observation[];
   seasonal?: string;

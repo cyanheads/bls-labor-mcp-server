@@ -405,6 +405,7 @@ export class BlsApiService {
           year: row.year,
           period: row.period,
           value: row.value,
+          available: row.value !== '-',
           ...(row.footnote_codes ? { footnotes: [row.footnote_codes] } : {}),
         }));
 
@@ -437,7 +438,7 @@ export class BlsApiService {
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
             'BLS surveys API returned HTML instead of JSON — likely rate-limited.',
-            { reason: 'service_unavailable' },
+            { reason: 'service_unavailable', ...ctx.recoveryFor('service_unavailable') },
           );
         }
         let parsed: BlsSurveysResponse;
@@ -446,7 +447,7 @@ export class BlsApiService {
         } catch (e: unknown) {
           throw serializationError(
             'Failed to parse BLS surveys response as JSON',
-            { reason: 'serialization_failure' },
+            { reason: 'serialization_failure', ...ctx.recoveryFor('serialization_failure') },
             { cause: e },
           );
         }
@@ -460,6 +461,7 @@ export class BlsApiService {
           }
           throw serviceUnavailable(`BLS surveys API: ${messages.join('; ') || 'unknown error'}`, {
             reason: 'service_unavailable',
+            ...ctx.recoveryFor('service_unavailable'),
           });
         }
         return (parsed.Results?.survey ?? []).map((s): SurveyMeta => {
@@ -555,37 +557,24 @@ export class BlsApiService {
           reason: 'quota_exceeded',
           retryable: false,
           messages,
-        });
-      }
-      if (/does not exist/i.test(msg)) {
-        throw notFound(`BLS API: ${msg} — use bls_search_series to find valid SeriesIDs.`, {
-          reason: 'series_not_found',
-          messages,
-          seriesIds: options.seriesIds,
+          ...ctx.recoveryFor('quota_exceeded'),
         });
       }
       if (/database is locked/i.test(msg)) {
         throw serviceUnavailable('BLS database is temporarily locked — retry shortly.', {
           reason: 'series_locked',
           messages,
+          ...ctx.recoveryFor('series_locked'),
         });
-      }
-      if (/no data available/i.test(msg)) {
-        // Collect all per-series "no data" messages so the caller can identify
-        // which series to remove or which range to narrow.
-        const detail = messages
-          .filter((m) => /no data available/i.test(m))
-          .map((m) => `  ${m}`)
-          .join('\n');
-        throw validationError(
-          `BLS API: No data available for the requested period range.\n${detail}`,
-          { reason: 'no_data_for_period', messages },
-        );
       }
       if (/calculations.*not supported|does not support.*calculations/i.test(msg)) {
         throw validationError(
           'This survey does not support calculations — remove the calculations flag or check bls_list_surveys.',
-          { reason: 'calculations_not_supported', messages },
+          {
+            reason: 'calculations_not_supported',
+            messages,
+            ...ctx.recoveryFor('calculations_not_supported'),
+          },
         );
       }
     }
@@ -597,11 +586,20 @@ export class BlsApiService {
       // wording below hedges accordingly. Retrying unchanged cannot help.
       throw serviceUnavailable(
         'BLS API request not processed. Daily quota (500 queries/day) may be exhausted — retry after UTC midnight.',
-        { reason: 'quota_exceeded', retryable: false, messages },
+        {
+          reason: 'quota_exceeded',
+          retryable: false,
+          messages,
+          ...ctx.recoveryFor('quota_exceeded'),
+        },
       );
     }
 
+    const failures = this.classifySeriesFailures(messages, options.seriesIds);
+
     if (parsed.status !== 'REQUEST_SUCCEEDED') {
+      if (failures.size > 0) this.throwSeriesFailure(failures, messages, options, ctx);
+
       // BLS rejected the request with a message none of the branches above
       // recognize (e.g. "Your request has failed. Please check your input
       // parameters"). That is a verdict on the request, so identical parameters
@@ -614,16 +612,84 @@ export class BlsApiService {
       });
     }
 
-    return (parsed.Results?.series ?? []).map((raw): SeriesData => {
+    const byId = new Map((parsed.Results?.series ?? []).map((raw) => [raw.seriesID, raw]));
+    const series = options.seriesIds.flatMap((seriesId): SeriesData[] => {
+      const raw = byId.get(seriesId);
+      const failure = failures.get(seriesId);
+      if (!raw) return failure ? [{ seriesId, observations: [], failure }] : [];
       const cat = raw.catalog;
-      return {
-        seriesId: raw.seriesID,
-        ...(cat?.series_title && { title: cat.series_title }),
-        ...(cat?.area && { area: cat.area }),
-        ...(cat?.item && { item: cat.item }),
-        ...(cat?.seasonality && { seasonal: cat.seasonality }),
-        observations: raw.data.map((obs) => this.normalizeObs(obs)),
-      };
+      return [
+        {
+          seriesId: raw.seriesID,
+          ...(cat?.series_title && { title: cat.series_title }),
+          ...(cat?.area && { area: cat.area }),
+          ...(cat?.item && { item: cat.item }),
+          ...(cat?.seasonality && { seasonal: cat.seasonality }),
+          observations: raw.data.map((obs) => this.normalizeObs(obs)),
+          ...(failure && { failure }),
+        },
+      ];
+    });
+
+    if (series.every((item) => item.observations.length === 0) && failures.size > 0) {
+      this.throwSeriesFailure(failures, messages, options, ctx);
+    }
+
+    return series;
+  }
+
+  /** Associate BLS advisories with the SeriesID they describe. */
+  private classifySeriesFailures(
+    messages: string[],
+    requestedIds: string[],
+  ): Map<string, NonNullable<SeriesData['failure']>> {
+    const failures = new Map<string, NonNullable<SeriesData['failure']>>();
+    for (const message of messages) {
+      const reason = /does not exist|invalid series/i.test(message)
+        ? 'series_not_found'
+        : /no data available/i.test(message)
+          ? 'no_data_for_period'
+          : undefined;
+      if (!reason) continue;
+
+      const id = requestedIds.find((requestedId) =>
+        new RegExp(
+          `(?:^|\\s)${requestedId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`,
+          'i',
+        ).test(message),
+      );
+      if (id) failures.set(id, { reason, message });
+    }
+    return failures;
+  }
+
+  /** Raise the request-level error used when no requested series produced data. */
+  private throwSeriesFailure(
+    failures: Map<string, NonNullable<SeriesData['failure']>>,
+    messages: string[],
+    options: Pick<BatchFetchOptions, 'seriesIds'>,
+    ctx: Context,
+  ): never {
+    const invalid = [...failures.values()].filter(
+      (failure) => failure.reason === 'series_not_found',
+    );
+    if (invalid.length > 0) {
+      throw notFound(
+        `BLS API: ${invalid.map((failure) => failure.message).join('; ')} — use bls_search_series to find valid SeriesIDs.`,
+        {
+          reason: 'series_not_found',
+          messages,
+          seriesIds: options.seriesIds,
+          ...ctx.recoveryFor('series_not_found'),
+        },
+      );
+    }
+
+    const detail = [...failures.values()].map((failure) => `  ${failure.message}`).join('\n');
+    throw validationError(`BLS API: No data available for the requested period range.\n${detail}`, {
+      reason: 'no_data_for_period',
+      messages,
+      ...ctx.recoveryFor('no_data_for_period'),
     });
   }
 
@@ -634,6 +700,7 @@ export class BlsApiService {
       year: raw.year,
       period: raw.period,
       value: raw.value,
+      available: raw.value !== '-',
       ...(raw.periodName && { periodName: raw.periodName }),
       ...(raw.footnotes?.length && {
         footnotes: raw.footnotes

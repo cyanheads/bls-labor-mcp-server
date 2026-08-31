@@ -3,7 +3,8 @@
  * @module tests/tools/bls-get-latest.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetLatestTool } from '@/mcp-server/tools/definitions/bls-get-latest.tool.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
@@ -71,6 +72,67 @@ describe('blsGetLatestTool', () => {
     expect(result.failed[0]!.error).toContain('No observations returned');
   });
 
+  it('marks and renders an unavailable latest observation (#58)', async () => {
+    fetchLatestMock.mockResolvedValue({
+      ...MOCK_SERIES,
+      observations: [
+        {
+          year: '2025',
+          period: 'M10',
+          periodName: 'October',
+          value: '-',
+          available: false,
+          footnotes: ['9: Data unavailable.'],
+        },
+      ],
+    });
+
+    const result = await runToolContract(
+      blsGetLatestTool,
+      { series_ids: ['LNS14000000'] },
+      { context: { errors: blsGetLatestTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      results: [{ latestObservation: { value: '-', available: false } }],
+      notice: expect.stringContaining('1 latest observation(s) are unavailable'),
+    });
+    expect(result.content[0]).toMatchObject({
+      type: 'text',
+      text: expect.stringContaining('Value: **Unavailable**'),
+    });
+  });
+
+  it('reports an Invalid Series advisory as a per-series failure (#61)', async () => {
+    fetchLatestMock.mockRejectedValue(
+      notFound(
+        'BLS API: Invalid Series for Series BOGUS123 — use bls_search_series to find valid SeriesIDs.',
+        { reason: 'series_not_found' },
+      ),
+    );
+
+    const result = await runToolContract(
+      blsGetLatestTool,
+      { series_ids: ['BOGUS123'] },
+      { context: { errors: blsGetLatestTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      succeeded: 0,
+      failed: [
+        {
+          seriesId: 'BOGUS123',
+          error: expect.stringContaining('Invalid Series for Series BOGUS123'),
+        },
+      ],
+      notice: expect.stringContaining('bls_search_series'),
+    });
+    expect(result.content[0]).toMatchObject({
+      type: 'text',
+      text: expect.stringContaining('Invalid Series for Series BOGUS123'),
+    });
+  });
+
   it('formats output with period code and item fields', () => {
     const output = {
       results: [
@@ -85,6 +147,7 @@ describe('blsGetLatestTool', () => {
             period: 'M12',
             periodName: 'December',
             value: '4.1',
+            available: true,
           },
         },
       ],
@@ -184,7 +247,7 @@ describe('blsGetLatestTool — additional coverage', () => {
       results: [
         {
           seriesId: 'LNS14000000',
-          latestObservation: { year: '2024', period: 'M12', value: '4.1' },
+          latestObservation: { year: '2024', period: 'M12', value: '4.1', available: true },
         },
       ],
       succeeded: 1,
@@ -227,6 +290,7 @@ describe('blsGetLatestTool — additional coverage', () => {
             year: '2024',
             period: 'M12',
             value: '4.1',
+            available: true,
             footnotes: ['P: Preliminary'],
           },
         },
@@ -249,6 +313,7 @@ describe('blsGetLatestTool — additional coverage', () => {
             period: 'M12',
             periodName: 'December',
             value: '4.1',
+            available: true,
           },
         },
       ],

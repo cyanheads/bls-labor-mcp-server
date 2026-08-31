@@ -3,7 +3,8 @@
  * @module tests/tools/bls-get-series.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetSeriesTool } from '@/mcp-server/tools/definitions/bls-get-series.tool.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
@@ -86,6 +87,138 @@ describe('blsGetSeriesTool', () => {
     expect(enriched.startYearApplied).toBeUndefined();
     expect(enriched.endYearApplied).toBeUndefined();
     expect(enriched.calculationsApplied).toBeUndefined();
+  });
+
+  it('marks unavailable rows across structured output, enrichment, and content (#58)', async () => {
+    fetchSeriesMock.mockResolvedValue([
+      {
+        ...MOCK_SERIES,
+        observations: [
+          { year: '2025', period: 'M11', value: '4.2', available: true },
+          {
+            year: '2025',
+            period: 'M10',
+            value: '-',
+            available: false,
+            footnotes: ['9: Data unavailable.'],
+          },
+        ],
+      },
+    ]);
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      series: [
+        {
+          observationCount: 2,
+          availableObservationCount: 1,
+          observations: [
+            { value: '4.2', available: true },
+            { value: '-', available: false },
+          ],
+        },
+      ],
+      availableObservations: 1,
+      unavailableObservations: 1,
+      notice: expect.stringContaining('1 of 2 rows are unavailable'),
+    });
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('Unavailable (-)');
+    expect(text).toContain('1 available of 2 row(s)');
+  });
+
+  it('writes nullable numeric and availability columns to spilled DataCanvas rows (#58)', async () => {
+    canvasBridge = { registerDataframe: registerDataframeMock };
+    const series = bulkySeries();
+    series.observations[0] = {
+      year: '2025',
+      period: 'M10',
+      value: '-',
+      available: false,
+      footnotes: ['9: Data unavailable.'],
+    };
+    fetchSeriesMock.mockResolvedValue([series]);
+    registerDataframeMock.mockResolvedValue({
+      tableName: 'df_MISSING_VALUES',
+      rowCount: 900,
+      expiresAt: '2026-08-31T00:00:00.000Z',
+    });
+
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const rows = registerDataframeMock.mock.calls[0]![1].rows as Array<Record<string, unknown>>;
+    expect(rows[0]).toMatchObject({ value: '-', available: false, value_numeric: null });
+    expect(rows[1]).toMatchObject({ available: true, value_numeric: 4.1 });
+  });
+
+  it('names a per-series invalid-ID advisory without discarding valid rows (#59)', async () => {
+    fetchSeriesMock.mockResolvedValue([
+      MOCK_SERIES,
+      {
+        seriesId: 'LNS99999999',
+        observations: [],
+        failure: {
+          reason: 'series_not_found',
+          message: 'Series does not exist for Series LNS99999999',
+        },
+      },
+    ]);
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000', 'LNS99999999'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      series: [
+        { seriesId: 'LNS14000000', observationCount: 2 },
+        { seriesId: 'LNS99999999', observationCount: 0 },
+      ],
+      notice: expect.stringContaining('LNS99999999 is invalid or does not exist'),
+    });
+    expect(result.content[0]).toMatchObject({
+      type: 'text',
+      text: expect.stringContaining('LNS14000000'),
+    });
+  });
+
+  it('renders service recovery through structuredContent and content[] (#60)', async () => {
+    fetchSeriesMock.mockImplementationOnce((_input, ctx) => {
+      throw serviceUnavailable('BLS quota exhausted.', {
+        reason: 'quota_exceeded',
+        ...ctx.recoveryFor('quota_exceeded'),
+      });
+    });
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'quota_exceeded',
+          recovery: { hint: expect.stringContaining('UTC midnight') },
+        },
+      },
+    });
+    expect(result.content[0]).toMatchObject({
+      type: 'text',
+      text: expect.stringContaining('Recovery:'),
+    });
   });
 
   it('echoes requested params (series count, year range, calculations) in enrichment', async () => {
@@ -249,7 +382,16 @@ describe('blsGetSeriesTool', () => {
           seriesId: 'LNS14000000',
           title: 'Unemployment Rate',
           observationCount: 1,
-          observations: [{ year: '2024', period: 'M12', periodName: 'December', value: '4.1' }],
+          availableObservationCount: 1,
+          observations: [
+            {
+              year: '2024',
+              period: 'M12',
+              periodName: 'December',
+              value: '4.1',
+              available: true,
+            },
+          ],
         },
       ],
       spilled: false as const,
@@ -267,7 +409,8 @@ describe('blsGetSeriesTool', () => {
         {
           seriesId: 'LNS14000000',
           observationCount: 100,
-          observations: [{ year: '2024', period: 'M12', value: '4.1' }],
+          availableObservationCount: 100,
+          observations: [{ year: '2024', period: 'M12', value: '4.1', available: true }],
         },
       ],
       dataset: {
@@ -352,12 +495,14 @@ describe('blsGetSeriesTool', () => {
           seriesId: 'LNS14000000',
           title: 'Unemployment Rate',
           observationCount: 1,
+          availableObservationCount: 1,
           observations: [
             {
               year: '2024',
               period: 'M12',
               periodName: 'December',
               value: '4.1',
+              available: true,
               netChange1Month: '-0.1',
               netChange12Month: '-0.3',
               pctChange1Month: '-2.4',
@@ -418,11 +563,13 @@ describe('blsGetSeriesTool', () => {
         {
           seriesId: 'APU0000708111',
           observationCount: 1,
+          availableObservationCount: 1,
           observations: [
             {
               year: '2024',
               period: 'M12',
               value: '4.146',
+              available: true,
               netChange1Month: '0.497',
               netChange3Month: '0.325',
               netChange6Month: '1.431',
@@ -460,11 +607,13 @@ describe('blsGetSeriesTool', () => {
         {
           seriesId: 'CUUR0000SA0',
           observationCount: 1,
+          availableObservationCount: 1,
           observations: [
             {
               year: '2024',
               period: 'M12',
               value: '315.6',
+              available: true,
               pctChange1Month: '0.0',
               pctChange12Month: '2.8',
             },
@@ -489,11 +638,13 @@ describe('blsGetSeriesTool', () => {
         {
           seriesId: 'LNS14000000',
           observationCount: 1,
+          availableObservationCount: 1,
           observations: [
             {
               year: '2024',
               period: 'M12',
               value: '4.1',
+              available: true,
               footnotes: ['P: Preliminary'],
             },
           ],
@@ -512,6 +663,7 @@ describe('blsGetSeriesTool', () => {
         {
           seriesId: 'NODATA000',
           observationCount: 0,
+          availableObservationCount: 0,
           observations: [],
         },
       ],
@@ -800,9 +952,22 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
         {
           seriesId: 'CUUR0000SA0',
           observationCount: 2,
+          availableObservationCount: 2,
           observations: [
-            { year: '2024', period: 'M13', periodName: 'Annual', value: '313.689' },
-            { year: '2024', period: 'M12', periodName: 'December', value: '315.605' },
+            {
+              year: '2024',
+              period: 'M13',
+              periodName: 'Annual',
+              value: '313.689',
+              available: true,
+            },
+            {
+              year: '2024',
+              period: 'M12',
+              periodName: 'December',
+              value: '315.605',
+              available: true,
+            },
           ],
         },
       ],

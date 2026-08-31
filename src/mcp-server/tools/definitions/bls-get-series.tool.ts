@@ -27,7 +27,12 @@ const ObservationSchema = z.object({
   periodName: z.string().optional().describe('Human-readable period name.'),
   value: z
     .string()
-    .describe('Observation value as a string matching BLS output. Parse to float for arithmetic.'),
+    .describe(
+      'Raw observation value from BLS. The literal "-" means unavailable; check available before arithmetic and read footnotes for the reason.',
+    ),
+  available: z
+    .boolean()
+    .describe('False when BLS published the "-" missing-value sentinel for this period.'),
   footnotes: z.array(z.string()).optional().describe('Footnote codes and text, when present.'),
   netChange1Month: z.string().optional().describe('1-month net change (when calculations=true).'),
   netChange3Month: z.string().optional().describe('3-month net change (when calculations=true).'),
@@ -73,7 +78,7 @@ const CALC_COLUMNS = [
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). Observations cover real periods only and are safe to sum or average as returned; set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle. Call bls_dataframe_describe with that name to inspect the dataframe schema, then use the name in bls_dataframe_query SQL. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
+    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). BLS can publish a '-' missing-value sentinel; check observation.available before arithmetic. Set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle. Call bls_dataframe_describe with that name to inspect the dataframe schema, then use the name in bls_dataframe_query SQL. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -178,7 +183,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .default(false)
       .describe(
-        'When true, add each year\'s annual-average row to the observations. An annual average is the mean of that year\'s real periods, returned as an extra row named "Annual" with period M13 (monthly series), Q05 (quarterly) or S03 (semiannual) — not an additional month or quarter, so it must be excluded from any sum or average over observations. Defaults to false, which returns real periods only and is safe to aggregate directly. Independent of start_year/end_year. Surveys that publish no annual averages return the same rows either way; enrichment.annualAverageRows reports how many rows were actually added.',
+        'When true, add each year\'s annual-average row to the observations. An annual average is the mean of that year\'s real periods, returned as an extra row named "Annual" with period M13 (monthly series), Q05 (quarterly) or S03 (semiannual) — not an additional month or quarter, so it must be excluded from any sum or average over observations. Defaults to false, which returns real periods only; check available before aggregating. Independent of start_year/end_year. Surveys that publish no annual averages return the same rows either way; enrichment.annualAverageRows reports how many rows were actually added.',
       ),
   }),
 
@@ -198,8 +203,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
             observationCount: z
               .number()
               .describe(
-                'Total observations for this series. When spilled to canvas, all observations are on the dataframe; inline only shows a preview.',
+                'Total period rows for this series, including unavailable BLS placeholder rows. When spilled to canvas, all rows are on the dataframe; inline only shows a preview.',
               ),
+            availableObservationCount: z
+              .number()
+              .describe('Rows with a published numeric value, excluding the BLS "-" sentinel.'),
             observations: z
               .array(ObservationSchema.describe('One observation data point.'))
               .describe(
@@ -230,6 +238,10 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
   enrichment: {
     totalObservations: z.number().describe('Total observation rows across all requested series.'),
+    availableObservations: z.number().describe('Rows with a published numeric value.'),
+    unavailableObservations: z
+      .number()
+      .describe('Rows carrying the BLS "-" missing-value sentinel.'),
     seriesRequested: z
       .number()
       .describe(
@@ -250,7 +262,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     annualAverageApplied: z
       .boolean()
       .describe(
-        'Whether annual-average rows were requested. When false, observations hold real periods only and can be summed or averaged directly.',
+        'Whether annual-average rows were requested. When false, observations hold real periods only; filter on available before aggregation.',
       ),
     annualAverageRows: z
       .number()
@@ -315,9 +327,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const shouldSpill = inlineJson.length > INLINE_BUDGET_CHARS;
 
     const totalObservations = allRows.length;
+    const unavailableObservations = allRows.filter((row) => row.available === false).length;
+    const availableObservations = totalObservations - unavailableObservations;
     const annualAverageRows = allRows.filter((r) => r.is_annual_average === true).length;
     ctx.enrich({
       totalObservations,
+      availableObservations,
+      unavailableObservations,
       seriesRequested: input.series_ids.length,
       annualAverageApplied: input.annual_average,
       ...(input.start_year !== undefined && { startYearApplied: input.start_year }),
@@ -340,8 +356,20 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const notices: string[] = [];
     if (emptySeriesIds.length > 0) {
       const ranged = input.start_year !== undefined || input.end_year !== undefined;
+      for (const id of emptySeriesIds) {
+        const failure = byId.get(id)?.failure;
+        notices.push(
+          failure?.reason === 'series_not_found'
+            ? `BLS reports ${id} is invalid or does not exist. Use bls_search_series to find a valid SeriesID.`
+            : failure?.reason === 'no_data_for_period'
+              ? `BLS returned no data for ${id} over the requested period. Adjust start_year/end_year.`
+              : `No observations returned for ${id}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
+        );
+      }
+    }
+    if (unavailableObservations > 0) {
       notices.push(
-        `No observations returned for ${emptySeriesIds.join(', ')}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
+        `${unavailableObservations} of ${totalObservations} rows are unavailable BLS observations. Check available before arithmetic, use value_numeric in DataCanvas SQL, and read each row's footnotes for the reason.`,
       );
     }
     if (input.annual_average && annualAverageRows > 0) {
@@ -394,6 +422,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         ...(s.item && { item: s.item }),
         ...(s.seasonal && { seasonal: s.seasonal }),
         observationCount: s.observations.length,
+        availableObservationCount: s.observations.filter(observationAvailable).length,
         observations: s.observations.slice(0, 3).map(normalizeObs),
       }));
       return {
@@ -413,6 +442,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         ...(s.item && { item: s.item }),
         ...(s.seasonal && { seasonal: s.seasonal }),
         observationCount: s.observations.length,
+        availableObservationCount: s.observations.filter(observationAvailable).length,
         observations: s.observations.map(normalizeObs),
       })),
       spilled: false as const,
@@ -436,7 +466,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       if (s.area) lines.push(`Area: ${s.area}`);
       if (s.item) lines.push(`Item: ${s.item}`);
       if (s.seasonal) lines.push(`Seasonality: ${s.seasonal}`);
-      lines.push(`Observations: ${s.observationCount}${result.spilled ? ' (preview below)' : ''}`);
+      const availableObservationCount =
+        s.availableObservationCount ??
+        s.observations.filter((obs) => obs.available ?? obs.value !== '-').length;
+      lines.push(
+        `Observations: ${availableObservationCount} available of ${s.observationCount} row(s)${result.spilled ? ' (preview below)' : ''}`,
+      );
       lines.push('');
       if (s.observations.length > 0) {
         // Render only the calculation intervals this survey actually returned —
@@ -450,7 +485,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           const cells = [
             periodLabel,
             obs.period,
-            obs.value,
+            (obs.available ?? obs.value !== '-') ? obs.value : 'Unavailable (-)',
             ...calcs.map((c) => obs[c.key] ?? ''),
             obs.footnotes?.join('; ') ?? '',
           ];
@@ -472,6 +507,8 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = [];
   for (const s of series) {
     for (const obs of s.observations) {
+      const available = observationAvailable(obs);
+      const numericValue = available ? Number(obs.value) : Number.NaN;
       rows.push({
         series_id: s.seriesId,
         series_title: s.title ?? null,
@@ -484,6 +521,8 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
         // SQL discriminator — an aggregate query that ignores it double-counts each year.
         is_annual_average: isAnnualAveragePeriod(obs.period),
         value: obs.value,
+        available,
+        value_numeric: Number.isFinite(numericValue) ? numericValue : null,
         footnotes: obs.footnotes?.join('; ') ?? null,
         net_change_1m: obs.netChange1Month ?? null,
         net_change_3m: obs.netChange3Month ?? null,
@@ -504,6 +543,7 @@ function normalizeObs(obs: SeriesData['observations'][number]) {
     year: obs.year,
     period: obs.period,
     value: obs.value,
+    available: observationAvailable(obs),
     ...(obs.periodName && { periodName: obs.periodName }),
     ...(obs.footnotes?.length && { footnotes: obs.footnotes }),
     ...(obs.netChange1Month && { netChange1Month: obs.netChange1Month }),
@@ -515,4 +555,8 @@ function normalizeObs(obs: SeriesData['observations'][number]) {
     ...(obs.pctChange6Month && { pctChange6Month: obs.pctChange6Month }),
     ...(obs.pctChange12Month && { pctChange12Month: obs.pctChange12Month }),
   };
+}
+
+function observationAvailable(obs: SeriesData['observations'][number]): boolean {
+  return obs.available ?? obs.value !== '-';
 }

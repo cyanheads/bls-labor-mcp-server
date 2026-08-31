@@ -273,6 +273,115 @@ describe('BlsApiService.fetchLatest', () => {
 });
 
 describe('BlsApiService.fetchSeries — error message parsing', () => {
+  it('marks the BLS missing-value sentinel unavailable (#58)', async () => {
+    const response = {
+      ...SUCCESS_RESPONSE,
+      Results: {
+        series: [
+          {
+            seriesID: 'LNS14000000',
+            data: [
+              {
+                year: '2025',
+                period: 'M10',
+                periodName: 'October',
+                value: '-',
+                footnotes: [{ code: '9', text: 'Data unavailable.' }],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(response));
+
+    const result = await new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+      { seriesIds: ['LNS14000000'] },
+      createMockContext(),
+    );
+
+    expect(result[0]!.observations[0]).toMatchObject({ value: '-', available: false });
+  });
+
+  it('keeps valid observations when another requested series does not exist (#59)', async () => {
+    const response = {
+      status: 'REQUEST_SUCCEEDED',
+      responseTime: 50,
+      message: ['Series does not exist for Series LNS99999999'],
+      Results: {
+        series: [
+          {
+            seriesID: 'LNS14000000',
+            data: [{ year: '2025', period: 'M01', value: '4.0', footnotes: [] }],
+          },
+          { seriesID: 'LNS99999999', data: [] },
+        ],
+      },
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(response));
+
+    const result = await new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+      { seriesIds: ['LNS14000000', 'LNS99999999'] },
+      createMockContext(),
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[0]!.observations).toHaveLength(1);
+    expect(result[1]).toMatchObject({
+      seriesId: 'LNS99999999',
+      observations: [],
+      failure: { reason: 'series_not_found' },
+    });
+  });
+
+  it('classifies Invalid Series as series_not_found (#61)', async () => {
+    const response = {
+      status: 'REQUEST_SUCCEEDED',
+      responseTime: 10,
+      message: [
+        'Unable to get Catalog Data for series BOGUS123',
+        'Invalid Series for Series BOGUS123',
+      ],
+      Results: { series: [{ seriesID: 'BOGUS123', data: [] }] },
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(response));
+
+    await expect(
+      new BlsApiService(apiKey, baseUrl, userAgent).fetchLatest('BOGUS123', createMockContext()),
+    ).rejects.toMatchObject({
+      data: { reason: 'series_not_found' },
+    });
+  });
+
+  it('attaches declared recovery to service-raised quota errors (#60)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      okJson({
+        status: 'REQUEST_NOT_PROCESSED',
+        responseTime: 10,
+        message: ['500 queries per day limit exceeded'],
+      }),
+    );
+    const ctx = createMockContext({
+      errors: [
+        {
+          reason: 'quota_exceeded',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          when: 'Daily quota is exhausted.',
+          recovery: 'Retry after UTC midnight.',
+        },
+      ] as const,
+    });
+
+    await expect(
+      new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+        { seriesIds: ['LNS14000000'] },
+        ctx,
+      ),
+    ).rejects.toMatchObject({
+      data: { reason: 'quota_exceeded', recovery: { hint: 'Retry after UTC midnight.' } },
+    });
+  });
+
   it('throws serviceUnavailable on series_locked message without opting out of retry', async () => {
     const lockedResponse = {
       status: 'REQUEST_FAILED_ERROR',
