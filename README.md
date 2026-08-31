@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -72,9 +72,10 @@ Fetch historical time-series data for one or more BLS series.
 - Batch fetch up to 50 series per request (counts as one of the 500 daily API queries)
 - Optional `start_year` / `end_year` window (BLS caps history at 20 years per request)
 - Optional `calculations: true` for BLS-server-side net change and percent change — a survey returns whichever it supports (CPI/PPI return percent change only); check `bls_list_surveys` for per-survey support
-- Optional `annual_average: true` adds each year's annual-average row (period `M13`, `Q05` or `S03`) — the mean of that year's real periods, not an additional one. Off by default, so observations are safe to sum or average as returned; `enrichment.annualAverageRows` reports how many were added
-- Returns observations with series metadata (title, area, item, seasonality)
-- With `CANVAS_PROVIDER_TYPE=duckdb`, spills to a DataCanvas dataframe when the observation count exceeds the inline context budget. Call `bls_dataframe_describe` with the returned `dataset.name` to inspect `column_schema`, then use that table name in `bls_dataframe_query` SQL. Without DataCanvas, narrow oversized requests with `start_year` / `end_year`.
+- Optional `annual_average: true` adds each year's annual-average row (period `M13`, `Q05` or `S03`) — the mean of that year's real periods, not an additional one. `enrichment.annualAverageRows` reports how many were added
+- Returns observations with series metadata plus `available`; BLS's raw `-` missing-value sentinel is preserved but excluded from `availableObservationCount` and called out in the notice
+- Mixed batches preserve valid series when another SeriesID is invalid or has no data; the unresolved ID remains visible with zero observations and reason-specific guidance
+- With `CANVAS_PROVIDER_TYPE=duckdb`, spills to a DataCanvas dataframe when the observation count exceeds the inline context budget. Rows preserve raw `value` and add `available` plus nullable numeric `value_numeric` for safe SQL arithmetic. Call `bls_dataframe_describe` with the returned `dataset.name` to inspect `column_schema`, then use that table name in `bls_dataframe_query` SQL. Without DataCanvas, narrow oversized requests with `start_year` / `end_year`.
 
 ---
 
@@ -86,6 +87,7 @@ Get the current value for one or more BLS series.
 - Recommended limit: ≤10 series per call; accepts up to 50
 - For "current value" across many series, `bls_get_series` with a narrow year window is more quota-efficient (one API query regardless of series count)
 - Partial success reporting — failed series are returned in a separate `failed[]` array alongside successful results
+- Latest observations expose `available`; a BLS `-` value renders explicitly as unavailable with its footnote reason
 
 ---
 

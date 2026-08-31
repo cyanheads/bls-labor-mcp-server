@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-08-30 21:57:28
+Generated on: 2026-08-31 02:53:19
 
 ```text
 bls-labor-mcp-server/
@@ -173,6 +173,7 @@ bls-labor-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   ├── bls-api/
+│   │   │   ├── bls-api-mirror.test.ts
 │   │   │   ├── bls-api-service-retry.test.ts
 │   │   │   └── bls-api-service.test.ts
 │   │   ├── bls-catalog/
