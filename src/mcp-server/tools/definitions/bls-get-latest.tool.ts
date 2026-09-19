@@ -45,6 +45,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       code: JsonRpcErrorCode.ConfigurationError,
       when: 'BLS rejected the configured BLS_API_KEY as invalid.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
     },
@@ -53,6 +54,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS API 500 query/day limit has been reached.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'The daily quota resets at UTC midnight. Retry after midnight or reduce query volume.',
     },
@@ -60,6 +62,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       reason: 'series_locked',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS database is temporarily locked for the requested series.',
+      thrownBy: 'service',
       recovery: 'The BLS database lock is transient — retry the request after a brief delay.',
     },
   ],

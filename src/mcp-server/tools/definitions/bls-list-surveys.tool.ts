@@ -52,6 +52,7 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
       code: JsonRpcErrorCode.ConfigurationError,
       when: 'BLS rejected the configured BLS_API_KEY as invalid.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
     },
@@ -59,12 +60,14 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
       reason: 'service_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'BLS /surveys API is unreachable or returns a non-200 response.',
+      thrownBy: 'service',
       recovery: 'Retry after a short delay. If persistent, check BLS API status at api.bls.gov.',
     },
     {
       reason: 'serialization_failure',
       code: JsonRpcErrorCode.InternalError,
       when: 'BLS /surveys response cannot be parsed (malformed JSON or unexpected schema).',
+      thrownBy: 'service',
       recovery:
         'This is a BLS API inconsistency — retry or use a known survey code directly with bls_search_series.',
     },

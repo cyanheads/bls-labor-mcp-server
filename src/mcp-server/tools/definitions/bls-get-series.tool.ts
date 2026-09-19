@@ -87,6 +87,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       code: JsonRpcErrorCode.ConfigurationError,
       when: 'BLS rejected the configured BLS_API_KEY as invalid.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Set BLS_API_KEY to a valid key and restart the server — register free at https://data.bls.gov/registrationEngine/. This is a configuration error: it does not clear at the UTC quota reset.',
     },
@@ -95,6 +96,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS API 500 query/day limit has been reached.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'The daily quota resets at UTC midnight. Retry after midnight or reduce query volume.',
     },
@@ -103,6 +105,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'BLS returned a non-success status with a message matching no known failure mode — e.g. a rejected combination of request parameters.',
       retryable: false,
+      thrownBy: 'service',
       recovery:
         'Retry with calculations omitted, or split series_ids into smaller batches to isolate the series BLS rejects.',
     },
@@ -110,12 +113,14 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       reason: 'series_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more SeriesIDs do not exist in BLS data.',
+      thrownBy: 'service',
       recovery: 'Use bls_search_series to find valid SeriesIDs before calling bls_get_series.',
     },
     {
       reason: 'series_locked',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The BLS database is temporarily locked for the requested series.',
+      thrownBy: 'service',
       recovery: 'The BLS database lock is transient — retry the request after a brief delay.',
     },
     {
@@ -128,6 +133,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       reason: 'calculations_not_supported',
       code: JsonRpcErrorCode.ValidationError,
       when: 'calculations=true was requested for a survey that does not support it.',
+      thrownBy: 'service',
       recovery:
         'Remove the calculations flag or use bls_list_surveys to verify calculation support before requesting it.',
     },
@@ -142,6 +148,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       reason: 'canvas_registration_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The result set exceeds the inline budget and canvas is configured, but registering the dataframe failed.',
+      thrownBy: 'service',
       recovery:
         'Retry the request — the failure is usually transient. If it persists, narrow start_year/end_year so the result fits inline.',
     },
@@ -387,11 +394,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         throw ctx.fail(
           'canvas_unavailable',
           `Result set exceeded the inline budget (${allRows.length} rows across ${allSeries.length} series). Canvas is not configured — full data cannot be returned.`,
-          {
-            recovery: {
-              hint: 'Narrow start_year/end_year to reduce result size, or enable canvas by setting CANVAS_PROVIDER_TYPE=duckdb.',
-            },
-          },
+          ctx.recoveryFor('canvas_unavailable'),
         );
       }
 
