@@ -109,6 +109,11 @@ export class BlsObservationsService {
     return this.mirror.status();
   }
 
+  /** Close the mirror's SQLite handle. A store never opened closes as a no-op. */
+  shutdown(): Promise<void> {
+    return this.mirror.close();
+  }
+
   /**
    * Query observations for the given series IDs. Returns rows for all IDs that
    * have mirror data, and records which IDs had zero rows (for live fallback).
@@ -229,4 +234,11 @@ export function getBlsObservationsService(): BlsObservationsService {
 /** Whether the service has been initialized (mirror enabled and init called). */
 export function isBlsObservationsServiceReady(): boolean {
   return _service !== undefined;
+}
+
+/** Release the mirror's SQLite handle. Wired to `createApp({ teardown })`. */
+export async function shutdownBlsObservationsService(): Promise<void> {
+  const service = _service;
+  _service = undefined;
+  await service?.shutdown();
 }

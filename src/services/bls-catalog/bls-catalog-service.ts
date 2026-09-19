@@ -552,6 +552,15 @@ export class BlsCatalogService {
     return new Map(rows.map((row) => [row.series_id as string, toCatalog(row)]));
   }
 
+  /**
+   * Close the on-disk SQLite index. The store lazy-opens, so closing one that
+   * was never queried is a no-op; a harvest still in flight fails its next
+   * write, which `load()`'s caller already reports.
+   */
+  async shutdown(): Promise<void> {
+    await this.store.close();
+  }
+
   get isLoaded(): boolean {
     return this.loaded;
   }
@@ -584,4 +593,11 @@ export function getBlsCatalogService(): BlsCatalogService {
     throw new Error('BlsCatalogService not initialized — call initBlsCatalogService() in setup()');
   }
   return _service;
+}
+
+/** Release the catalog's SQLite handle. Wired to `createApp({ teardown })`. */
+export async function shutdownBlsCatalogService(): Promise<void> {
+  const service = _service;
+  _service = undefined;
+  await service?.shutdown();
 }

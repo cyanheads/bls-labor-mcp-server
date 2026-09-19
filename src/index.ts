@@ -20,8 +20,12 @@ import { initBlsApiService } from './services/bls-api/bls-api-service.js';
 import {
   getBlsCatalogService,
   initBlsCatalogService,
+  shutdownBlsCatalogService,
 } from './services/bls-catalog/bls-catalog-service.js';
-import { initBlsObservationsService } from './services/bls-observations/bls-observations-service.js';
+import {
+  initBlsObservationsService,
+  shutdownBlsObservationsService,
+} from './services/bls-observations/bls-observations-service.js';
 import { runObservationsSubprocess } from './services/bls-observations/subprocess.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
 
@@ -58,6 +62,8 @@ await createApp({
   title: 'bls-labor-mcp-server',
   instructions,
   landing: { requireAuth: false },
+  // No tool asks the caller for input mid-handler, so nothing needs a session.
+  sessionMode: 'stateless',
   tools: [
     blsListSurveysTool,
     blsSearchSeriesTool,
@@ -124,5 +130,15 @@ await createApp({
       );
       schedulerService.start('bls-observations-refresh');
     }
+  },
+
+  /**
+   * Release the two SQLite handles setup() opened — the catalog index and the
+   * observations mirror. Both are started before awaiting, so a failure in one
+   * still closes the other. The canvas and the scheduled refresh job are
+   * framework-owned and disposed without a hook.
+   */
+  async teardown() {
+    await Promise.all([shutdownBlsCatalogService(), shutdownBlsObservationsService()]);
   },
 });
