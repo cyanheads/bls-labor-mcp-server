@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-19
+
+mcp-ts-core moves to 0.13.6, closing catalog and mirror SQLite handles on shutdown and retrying a transient BLS upstream error; bls_dataframe_query now escapes backslashes correctly in markdown cells.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-08-30
 
 Missing BLS values are explicit across tool and DataCanvas output, while mixed-series failures preserve valid observations and recovery guidance.
