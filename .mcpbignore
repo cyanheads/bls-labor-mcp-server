@@ -3,7 +3,7 @@
 /.cache/
 /.claude/
 /.agents/
-/skills/
+/framework-skills/
 /Dockerfile
 /bun.lock
 /bunfig.toml
