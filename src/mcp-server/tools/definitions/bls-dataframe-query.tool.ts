@@ -10,6 +10,14 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 
+/**
+ * Escape a value for a Markdown table cell. Backslashes go first — a renderer
+ * consumes a bare backslash as an escape for whatever punctuation follows it,
+ * including the `\|` this then writes, so escaping the pipe alone drops
+ * characters from the rendered cell.
+ */
+const escapeCell = (s: string): string => s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+
 export const blsDataframeQueryTool = tool('bls_dataframe_query', {
   title: 'Query BLS Dataframes',
   description:
@@ -177,8 +185,8 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
       const cells = result.columns.map((c) => {
         const v = row[c];
         if (v == null) return '';
-        if (typeof v === 'string') return v.replace(/\|/g, '\\|');
-        if (typeof v === 'object') return JSON.stringify(v).replace(/\|/g, '\\|');
+        if (typeof v === 'string') return escapeCell(v);
+        if (typeof v === 'object') return escapeCell(JSON.stringify(v));
         return String(v);
       });
       lines.push(`| ${cells.join(' | ')} |`);

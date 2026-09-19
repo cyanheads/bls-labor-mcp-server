@@ -305,6 +305,33 @@ describe('blsDataframeQueryTool', () => {
     expect(text).toContain('a\\|b');
   });
 
+  it('escapes backslashes so a cell survives markdown rendering', () => {
+    const output = {
+      columns: ['a', 'b'],
+      row_count: 1,
+      rows: [{ a: 'x\\|y', b: 'a\\*b' }],
+    };
+    const blocks = blsDataframeQueryTool.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    // A bare backslash is consumed as an escape by the renderer, so the literal
+    // value has to arrive with its backslash doubled and the pipe escaped on top.
+    expect(text).toContain('x\\\\\\|y');
+    expect(text).toContain('a\\\\*b');
+  });
+
+  it('escapes backslashes in serialized object cells', () => {
+    const output = {
+      columns: ['payload'],
+      row_count: 1,
+      rows: [{ payload: { path: 'C:\\tmp', sep: 'a|b' } }],
+    };
+    const blocks = blsDataframeQueryTool.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    // JSON.stringify already emits `C:\\tmp`; both backslashes need doubling.
+    expect(text).toContain('C:\\\\\\\\tmp');
+    expect(text).toContain('a\\|b');
+  });
+
   it('formats null cell values as empty string', () => {
     const output = {
       columns: ['value'],
