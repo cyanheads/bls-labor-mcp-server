@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 20:40:32
+Generated on: 2026-09-22 17:44:47
 
 ```text
 bls-labor-mcp-server/
@@ -186,6 +186,7 @@ bls-labor-mcp-server/
 │   │   │   ├── bls-observations-routing.test.ts
 │   │   │   ├── bls-observations-service.test.ts
 │   │   │   ├── ingester.test.ts
+│   │   │   ├── mirror-migration.test.ts
 │   │   │   └── subprocess.test.ts
 │   │   ├── bls-periods/
 │   │   │   └── period-codes.test.ts

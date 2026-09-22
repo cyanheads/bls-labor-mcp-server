@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.3](changelog/0.5.x/0.5.3.md) — 2026-09-22
+
+Fixes the observations-mirror bootstrap (dropped sentinel rows, a subprocess that never initialized the mirror, LABSTAT index discovery) and bls_get_series (out-of-order series[], mis-composed failure reasons, one-sided year ranges).
+
 ## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-19
 
 mcp-ts-core moves to 0.13.6, closing catalog and mirror SQLite handles on shutdown and retrying a transient BLS upstream error; bls_dataframe_query now escapes backslashes correctly in markdown cells.
