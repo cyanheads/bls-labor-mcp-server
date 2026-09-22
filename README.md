@@ -68,6 +68,7 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 - Batch fetch 1–50 SeriesIDs per call; the whole batch counts as one of the 500 daily API queries
 - Optional `start_year`/`end_year` window (BLS caps requests at 20 years) and `calculations: true` for BLS server-side net/percent change — a survey returns whichever it supports and omits the rest (CPI/PPI return percent change only)
+- BLS needs both year bounds or neither: `start_year` alone resolves `end_year` to the current year, capped at `start_year + 19`; `end_year` alone is rejected without spending a query. `enrichment.startYearApplied`/`endYearApplied` report the window actually applied
 - Optional `annual_average: true` adds each year's mean as an extra `M13`/`Q05`/`S03` row; `enrichment.annualAverageRows` reports how many were added
 - BLS's raw `-` missing-value sentinel is preserved in `value` but reflected in `available` and excluded from `availableObservationCount`
 - A mixed batch keeps valid series when another SeriesID is invalid or empty — the unresolved ID stays listed with zero observations and reason-specific guidance
@@ -276,6 +277,8 @@ For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls
    ```
 
 Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
+
+**Upgrading an existing mirror.** A mirror bootstrapped before sentinel rows were stored is missing the periods BLS publishes with its `-` missing-value marker. Opening such a mirror clears its sync checkpoint once, so the next refresh re-reads every LABSTAT file and fills them in — no operator action beyond letting that refresh run, and it takes as long as a full read. The mirror keeps serving throughout.
 
 ## Running the server
 

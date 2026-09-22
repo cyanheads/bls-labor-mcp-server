@@ -3,7 +3,7 @@
  * @module tests/tools/bls-get-series.tool.test
  */
 
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetSeriesTool } from '@/mcp-server/tools/definitions/bls-get-series.tool.js';
@@ -193,6 +193,46 @@ describe('blsGetSeriesTool', () => {
     });
   });
 
+  it('carries an all-empty mixed verdict to both client surfaces (#59)', async () => {
+    // The service raises one multi-line message naming each failing SeriesID
+    // plus a hint naming both moves; neither may be lost on either surface.
+    fetchSeriesMock.mockRejectedValueOnce(
+      notFound(
+        'BLS API: no requested series returned data. Invalid: LNS99999999. No data for the requested period: WPUFD49104.\n  WPUFD49104: No Data Available for Series WPUFD49104 Year: 2005; No Data Available for Series WPUFD49104 Year: 2006\n  LNS99999999: Series does not exist for Series LNS99999999',
+        {
+          reason: 'series_not_found',
+          recovery: {
+            hint: 'Replace LNS99999999 with a valid SeriesID from bls_search_series, and adjust start_year/end_year to a range WPUFD49104 covers.',
+          },
+        },
+      ),
+    );
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['WPUFD49104', 'LNS99999999'], start_year: 2005, end_year: 2006 },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        message: expect.stringContaining('WPUFD49104: No Data Available'),
+        data: {
+          reason: 'series_not_found',
+          recovery: { hint: expect.stringContaining('adjust start_year/end_year') },
+        },
+      },
+    });
+
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('LNS99999999: Series does not exist');
+    expect(text).toContain('Year: 2005');
+    expect(text).toContain('Recovery: Replace LNS99999999');
+  });
+
   it('renders service recovery through structuredContent and content[] (#60)', async () => {
     fetchSeriesMock.mockImplementationOnce((_input, ctx) => {
       throw serviceUnavailable('BLS quota exhausted.', {
@@ -349,6 +389,41 @@ describe('blsGetSeriesTool', () => {
     await blsGetSeriesTool.handler(input, ctx);
 
     expect(getEnrichment(ctx).notice).toContain('ABSENT001');
+  });
+
+  it('gives a mirror miss the generic notice and no failure, on both surfaces (#73)', async () => {
+    // The mirror path now reconciles to request order, so an ID it could not
+    // resolve arrives as a zero-observation entry at its own position. It has no
+    // `failure` — BLS issued no advisory — and that absence is what picks the
+    // generic notice over the invalid-ID one.
+    fetchSeriesMock.mockResolvedValue([{ seriesId: 'ABSENT001', observations: [] }, MOCK_SERIES]);
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['ABSENT001', 'LNS14000000'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      series: [
+        { seriesId: 'ABSENT001', observationCount: 0, observations: [] },
+        { seriesId: 'LNS14000000', observationCount: 2 },
+      ],
+      notice: expect.stringContaining('No observations returned for ABSENT001'),
+    });
+    expect((result.structuredContent as { series: unknown[] }).series[0]).not.toHaveProperty(
+      'failure',
+    );
+    expect(result.structuredContent).not.toMatchObject({
+      notice: expect.stringContaining('invalid or does not exist'),
+    });
+
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('### ABSENT001');
+    expect(text).toContain('_No observations returned.');
   });
 
   it('points an empty ranged request at the year range as well as the SeriesID (#45)', async () => {
@@ -768,6 +843,271 @@ describe('blsGetSeriesTool', () => {
     // process.env.BLS_API_KEY is typically empty/undefined in tests — confirm no secret leakage pattern
     expect(serialized).not.toMatch(/registrationkey/i);
     expect(serialized).not.toMatch(/apikey/i);
+  });
+});
+
+describe('blsGetSeriesTool — one-sided year range (#76)', () => {
+  /** Read the same way the handler reads it, so the assertion cannot drift. */
+  const currentYear = new Date().getFullYear();
+
+  beforeEach(() => {
+    canvasBridge = undefined;
+    registerDataframeMock.mockReset();
+    fetchSeriesMock.mockReset();
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES]);
+  });
+
+  it('resolves end_year to the current year when only start_year is supplied', async () => {
+    // BLS rejects startyear without endyear outright, spending a daily query.
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      start_year: currentYear - 2,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ startYear: currentYear - 2, endYear: currentYear }),
+      ctx,
+    );
+    const enriched = getEnrichment(ctx);
+    expect(enriched.startYearApplied).toBe(currentYear - 2);
+    expect(enriched.endYearApplied).toBe(currentYear);
+    expect(enriched.notice).toBeUndefined();
+  });
+
+  it('caps the resolved end_year at the 20-year window, on both surfaces', async () => {
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000'], start_year: 2000 },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ startYear: 2000, endYear: 2019 }),
+      expect.anything(),
+    );
+    expect(result.structuredContent).toMatchObject({
+      startYearApplied: 2000,
+      endYearApplied: 2019,
+      notice: expect.stringContaining('2019'),
+    });
+    expect((result.structuredContent as { notice: string }).notice).toContain('20 years');
+
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('**endYearApplied:** 2019');
+    expect(text).toContain('20 years');
+  });
+
+  it('rejects end_year alone before spending a BLS query', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      end_year: 2024,
+    });
+
+    const error = await Promise.resolve(blsGetSeriesTool.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect(error).toMatchObject({ data: { reason: 'no_data_for_period' } });
+    expect((error as { message: string }).message).toContain('start_year');
+    expect(fetchSeriesMock).not.toHaveBeenCalled();
+  });
+
+  it('forwards both bounds unchanged when both are supplied', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      start_year: 2020,
+      end_year: 2024,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ startYear: 2020, endYear: 2024 }),
+      ctx,
+    );
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('sends neither bound when neither is supplied, leaving the BLS default window', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const options = fetchSeriesMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('startYear');
+    expect(options).not.toHaveProperty('endYear');
+  });
+
+  it('resolves a current-year start_year to a single-year window without a cap notice', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      start_year: currentYear,
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    expect(fetchSeriesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ startYear: currentYear, endYear: currentYear }),
+      ctx,
+    );
+    expect(getEnrichment(ctx).endYearApplied).toBe(currentYear);
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+});
+
+describe('blsGetSeriesTool — a repeated SeriesID is one series', () => {
+  /** Second series, so the totals can distinguish "per position" from "per series". */
+  const SECOND_SERIES: SeriesData = {
+    seriesId: 'CES0000000001',
+    title: 'All Employees, Total Nonfarm',
+    observations: [{ year: '2024', period: 'M12', periodName: 'December', value: '159367' }],
+  };
+
+  beforeEach(() => {
+    canvasBridge = undefined;
+    registerDataframeMock.mockReset();
+    fetchSeriesMock.mockReset();
+    // One entry per requested position is the service's contract; the repeat is
+    // the same series, so its observations must be counted once.
+    fetchSeriesMock.mockResolvedValue([MOCK_SERIES, SECOND_SERIES, MOCK_SERIES]);
+  });
+
+  it('counts its observations once across structuredContent and the rendered text', async () => {
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000', 'CES0000000001', 'LNS14000000'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      series: [
+        { seriesId: 'LNS14000000', observationCount: 2 },
+        { seriesId: 'CES0000000001', observationCount: 1 },
+        { seriesId: 'LNS14000000', observationCount: 2 },
+      ],
+      totalObservations: 3,
+      availableObservations: 3,
+      unavailableObservations: 0,
+    });
+
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('**totalObservations:** 3');
+    expect(text).toContain('**availableObservations:** 3');
+  });
+
+  it('writes each observation to the canvas table once', async () => {
+    const repeated = bulkySeries();
+    fetchSeriesMock.mockResolvedValue([repeated, repeated]);
+    registerDataframeMock.mockResolvedValue({
+      tableName: 'df_REPEAT_ONCE',
+      rowCount: 900,
+      expiresAt: '2026-07-18T00:00:00.000Z',
+      columnSchema: [],
+    });
+    canvasBridge = { registerDataframe: registerDataframeMock };
+
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000', 'LNS14000000'],
+    });
+    await blsGetSeriesTool.handler(input, ctx);
+
+    const rows = registerDataframeMock.mock.calls[0]![1].rows as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(900);
+    expect(getEnrichment(ctx).totalObservations).toBe(900);
+  });
+});
+
+describe('blsGetSeriesTool — spill failures name the applied window (#79)', () => {
+  beforeEach(() => {
+    canvasBridge = undefined;
+    registerDataframeMock.mockReset();
+    fetchSeriesMock.mockReset();
+    fetchSeriesMock.mockResolvedValue([bulkySeries()]);
+  });
+
+  it('names a window resolved from start_year alone, on both surfaces', async () => {
+    // Told only to narrow start_year/end_year, a caller who supplied one bound
+    // cannot see the other bound the handler chose for it.
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000'], start_year: 2000 },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        message: expect.stringContaining('2000–2019'),
+        data: {
+          reason: 'canvas_unavailable',
+          recovery: { hint: expect.stringContaining('2000–2019') },
+        },
+      },
+    });
+
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain('2000–2019');
+    expect(text).toContain('end_year resolved from start_year');
+  });
+
+  it('names a caller-supplied window without claiming it was resolved', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      start_year: 2000,
+      end_year: 2005,
+    });
+
+    const error = await Promise.resolve(blsGetSeriesTool.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect((error as Error).message).toContain('2000–2005');
+    expect((error as Error).message).not.toContain('resolved from start_year');
+  });
+
+  it('names the BLS default window when neither bound was supplied', async () => {
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
+
+    const error = await Promise.resolve(blsGetSeriesTool.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect((error as Error).message).toContain('BLS default window');
+  });
+
+  it('hands the applied window to registration, so a failed spill reports it too', async () => {
+    const { serviceUnavailable: unavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    canvasBridge = { registerDataframe: registerDataframeMock };
+    registerDataframeMock.mockRejectedValue(
+      unavailable('registration blew up', { reason: 'canvas_registration_failed' }),
+    );
+
+    const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
+    const input = blsGetSeriesTool.input.parse({
+      series_ids: ['LNS14000000'],
+      start_year: 2000,
+    });
+
+    await expect(blsGetSeriesTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'canvas_registration_failed' },
+    });
+    const options = registerDataframeMock.mock.calls[0]![1] as { appliedScope?: string };
+    expect(options.appliedScope).toContain('2000–2019');
+    expect(options.appliedScope).toContain('end_year resolved from start_year');
   });
 });
 

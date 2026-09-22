@@ -618,6 +618,154 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
   });
 });
 
+describe('BlsApiService.fetchSeries — all-empty batch composition (#59)', () => {
+  /**
+   * BLS's answer to a batch pairing an invalid SeriesID with a real PPI series
+   * whose history starts after the requested window: HTTP 200,
+   * REQUEST_SUCCEEDED, both series present and both empty. One advisory per
+   * uncovered year, plus a catalog advisory that names no failure mode.
+   */
+  const MIXED_ALL_EMPTY = {
+    status: 'REQUEST_SUCCEEDED',
+    responseTime: 88,
+    message: [
+      'Series does not exist for Series LNS99999999',
+      'No Data Available for Series WPUFD49104 Year: 2005',
+      'No Data Available for Series WPUFD49104 Year: 2006',
+      'Unable to get Catalog Data for series LNS99999999',
+    ],
+    Results: {
+      series: [
+        { seriesID: 'WPUFD49104', data: [] },
+        { seriesID: 'LNS99999999', data: [] },
+      ],
+    },
+  };
+
+  function fetchAllEmpty(payload: unknown, seriesIds: string[]) {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(payload));
+    return new BlsApiService(apiKey, baseUrl, userAgent)
+      .fetchSeries({ seriesIds, startYear: 2005, endYear: 2006 }, createMockContext())
+      .catch((e: unknown) => e);
+  }
+
+  it('names every failing SeriesID with its own advisory text', async () => {
+    const error = await fetchAllEmpty(MIXED_ALL_EMPTY, ['WPUFD49104', 'LNS99999999']);
+
+    const { message } = error as { message: string };
+    expect(message).toContain('No Data Available for Series WPUFD49104 Year: 2005');
+    expect(message).toContain('No Data Available for Series WPUFD49104 Year: 2006');
+    expect(message).toContain('Series does not exist for Series LNS99999999');
+  });
+
+  it('reports a mixed all-empty batch with a recovery naming both next moves', async () => {
+    const error = await fetchAllEmpty(MIXED_ALL_EMPTY, ['WPUFD49104', 'LNS99999999']);
+
+    // Both reasons are in play, so the single declared reason cannot carry the
+    // whole verdict — the hint has to name the invalid ID and the window miss.
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'series_not_found' },
+    });
+    const hint = (error as { data: { recovery: { hint: string } } }).data.recovery.hint;
+    expect(hint).toContain('LNS99999999');
+    expect(hint).toContain('bls_search_series');
+    expect(hint).toContain('WPUFD49104');
+    expect(hint).toContain('start_year');
+  });
+
+  it('raises series_not_found when every failing ID is invalid', async () => {
+    const error = await fetchAllEmpty(
+      {
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 20,
+        message: [
+          'Series does not exist for Series LNS99999999',
+          'Invalid Series for Series BOGUS123',
+        ],
+        Results: {
+          series: [
+            { seriesID: 'LNS99999999', data: [] },
+            { seriesID: 'BOGUS123', data: [] },
+          ],
+        },
+      },
+      ['LNS99999999', 'BOGUS123'],
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'series_not_found' },
+    });
+    const { message } = error as { message: string };
+    expect(message).toContain('Series does not exist for Series LNS99999999');
+    expect(message).toContain('Invalid Series for Series BOGUS123');
+  });
+
+  it('raises no_data_for_period when every failing ID is a period-coverage miss', async () => {
+    const error = await fetchAllEmpty(
+      {
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 20,
+        message: [
+          'No Data Available for Series WPUFD49104 Year: 2005',
+          'No Data Available for Series PCU1133--1133-- Year: 2005',
+        ],
+        Results: {
+          series: [
+            { seriesID: 'WPUFD49104', data: [] },
+            { seriesID: 'PCU1133--1133--', data: [] },
+          ],
+        },
+      },
+      ['WPUFD49104', 'PCU1133--1133--'],
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'no_data_for_period' },
+    });
+    const { message } = error as { message: string };
+    expect(message).toContain('WPUFD49104');
+    expect(message).toContain('PCU1133--1133--');
+  });
+
+  it('keeps every advisory for a SeriesID that carries more than one', async () => {
+    const error = await fetchAllEmpty(
+      {
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 20,
+        message: [
+          'No Data Available for Series WPUFD49104 Year: 2005',
+          'No Data Available for Series WPUFD49104 Year: 2006',
+        ],
+        Results: { series: [{ seriesID: 'WPUFD49104', data: [] }] },
+      },
+      ['WPUFD49104'],
+    );
+
+    // Keyed by SeriesID, the second advisory used to overwrite the first.
+    const { message } = error as { message: string };
+    expect(message).toContain('Year: 2005');
+    expect(message).toContain('Year: 2006');
+  });
+
+  it('names the single failing SeriesID when only one was requested', async () => {
+    const error = await fetchAllEmpty(
+      {
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 20,
+        message: ['Series does not exist for Series LNS99999999'],
+        Results: { series: [{ seriesID: 'LNS99999999', data: [] }] },
+      },
+      ['LNS99999999'],
+    );
+
+    expect(error).toMatchObject({ data: { reason: 'series_not_found' } });
+    expect((error as { message: string }).message).toContain('LNS99999999');
+  });
+});
+
 describe('BlsApiService — invalid API key and message redaction (#56)', () => {
   it('classifies the invalid-key message as invalid_api_key, not quota_exceeded', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(invalidKeyResponse(FAKE_KEY)));

@@ -105,6 +105,25 @@ describe('CanvasBridge.registerDataframe', () => {
     });
   });
 
+  it('carries the caller-supplied scope into the failure message (#79)', async () => {
+    // The caller knows the window it applied; the bridge only knows the rows.
+    const bridge = new CanvasBridge(canvasFailingWith(new Error('DuckDB appender rollback')));
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+
+    const error = await bridge
+      .registerDataframe(ctx, {
+        rows: ROWS,
+        sourceTool: 'bls_get_series',
+        queryParams: {},
+        appliedScope: 'The applied window was 2000–2019, end_year resolved from start_year.',
+      })
+      .catch((e: unknown) => e);
+
+    expect((error as Error).message).toContain(
+      'The applied window was 2000–2019, end_year resolved from start_year.',
+    );
+  });
+
   it('preserves the underlying error as the cause', async () => {
     const underlying = new Error('DuckDB appender rollback');
     const bridge = new CanvasBridge(canvasFailingWith(underlying));

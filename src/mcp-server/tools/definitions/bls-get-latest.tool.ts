@@ -106,7 +106,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
             error: z
               .string()
               .describe(
-                'Error message. Common values: "Series does not exist" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data).',
+                'Error message. Common values: "Series does not exist" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data). BLS does not always name the series it rejected: an invalid SeriesID sometimes comes back as the generic "Your request has failed. Please check your input parameters, and try your request again.", which means the same thing here.',
               ),
           })
           .describe(

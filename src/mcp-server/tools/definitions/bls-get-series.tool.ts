@@ -107,12 +107,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       retryable: false,
       thrownBy: 'service',
       recovery:
-        'Retry with calculations omitted, or split series_ids into smaller batches to isolate the series BLS rejects.',
+        'Split series_ids into smaller requests to isolate the series BLS rejects, or retry with calculations omitted.',
     },
     {
       reason: 'series_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'One or more SeriesIDs do not exist in BLS data.',
+      when: 'No requested series returned data and at least one SeriesID does not exist. A batch mixing an invalid SeriesID with one BLS has no data for lands here too, and names both in the message and recovery hint.',
       thrownBy: 'service',
       recovery: 'Use bls_search_series to find valid SeriesIDs before calling bls_get_series.',
     },
@@ -126,7 +126,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     {
       reason: 'no_data_for_period',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'No data is available for the requested year range.',
+      when: 'The requested year range is unusable before the request — start_year after end_year, a span of 20 years or more, or end_year without start_year — or BLS returned data for none of the requested series over the range.',
       recovery: 'Adjust start_year or end_year. The BLS series may not cover the requested period.',
     },
     {
@@ -169,7 +169,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .max(2100)
       .optional()
       .describe(
-        'Start year for the data range (inclusive). The BLS API allows up to 20 years per request. Omit for the API default (typically 3–20 years depending on survey).',
+        'Start year for the data range (inclusive). The BLS API allows up to 20 years per request and requires both bounds or neither: supplying start_year alone resolves end_year to the current year, capped at start_year + 19 so the window stays inside the 20-year limit. Omit both for the API default (typically 3–20 years depending on survey).',
       ),
     end_year: z
       .number()
@@ -178,7 +178,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .max(2100)
       .optional()
       .describe(
-        'End year for the data range (inclusive). Defaults to the current year when omitted.',
+        'End year for the data range (inclusive). Supplying it without start_year is rejected before the request — BLS applies no default start year alongside an explicit end year. Pair it with start_year, or omit both for the API default window.',
       ),
     calculations: z
       .boolean()
@@ -257,11 +257,15 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     startYearApplied: z
       .number()
       .optional()
-      .describe('Start year in effect, when a range was requested.'),
+      .describe(
+        'Start year applied to the query, whether it was served live or from the local observation mirror. Absent when no year range was in effect.',
+      ),
     endYearApplied: z
       .number()
       .optional()
-      .describe('End year in effect, when a range was requested.'),
+      .describe(
+        'End year applied to the query. Resolved from start_year when end_year was omitted, so it can differ from the requested range; notice names the cap when the 20-year window decided it. Absent when no year range was in effect.',
+      ),
     calculationsApplied: z
       .boolean()
       .optional()
@@ -281,7 +285,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .string()
       .optional()
       .describe(
-        'Guidance for agents — names any SeriesID that returned zero observations, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data and it all fit inline.',
+        'Guidance for agents — names any SeriesID that returned zero observations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.',
       ),
   },
 
@@ -318,18 +322,54 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       );
     }
 
+    const notices: string[] = [];
+    const startYear = input.start_year;
+    let endYear = input.end_year;
+
+    /**
+     * BLS requires `startyear` and `endyear` together and rejects either one
+     * alone, spending a daily query to say so. Resolving the pair here — once,
+     * before the fetch options exist — is what keeps the observations mirror
+     * and the live API on the same window.
+     */
+    if (startYear !== undefined && endYear === undefined) {
+      const currentYear = new Date().getFullYear();
+      const windowEnd = startYear + 19;
+      // A start year in the future would otherwise resolve to an inverted range.
+      endYear = Math.min(Math.max(currentYear, startYear), windowEnd);
+      if (windowEnd < currentYear) {
+        notices.push(
+          `end_year was omitted and resolved to ${endYear} rather than the current year (${currentYear}): BLS caps a request at 20 years, so the window ends at start_year + 19. Request ${windowEnd + 1}–${currentYear} separately for the remainder.`,
+        );
+      }
+    } else if (startYear === undefined && endYear !== undefined) {
+      throw ctx.fail(
+        'no_data_for_period',
+        `end_year (${endYear}) was supplied without start_year. BLS requires both year bounds or neither, and applies no default start year alongside an explicit end year. Supply start_year no more than 19 years before end_year, or omit both for the BLS default window.`,
+        { ...ctx.recoveryFor('no_data_for_period') },
+      );
+    }
+
     const service = getBlsApiService();
     const fetchOptions: BatchFetchOptions = {
       seriesIds: input.series_ids,
       annualAverage: input.annual_average,
     };
-    if (input.start_year !== undefined) fetchOptions.startYear = input.start_year;
-    if (input.end_year !== undefined) fetchOptions.endYear = input.end_year;
+    if (startYear !== undefined) fetchOptions.startYear = startYear;
+    if (endYear !== undefined) fetchOptions.endYear = endYear;
     if (input.calculations !== undefined) fetchOptions.calculations = input.calculations;
     const allSeries = await service.fetchSeries(fetchOptions, ctx);
 
+    /**
+     * A SeriesID repeated in series_ids keeps one `series[]` entry per requested
+     * position, but it is still one series: counting it per position would
+     * double its observations in every total and write each of its rows to the
+     * canvas table twice.
+     */
+    const uniqueSeries = [...new Map(allSeries.map((s) => [s.seriesId, s])).values()];
+
     // Flatten to rows for canvas registration
-    const allRows = flattenToRows(allSeries);
+    const allRows = flattenToRows(uniqueSeries);
     const inlineJson = JSON.stringify(allRows);
     const shouldSpill = inlineJson.length > INLINE_BUDGET_CHARS;
 
@@ -343,8 +383,8 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       unavailableObservations,
       seriesRequested: input.series_ids.length,
       annualAverageApplied: input.annual_average,
-      ...(input.start_year !== undefined && { startYearApplied: input.start_year }),
-      ...(input.end_year !== undefined && { endYearApplied: input.end_year }),
+      ...(startYear !== undefined && { startYearApplied: startYear }),
+      ...(endYear !== undefined && { endYearApplied: endYear }),
       ...(input.calculations !== undefined && { calculationsApplied: input.calculations }),
       ...(input.annual_average && { annualAverageRows }),
     });
@@ -357,12 +397,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
      * composed into one string below.
      */
     const byId = new Map(allSeries.map((s) => [s.seriesId, s]));
-    const emptySeriesIds = input.series_ids.filter(
+    const emptySeriesIds = [...new Set(input.series_ids)].filter(
       (id) => (byId.get(id)?.observations.length ?? 0) === 0,
     );
-    const notices: string[] = [];
     if (emptySeriesIds.length > 0) {
-      const ranged = input.start_year !== undefined || input.end_year !== undefined;
+      const ranged = startYear !== undefined || endYear !== undefined;
       for (const id of emptySeriesIds) {
         const failure = byId.get(id)?.failure;
         notices.push(
@@ -388,13 +427,28 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     if (shouldSpill) {
       const bridge = getCanvasBridge();
 
+      /**
+       * Both spill failures tell the caller to narrow the year range, so both
+       * name the range in force — including an `end_year` this handler resolved
+       * rather than the caller supplying, which is otherwise a bound they cannot
+       * see to narrow.
+       */
+      const appliedWindow =
+        startYear !== undefined && endYear !== undefined
+          ? `${startYear}–${endYear}${input.end_year === undefined ? ', end_year resolved from start_year' : ''}`
+          : 'the BLS default window, since neither start_year nor end_year was supplied';
+
       if (!bridge) {
         // Data would be silently truncated — surface this as an error so agents
         // know to narrow the year range rather than treating partial data as complete.
         throw ctx.fail(
           'canvas_unavailable',
-          `Result set exceeded the inline budget (${allRows.length} rows across ${allSeries.length} series). Canvas is not configured — full data cannot be returned.`,
-          ctx.recoveryFor('canvas_unavailable'),
+          `Result set exceeded the inline budget (${allRows.length} rows across ${uniqueSeries.length} series) over ${appliedWindow}. Canvas is not configured — full data cannot be returned.`,
+          {
+            recovery: {
+              hint: `The applied window was ${appliedWindow}. Narrow start_year/end_year to reduce the result set, or enable canvas by setting CANVAS_PROVIDER_TYPE=duckdb.`,
+            },
+          },
         );
       }
 
@@ -402,10 +456,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       const registered = await bridge.registerDataframe(ctx, {
         rows: allRows,
         sourceTool: 'bls_get_series',
+        appliedScope: `The applied window was ${appliedWindow}.`,
         queryParams: {
           series_ids: input.series_ids,
-          start_year: input.start_year,
-          end_year: input.end_year,
+          start_year: startYear,
+          end_year: endYear,
           calculations: input.calculations,
           annual_average: input.annual_average,
         },
@@ -413,7 +468,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       const dataset = toDatasetField(registered);
 
       notices.push(
-        `${totalObservations} total observations across ${allSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset.name}; call bls_dataframe_describe with name=${dataset.name} to inspect column_schema, then use ${dataset.name} in bls_dataframe_query SQL.`,
+        `${totalObservations} total observations across ${uniqueSeries.length} series exceeded the inline budget. Full data is in canvas table ${dataset.name}; call bls_dataframe_describe with name=${dataset.name} to inspect column_schema, then use ${dataset.name} in bls_dataframe_query SQL.`,
       );
       ctx.enrich.notice(notices.join(' '));
 

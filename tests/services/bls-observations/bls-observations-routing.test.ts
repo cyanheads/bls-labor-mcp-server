@@ -111,16 +111,31 @@ const LIVE_CES_RESPONSE = {
   },
 };
 
-const MIRROR_OBS = [
-  {
-    row_key: 'LNS14000000|2024|M12',
-    series_id: 'LNS14000000',
-    year: '2024',
-    period: 'M12',
-    value: '4.1',
+/** One mirror row, shaped as the store returns it. */
+function mirrorRow(series_id: string, year: string, period: string, value: string) {
+  return {
+    row_key: `${series_id}|${year}|${period}`,
+    series_id,
+    year,
+    period,
+    value,
     footnote_codes: '',
-  },
-];
+  };
+}
+
+const MIRROR_OBS = [mirrorRow('LNS14000000', '2024', 'M12', '4.1')];
+
+/** A minimal live batch response echoing one requested SeriesID with one row. */
+function liveResponse(seriesId: string): Response {
+  return okJson({
+    status: 'REQUEST_SUCCEEDED',
+    responseTime: 50,
+    message: [],
+    Results: {
+      series: [{ seriesID: seriesId, data: [{ year: '2024', period: 'M06', value: '9.9' }] }],
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Group 1: Mirror disabled — live API always called
@@ -290,11 +305,151 @@ describe('fetchSeries — mirror READY', () => {
     // Live was called only for the missed ID
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(result.length).toBe(2);
-    const ids = result.map((s: SeriesData) => s.seriesId);
-    expect(ids).toContain('LNS14000000');
-    expect(ids).toContain('CES0000000001');
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['LNS14000000', 'CES0000000001']);
 
     fetchSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 3b: Mirror READY — request-order reconciliation (#73)
+// ---------------------------------------------------------------------------
+
+describe('fetchSeries — mirror-routed request order (#73)', () => {
+  beforeEach(() => {
+    vi.mocked(getServerConfig).mockReturnValue({
+      observationsMirrorEnabled: true,
+      observationsMirrorFallbackLive: true,
+    } as ReturnType<typeof getServerConfig>);
+    vi.mocked(isBlsObservationsServiceReady).mockReturnValue(true);
+    getMirror().ready.mockResolvedValue(true);
+    getMirror().queryBySeries.mockReset();
+  });
+
+  function disableFallback(): void {
+    vi.mocked(getServerConfig).mockReturnValue({
+      observationsMirrorEnabled: true,
+      observationsMirrorFallbackLive: false,
+    } as ReturnType<typeof getServerConfig>);
+  }
+
+  it('returns a fully mirrored batch in request order, not newest-year-first', async () => {
+    // The store sorts year DESC and the row grouping preserves that, so the
+    // 2025 series led the 2020 one however the caller asked for them.
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [
+        mirrorRow('HIT_NEW', '2025', 'M01', '2.0'),
+        mirrorRow('HIT_OLD', '2020', 'M01', '1.0'),
+      ],
+      complete: true,
+      missedIds: [],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['HIT_OLD', 'HIT_NEW'] },
+      createMockContext(),
+    );
+
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['HIT_OLD', 'HIT_NEW']);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    fetchSpy.mockRestore();
+  });
+
+  it('places a live-fallback result at its requested position', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [mirrorRow('HIT_NEW', '2025', 'M01', '2.0')],
+      complete: false,
+      missedIds: ['MISS'],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(liveResponse('MISS'));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries({ seriesIds: ['MISS', 'HIT_NEW'] }, createMockContext());
+
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['MISS', 'HIT_NEW']);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result[0]!.observations).toHaveLength(1);
+
+    fetchSpy.mockRestore();
+  });
+
+  it('keeps an unresolved ID as a zero-observation entry when fallback is off', async () => {
+    disableFallback();
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [mirrorRow('HIT_NEW', '2025', 'M01', '2.0')],
+      complete: false,
+      missedIds: ['MISS'],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries({ seriesIds: ['MISS', 'HIT_NEW'] }, createMockContext());
+
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['MISS', 'HIT_NEW']);
+    expect(result[0]!.observations).toEqual([]);
+    // A mirror miss is a fact about the local store, not a BLS advisory (#59).
+    expect(result[0]).not.toHaveProperty('failure');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    fetchSpy.mockRestore();
+  });
+
+  it('answers an all-missed batch with one zero-observation entry per position', async () => {
+    disableFallback();
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [],
+      complete: false,
+      missedIds: ['MISS_A', 'MISS_B'],
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries({ seriesIds: ['MISS_A', 'MISS_B'] }, createMockContext());
+
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['MISS_A', 'MISS_B']);
+    expect(result.every((s: SeriesData) => s.observations.length === 0)).toBe(true);
+  });
+
+  it('gives a series the annual-average filter emptied its position, spending no live query', async () => {
+    // Coverage is judged before the filter, so ANNUAL0 is in neither missedIds
+    // nor observations — a fallback would re-ask for rows the caller declined.
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [mirrorRow('HIT_NEW', '2025', 'M01', '2.0')],
+      complete: true,
+      missedIds: [],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['ANNUAL0', 'HIT_NEW'] },
+      createMockContext(),
+    );
+
+    expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['ANNUAL0', 'HIT_NEW']);
+    expect(result[0]!.observations).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    fetchSpy.mockRestore();
+  });
+
+  it('returns one entry per requested position for duplicate and single-ID requests', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [mirrorRow('HIT_NEW', '2025', 'M01', '2.0')],
+      complete: true,
+      missedIds: [],
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const ctx = createMockContext();
+
+    const duplicated = await svc.fetchSeries({ seriesIds: ['HIT_NEW', 'HIT_NEW'] }, ctx);
+    expect(duplicated.map((s: SeriesData) => s.seriesId)).toEqual(['HIT_NEW', 'HIT_NEW']);
+
+    const single = await svc.fetchSeries({ seriesIds: ['HIT_NEW'] }, ctx);
+    expect(single.map((s: SeriesData) => s.seriesId)).toEqual(['HIT_NEW']);
   });
 });
 

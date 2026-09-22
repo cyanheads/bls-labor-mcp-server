@@ -50,6 +50,13 @@ export function toDatasetField(registered: RegisterDataframeResult): {
 }
 
 export interface RegisterDataframeOptions {
+  /**
+   * One caller-written sentence naming the request parameters these rows cover.
+   * Appended to the failure message and to its recovery hint, so an agent whose
+   * spill failed sees the bounds it can narrow — including any the calling
+   * handler resolved rather than the caller supplying.
+   */
+  appliedScope?: string;
   queryParams: Record<string, unknown>;
   rows: Record<string, unknown>[];
   sourceTool: string;
@@ -129,13 +136,17 @@ export class CanvasBridge {
         error: error instanceof Error ? error.message : String(error),
         sourceTool: options.sourceTool,
       });
+      const scope = options.appliedScope ? ` ${options.appliedScope}` : '';
+      const declared = ctx.recoveryFor('canvas_registration_failed');
       throw serviceUnavailable(
-        `Canvas is configured but registering the ${options.rows.length}-row dataframe for ${options.sourceTool} failed, so the full result set cannot be returned.`,
+        `Canvas is configured but registering the ${options.rows.length}-row dataframe for ${options.sourceTool} failed, so the full result set cannot be returned.${scope}`,
         {
           reason: 'canvas_registration_failed',
           sourceTool: options.sourceTool,
           rowCount: options.rows.length,
-          ...ctx.recoveryFor('canvas_registration_failed'),
+          ...(scope && 'recovery' in declared
+            ? { recovery: { hint: `${declared.recovery.hint}${scope}` } }
+            : declared),
         },
         { cause: error },
       );

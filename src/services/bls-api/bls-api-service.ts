@@ -165,6 +165,23 @@ const SURVEY_CAPABILITIES: Record<
   WS: { allowsNetChange: true, allowsPercentChange: true, hasAnnualAverages: true },
 };
 
+/**
+ * Lay resolved series out at their requested positions, one entry per position.
+ *
+ * An ID no source resolved becomes a zero-observation entry. It carries no
+ * `failure`: that field reports a BLS advisory about the series, and calling a
+ * local-store miss `series_not_found` would attribute to BLS a rejection it
+ * never issued. The absence is also what selects the generic recovery notice
+ * `bls_get_series` composes for an empty entry.
+ */
+function alignToRequestOrder(seriesIds: string[], resolved: SeriesData[]): SeriesData[] {
+  const byId = new Map(resolved.map((series) => [series.seriesId, series]));
+  return seriesIds.map((seriesId) => byId.get(seriesId) ?? { seriesId, observations: [] });
+}
+
+/** One BLS advisory about a requested SeriesID. */
+type SeriesAdvisory = NonNullable<SeriesData['failure']>;
+
 export interface BatchFetchOptions {
   /**
    * Request BLS's annual-average rows (period M13/Q05/S03) alongside the real
@@ -215,28 +232,33 @@ export class BlsApiService {
           ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
         });
 
-        const mirrorSeries = await this.mirrorRowsToSeriesData(mirrorResult.observations);
+        const resolved = await this.mirrorRowsToSeriesData(mirrorResult.observations);
 
-        // Fetch missing IDs from live API when fallback is enabled
-        if (mirrorResult.missedIds.length > 0 && cfg.observationsMirrorFallbackLive) {
-          ctx.log.notice('fetchSeries: mirror miss, falling back to live API', {
-            missedIds: mirrorResult.missedIds,
-          });
-          const liveSeries = await this.fetchSeriesLive(
-            { ...options, seriesIds: mirrorResult.missedIds },
-            ctx,
-          );
-          return [...mirrorSeries, ...liveSeries];
+        if (mirrorResult.missedIds.length > 0) {
+          if (cfg.observationsMirrorFallbackLive) {
+            ctx.log.notice('fetchSeries: mirror miss, falling back to live API', {
+              missedIds: mirrorResult.missedIds,
+            });
+            const liveSeries = await this.fetchSeriesLive(
+              { ...options, seriesIds: mirrorResult.missedIds },
+              ctx,
+            );
+            resolved.push(...liveSeries);
+          } else {
+            ctx.log.notice('fetchSeries: mirror_partial — some series IDs not in mirror', {
+              missedIds: mirrorResult.missedIds,
+            });
+          }
         }
 
-        // Emit a notice when coverage is partial but fallback is disabled
-        if (!mirrorResult.complete) {
-          ctx.log.notice('fetchSeries: mirror_partial — some series IDs not in mirror', {
-            missedIds: mirrorResult.missedIds,
-          });
-        }
-
-        return mirrorSeries;
+        /**
+         * Both sources answer in their own order — the mirror groups rows the
+         * store sorted year-DESC, the fallback answers only the IDs it was
+         * given — and neither is obliged to answer at all. Reconciling here is
+         * what makes the declared "in request order" contract true and keeps an
+         * ID no source resolved visible instead of silently absent.
+         */
+        return alignToRequestOrder(options.seriesIds, resolved);
       }
 
       // Mirror not yet ready
@@ -354,6 +376,9 @@ export class BlsApiService {
    * (title, area, item, seasonal) from the in-memory catalog index.
    * The LABSTAT data files carry only raw observation values — catalog metadata
    * must be joined from the catalog service's in-memory series index.
+   *
+   * Series come back in row order and only for IDs the rows cover; the caller
+   * lays them out against the request via {@link alignToRequestOrder}.
    */
   private async mirrorRowsToSeriesData(rows: ObservationRow[]): Promise<SeriesData[]> {
     // Group rows by series_id, ordered by (year DESC, period DESC)
@@ -615,7 +640,9 @@ export class BlsApiService {
     const byId = new Map((parsed.Results?.series ?? []).map((raw) => [raw.seriesID, raw]));
     const series = options.seriesIds.flatMap((seriesId): SeriesData[] => {
       const raw = byId.get(seriesId);
-      const failure = failures.get(seriesId);
+      // The entry reports the class of the failure, which every advisory for one
+      // SeriesID shares; the full set shapes the request-level error instead.
+      const failure = failures.get(seriesId)?.[0];
       if (!raw) return failure ? [{ seriesId, observations: [], failure }] : [];
       const cat = raw.catalog;
       return [
@@ -638,12 +665,17 @@ export class BlsApiService {
     return series;
   }
 
-  /** Associate BLS advisories with the SeriesID they describe. */
+  /**
+   * Associate BLS advisories with the SeriesID they describe, keeping every
+   * advisory an ID collects. A series uncovered over a multi-year window draws
+   * one message per year, so keying them last-wins reported a single year of an
+   * otherwise complete verdict.
+   */
   private classifySeriesFailures(
     messages: string[],
     requestedIds: string[],
-  ): Map<string, NonNullable<SeriesData['failure']>> {
-    const failures = new Map<string, NonNullable<SeriesData['failure']>>();
+  ): Map<string, SeriesAdvisory[]> {
+    const failures = new Map<string, SeriesAdvisory[]>();
     for (const message of messages) {
       const reason = /does not exist|invalid series/i.test(message)
         ? 'series_not_found'
@@ -658,39 +690,77 @@ export class BlsApiService {
           'i',
         ).test(message),
       );
-      if (id) failures.set(id, { reason, message });
+      if (!id) continue;
+      const collected = failures.get(id);
+      if (collected) collected.push({ reason, message });
+      else failures.set(id, [{ reason, message }]);
     }
     return failures;
   }
 
-  /** Raise the request-level error used when no requested series produced data. */
+  /**
+   * Raise the request-level error used when no requested series produced data.
+   *
+   * The reason follows the composition of the advisories rather than the first
+   * invalid ID that turns up: all-invalid raises `series_not_found`, all-
+   * uncovered raises `no_data_for_period`, and a mixed batch keeps the stricter
+   * `series_not_found` — an invalid SeriesID is wrong at any window, while a
+   * period miss may resolve once the window moves. Only two reasons are
+   * declared, so a mixed batch carries the second class in the message and in a
+   * recovery hint naming both moves; sending the caller to re-resolve an ID that
+   * is already correct is the failure this replaces.
+   */
   private throwSeriesFailure(
-    failures: Map<string, NonNullable<SeriesData['failure']>>,
+    failures: Map<string, SeriesAdvisory[]>,
     messages: string[],
     options: Pick<BatchFetchOptions, 'seriesIds'>,
     ctx: Context,
   ): never {
-    const invalid = [...failures.values()].filter(
-      (failure) => failure.reason === 'series_not_found',
+    const failing = options.seriesIds
+      .map((seriesId) => ({ seriesId, advisories: failures.get(seriesId) ?? [] }))
+      .filter((entry) => entry.advisories.length > 0);
+
+    const invalidIds = failing
+      .filter((entry) => entry.advisories.some((a) => a.reason === 'series_not_found'))
+      .map((entry) => entry.seriesId);
+    const uncoveredIds = failing
+      .filter((entry) => entry.advisories.every((a) => a.reason === 'no_data_for_period'))
+      .map((entry) => entry.seriesId);
+
+    // One line per SeriesID, carrying every advisory BLS issued about it. A
+    // lone failing ID reads better inline than under a one-item list.
+    const lines = failing.map(
+      (entry) => `${entry.seriesId}: ${entry.advisories.map((a) => a.message).join('; ')}`,
     );
-    if (invalid.length > 0) {
-      throw notFound(
-        `BLS API: ${invalid.map((failure) => failure.message).join('; ')} — use bls_search_series to find valid SeriesIDs.`,
-        {
-          reason: 'series_not_found',
-          messages,
-          seriesIds: options.seriesIds,
-          ...ctx.recoveryFor('series_not_found'),
-        },
-      );
+    const detail = lines.length === 1 ? ` ${lines[0]}` : `\n  ${lines.join('\n  ')}`;
+    const data = { messages, seriesIds: options.seriesIds };
+
+    if (invalidIds.length === 0) {
+      throw validationError(`BLS API: No data available for the requested period range.${detail}`, {
+        reason: 'no_data_for_period',
+        ...data,
+        ...ctx.recoveryFor('no_data_for_period'),
+      });
     }
 
-    const detail = [...failures.values()].map((failure) => `  ${failure.message}`).join('\n');
-    throw validationError(`BLS API: No data available for the requested period range.\n${detail}`, {
-      reason: 'no_data_for_period',
-      messages,
-      ...ctx.recoveryFor('no_data_for_period'),
-    });
+    if (uncoveredIds.length === 0) {
+      throw notFound(`BLS API: no requested SeriesID exists.${detail}`, {
+        reason: 'series_not_found',
+        ...data,
+        ...ctx.recoveryFor('series_not_found'),
+      });
+    }
+
+    throw notFound(
+      `BLS API: no requested series returned data. Invalid: ${invalidIds.join(', ')}. No data for the requested period: ${uncoveredIds.join(', ')}.${detail}`,
+      {
+        reason: 'series_not_found',
+        ...data,
+        recovery: {
+          hint: `Replace ${invalidIds.join(', ')} with a valid SeriesID from bls_search_series, and adjust start_year/end_year to a range ${uncoveredIds.join(', ')} covers.`,
+        },
+      },
+    );
   }
 
   private normalizeObs(raw: RawObservation): Observation {
