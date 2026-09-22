@@ -79,7 +79,7 @@ await createApp({
   async setup(core) {
     initBlsApiService(core.config, core.storage);
     initBlsCatalogService(core.config, core.storage);
-    initBlsObservationsService(core.config, core.storage);
+    initBlsObservationsService();
     initCanvasBridge(core.canvas);
 
     // Load catalog in background — non-blocking. bls_search_series throws

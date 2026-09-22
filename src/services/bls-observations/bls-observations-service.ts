@@ -10,17 +10,18 @@
  * @module services/bls-observations/bls-observations-service
  */
 
-import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   defineMirror,
+  type Migration,
   type Mirror,
+  type MirrorLogger,
   type MirrorRunOptions,
   type MirrorStatus,
   type QueryFilter,
   type SyncResult,
   sqliteMirrorStore,
 } from '@cyanheads/mcp-ts-core/mirror';
-import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
+import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
 import { observationsSync } from './ingester.js';
@@ -57,6 +58,49 @@ function isLaterObservation(row: ObservationRow, existing: ObservationRow): bool
 }
 
 // ---------------------------------------------------------------------------
+// Ingester logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Sink for the ingester's own records — the same framework logger the mirror
+ * runner writes to. A harvest runs outside the request pipeline (cron job or
+ * CLI script), so each call wraps its metadata in a fresh `RequestContext`, the
+ * shape the framework logger expects.
+ */
+const INGESTER_LOG: MirrorLogger = {
+  warning: (message, meta) =>
+    logger.warning(
+      message,
+      requestContextService.createRequestContext({
+        operation: 'bls-observations-sync',
+        ...(meta && { additionalContext: meta }),
+      }),
+    ),
+};
+
+// ---------------------------------------------------------------------------
+// Schema migrations
+// ---------------------------------------------------------------------------
+
+/**
+ * Drop the durable high-water mark so the next refresh re-reads every LABSTAT
+ * file instead of skipping the ones whose `Last-Modified` predates it.
+ *
+ * A mirror synced before the ingester kept the `-` missing-value sentinel is
+ * missing those rows, and nothing upstream changed to bring them back — without
+ * this, the gap would persist for as long as BLS leaves the files alone. The
+ * completion marker is untouched, so the mirror stays ready and keeps serving
+ * while it re-reads. On a brand-new store the checkpoint is already NULL and
+ * this is a no-op.
+ */
+const MIRROR_SENTINEL_BACKFILL: Migration = {
+  version: 2,
+  up: (handle) => {
+    handle.exec('UPDATE mirror_sync_state SET checkpoint = NULL');
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Service class
 // ---------------------------------------------------------------------------
 
@@ -85,11 +129,14 @@ export class BlsObservationsService {
         },
         fts: [], // no FTS — queries are series_id-filtered point lookups
         indexes: [{ columns: ['series_id', 'year', 'period'] }],
+        version: 2,
+        migrations: [MIRROR_SENTINEL_BACKFILL],
       }),
       sync: (ctx) =>
         observationsSync(ctx, {
           catalogBaseUrl: this.catalogBaseUrl,
           userAgent: this.userAgent,
+          log: INGESTER_LOG,
         }),
     });
   }
@@ -209,7 +256,13 @@ export class BlsObservationsService {
 
 let _service: BlsObservationsService | undefined;
 
-export function initBlsObservationsService(_config: AppConfig, _storage: StorageService): void {
+/**
+ * Construct the mirror service from server configuration, or no-op when the
+ * mirror is switched off. Takes no arguments: every input the mirror needs comes
+ * from `getServerConfig()`, which lets the sync subprocess — which holds neither
+ * core handle — call it the same way `setup()` does.
+ */
+export function initBlsObservationsService(): void {
   const cfg = getServerConfig();
   if (!cfg.observationsMirrorEnabled) {
     // Not enabled — don't create the mirror store (avoids opening SQLite on startup).

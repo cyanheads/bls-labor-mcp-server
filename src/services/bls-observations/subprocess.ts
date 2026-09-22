@@ -12,7 +12,9 @@
  *   - Imported by `src/index.ts` for {@link runObservationsSubprocess} — the
  *     parent spawn helper the in-process HTTP cron calls.
  *   - Run directly (`<runtime> dist/services/bls-observations/subprocess.js`)
- *     as the child entry point — the bottom guard runs one refresh and exits.
+ *     as the child entry point — the bottom guard wires up signal handling and
+ *     exits on {@link runObservationsChildSync}'s code. `--init` runs the full
+ *     harvest; anything else runs an incremental refresh.
  *
  * @module services/bls-observations/subprocess
  */
@@ -20,9 +22,13 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { MirrorLogger } from '@cyanheads/mcp-ts-core/mirror';
-import { getServerConfig } from '@/config/server-config.js';
-import { getBlsObservationsService } from './bls-observations-service.js';
+import type { MirrorLogger, SyncMode } from '@cyanheads/mcp-ts-core/mirror';
+import {
+  getBlsObservationsService,
+  initBlsObservationsService,
+  isBlsObservationsServiceReady,
+  shutdownBlsObservationsService,
+} from './bls-observations-service.js';
 
 /** Grace period after SIGTERM before escalating to SIGKILL (ms). */
 const SIGKILL_GRACE_MS = 30_000;
@@ -182,7 +188,7 @@ function isLogLevel(value: unknown): value is LogLevel {
 // ---------------------------------------------------------------------------
 
 /** Logger that emits one JSON object per line on stdout for the parent to relay. */
-function makeChildLogger(): MirrorLogger {
+export function makeChildLogger(): MirrorLogger {
   const emit = (level: LogLevel, msg: string, meta?: object): void => {
     process.stdout.write(`${JSON.stringify({ level, msg, ...(meta ?? {}) })}\n`);
   };
@@ -201,6 +207,53 @@ function isMainEntry(): boolean {
   return entryArg != null && fileURLToPath(import.meta.url) === resolve(entryArg);
 }
 
+/**
+ * Run one sync and resolve the process exit code the child should carry.
+ *
+ * The child owns the mirror for the length of its run: nothing else in the
+ * process has constructed one, so it initializes the service before reading it.
+ * Initialization is inside the same try as `runSync`, so a bad configuration
+ * reports through the failure record the parent already parses rather than
+ * escaping as an uncaught module-level throw. The mirror is released on the way
+ * out so the SQLite handle is closed rather than dropped by `process.exit`.
+ *
+ * `--init` selects the full harvest; anything else is an incremental refresh.
+ * Ordinary failures — an unusable configuration, a rejected sync — resolve to
+ * exit code 1 rather than throwing.
+ */
+export async function runObservationsChildSync(
+  args: readonly string[],
+  log: MirrorLogger,
+  signal: AbortSignal,
+): Promise<number> {
+  const mode: SyncMode = args.includes('--init') ? 'init' : 'refresh';
+  try {
+    initBlsObservationsService();
+    if (!isBlsObservationsServiceReady()) {
+      log.warning?.(
+        'Observations mirror not enabled (BLS_OBSERVATIONS_MIRROR_ENABLED=false); exiting',
+      );
+      return 0;
+    }
+
+    const result = await getBlsObservationsService().runSync({ mode, signal });
+    log.info?.('Observations sync complete', {
+      pagesFetched: result.pagesFetched,
+      recordsApplied: result.recordsApplied,
+      tombstonesApplied: result.tombstonesApplied,
+      total: result.total,
+    });
+    return 0;
+  } catch (err: unknown) {
+    log.error?.('Observations sync failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 1;
+  } finally {
+    await shutdownBlsObservationsService();
+  }
+}
+
 if (isMainEntry()) {
   const log = makeChildLogger();
   const controller = new AbortController();
@@ -211,33 +264,7 @@ if (isMainEntry()) {
     });
   }
 
-  // Determine sync mode from CLI arg: --init for full harvest, default refresh
-  const args = process.argv.slice(2);
-  const mode = args.includes('--init') ? 'init' : 'refresh';
-
-  const cfg = getServerConfig();
-  if (!cfg.observationsMirrorEnabled) {
-    log.warning?.(
-      'Observations mirror not enabled (BLS_OBSERVATIONS_MIRROR_ENABLED=false); exiting',
-    );
-    process.exit(0);
-  }
-
-  getBlsObservationsService()
-    .runSync({ mode, signal: controller.signal })
-    .then((result) => {
-      log.info?.('Observations sync complete', {
-        pagesFetched: result.pagesFetched,
-        recordsApplied: result.recordsApplied,
-        tombstonesApplied: result.tombstonesApplied,
-        total: result.total,
-      });
-      process.exit(0);
-    })
-    .catch((err: unknown) => {
-      log.error?.('Observations sync failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      process.exit(1);
-    });
+  void runObservationsChildSync(process.argv.slice(2), log, controller.signal).then((code) => {
+    process.exit(code);
+  });
 }

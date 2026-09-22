@@ -1,10 +1,10 @@
 /**
  * @fileoverview Tests for the LABSTAT observation ingester — tab-delimited parsing,
- * readme discovery, cursor encoding, page batching, and the canonical survey list.
+ * index discovery, cursor encoding, page batching, and the canonical survey list.
  * @module tests/services/bls-observations/ingester.test
  */
 
-import type { SyncContext } from '@cyanheads/mcp-ts-core/mirror';
+import type { MirrorLogger, SyncContext } from '@cyanheads/mcp-ts-core/mirror';
 import { describe, expect, it, vi } from 'vitest';
 import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
 import { observationsSync } from '@/services/bls-observations/ingester.js';
@@ -21,35 +21,47 @@ const DATA_FILE_CONTENT = [
   'CES0000000001\t2024\tM12\t159367\t',
 ].join('\n');
 
-/** README content listing two data files. */
-const README_WITH_TWO_FILES = `
+/** Index content listing two data files in the older documentation shape. */
+const INDEX_WITH_TWO_FILES = `
 Name of file:  cu.data.1.AllItems
 Name of file:  cu.data.2.Seasonally Adjusted Average
 `;
 
-/** README content with no data file references. */
-const README_WITH_NO_FILES = `
+/** Index content with no data file references. */
+const INDEX_WITH_NO_FILES = `
 This survey has no observation data files in LABSTAT.
 `;
 
-/** README that lists a file in a different format. */
-const README_ALT_FORMAT = `
+/** Index that lists a file as a bare name. */
+const INDEX_ALT_FORMAT = `
 cu.data.0.AllData
 `;
 
-/** Data file with a '-' value that should be skipped. */
-const DATA_FILE_WITH_NULL = [
-  'series_id\tyear\tperiod\tvalue\tfootnote_codes',
-  'LNS14000000\t2024\tM12\t4.1\t',
-  'LNS14000000\t2024\tM11\t-\t', // null value — should be skipped
-  'LNS14000000\t2024\tM10\t4.3\t',
+/** The `{abbr}.txt` directory index LABSTAT publishes for every survey. */
+const CU_INDEX = [
+  '/pub/time.series/cu/',
+  '',
+  '01/15/2026  08:30 AM        12345 cu.contacts',
+  '01/15/2026  08:30 AM     98765432 cu.data.0.Current',
+  '01/15/2026  08:30 AM    123456789 cu.data.1.AllItems',
+  '01/15/2026  08:30 AM      9876543 cu.series',
 ].join('\n');
 
-/** Data file missing the footnote_codes column (optional). */
+/** Data file mixing the BLS '-' sentinel with a malformed empty-value row. */
+const DATA_FILE_WITH_SENTINEL = [
+  'series_id\tyear\tperiod\tvalue\tfootnote_codes',
+  'LNS14000000\t2024\tM12\t4.1\t',
+  'LNS14000000\t2024\tM11\t-\t9', // BLS missing-value sentinel — published, stored verbatim
+  'LNS14000000\t2024\tM10\t\t', // empty value cell — malformed, skipped
+  'LNS14000000\t2024\tM09\t4.3\t',
+].join('\n');
+
+/** Data file missing the footnote_codes column (optional), including a sentinel row. */
 const DATA_FILE_NO_FOOTNOTES = [
   'series_id\tyear\tperiod\tvalue',
   'LNS14000000\t2024\tM12\t4.1',
   'LNS14000000\t2024\tM11\t4.2',
+  'LNS14000000\t2024\tM10\t-',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -64,16 +76,55 @@ function makeCtx(overrides: Partial<SyncContext> = {}): SyncContext {
   };
 }
 
+/** Collect the warnings the ingester emits, so a skipped survey is observable. */
+function recordingLog(): MirrorLogger & { warnings: string[] } {
+  const warnings: string[] = [];
+  return {
+    warnings,
+    warning: (message, meta) => {
+      warnings.push(`${message} ${JSON.stringify(meta ?? {})}`);
+    },
+  };
+}
+
+/** Serve one index + one data file for every survey; everything else 404s. */
+function stubDataFile(content: string): void {
+  vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+    const u = String(url);
+    const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
+    if (u.endsWith('.txt')) {
+      return Promise.resolve(new Response('cu.data.1.AllItems\n', { status: 200, headers }));
+    }
+    if (u.includes('.data.')) {
+      return Promise.resolve(new Response(content, { status: 200, headers }));
+    }
+    return Promise.resolve(new Response('', { status: 404 }));
+  });
+}
+
+/** Drain the first non-empty page and return the rows belonging to one series. */
+async function collectSeriesRows(seriesId: string): Promise<Record<string, unknown>[]> {
+  let records: Record<string, unknown>[] = [];
+  for await (const page of observationsSync(makeCtx(), {
+    catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+    userAgent: 'test-agent',
+  })) {
+    records = page.records as Record<string, unknown>[];
+    if (records.length > 0) break;
+  }
+  return records.filter((r) => r.series_id === seriesId);
+}
+
 // ---------------------------------------------------------------------------
-// Tests — README parsing (via the ingester's behaviour with mocked fetch)
+// Tests — row parsing (via the ingester's behaviour with mocked fetch)
 // ---------------------------------------------------------------------------
 
 describe('observationsSync — tab-delimited parsing', () => {
   it('parses a well-formed data file into correct ObservationRow fields', async () => {
-    // Mock: readme → one file, data file → DATA_FILE_CONTENT
+    // Mock: index → one file, data file → DATA_FILE_CONTENT
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes('.readme')) {
+      if (u.endsWith('.txt')) {
         return Promise.resolve(
           new Response('cu.data.1.AllItems\n', {
             status: 200,
@@ -117,50 +168,50 @@ describe('observationsSync — tab-delimited parsing', () => {
     expect(typeof row.footnote_codes).toBe('string');
   });
 
-  it('skips rows with a null "-" value', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.includes('.readme')) {
-        return Promise.resolve(
-          new Response('cu.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_WITH_NULL, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
+  it('stores the BLS "-" sentinel row with its footnote code (#58)', async () => {
+    // The sentinel is a published observation: BLS says "this period has no
+    // figure" and footnotes why. Dropping it makes the period indistinguishable
+    // from one BLS never published, and the mirror can never answer
+    // `available: false` the way the live path does.
+    stubDataFile(DATA_FILE_WITH_SENTINEL);
+
+    const lnsRows = await collectSeriesRows('LNS14000000');
+
+    expect(lnsRows.find((r) => r.period === 'M11')).toEqual({
+      row_key: 'LNS14000000|2024|M11',
+      series_id: 'LNS14000000',
+      year: '2024',
+      period: 'M11',
+      value: '-',
+      footnote_codes: '9',
     });
+  });
 
-    const ctx = makeCtx();
-    let allRecords: Record<string, unknown>[] = [];
+  it('skips a row whose value cell is empty (#58)', async () => {
+    // A malformed row is not a published sentinel.
+    stubDataFile(DATA_FILE_WITH_SENTINEL);
 
-    for await (const page of observationsSync(ctx, {
-      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
-      userAgent: 'test-agent',
-    })) {
-      allRecords = [...allRecords, ...(page.records as Record<string, unknown>[])];
-      if (allRecords.length > 0) break;
-    }
+    const lnsRows = await collectSeriesRows('LNS14000000');
 
-    // Should have 2 rows (M12 and M10), not 3 (M11 has '-' value)
-    const lnsRows = allRecords.filter((r) => r.series_id === 'LNS14000000');
-    const periodM11 = lnsRows.find((r) => r.period === 'M11');
-    expect(periodM11).toBeUndefined();
-    expect(lnsRows.length).toBe(2);
+    expect(lnsRows.find((r) => r.period === 'M10')).toBeUndefined();
+    expect(lnsRows.map((r) => r.period)).toEqual(['M12', 'M11', 'M09']);
+  });
+
+  it('stores a sentinel row with empty footnote_codes when the column is absent (#58)', async () => {
+    stubDataFile(DATA_FILE_NO_FOOTNOTES);
+
+    const lnsRows = await collectSeriesRows('LNS14000000');
+
+    expect(lnsRows.find((r) => r.period === 'M10')).toMatchObject({
+      value: '-',
+      footnote_codes: '',
+    });
   });
 
   it('handles data files without footnote_codes column', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes('.readme')) {
+      if (u.endsWith('.txt')) {
         return Promise.resolve(
           new Response('cu.data.1.AllItems\n', {
             status: 200,
@@ -199,7 +250,7 @@ describe('observationsSync — tab-delimited parsing', () => {
   it('generates composite row_key as series_id|year|period', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes('.readme')) {
+      if (u.endsWith('.txt')) {
         return Promise.resolve(
           new Response('cu.data.1.AllItems\n', {
             status: 200,
@@ -233,64 +284,57 @@ describe('observationsSync — tab-delimited parsing', () => {
     expect(lnsRow?.row_key).toBe('LNS14000000|2024|M12');
   });
 
-  it('gracefully skips a survey whose readme fetch returns 404', async () => {
-    // Return 404 for the first survey (cu), but serve data for the second
-    const surveysSeen: string[] = [];
+  it('warns on a survey whose index fetch returns 404 and harvests the next one', async () => {
+    // 404 the first survey's index (cu); the second (ap) serves its own.
+    const second = SURVEY_ABBRS[1]!;
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
+      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
       if (u.includes('/cu/')) {
-        surveysSeen.push('cu');
         return Promise.resolve(new Response('', { status: 404 }));
       }
-      if (u.includes('.readme')) {
+      if (u.endsWith(`/${second}/${second}.txt`)) {
         return Promise.resolve(
-          new Response('sa.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
+          new Response(`${second}.data.1.AllItems\n`, { status: 200, headers }),
         );
       }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
+      if (u.includes(`/${second}/`) && u.includes('.data.')) {
+        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
       }
       return Promise.resolve(new Response('', { status: 404 }));
     });
 
-    const ctx = makeCtx();
+    const log = recordingLog();
     const pages: unknown[] = [];
 
-    // Should not throw even when cu readme returns 404
-    for await (const page of observationsSync(ctx, {
+    for await (const page of observationsSync(makeCtx(), {
       catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
       userAgent: 'test-agent',
+      log,
     })) {
       pages.push(page);
-      if (pages.length >= 3) break; // enough to validate no throw
+      if (pages.length >= 1) break;
     }
 
-    // No error thrown — graceful degradation
-    expect(true).toBe(true);
+    // The unreachable survey is reported, not passed over in silence.
+    expect(log.warnings.some((w) => w.includes('"survey":"cu"'))).toBe(true);
+    expect(pages).toHaveLength(1);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests — readme data-file discovery
+// Tests — index data-file discovery
 // ---------------------------------------------------------------------------
 
-describe('observationsSync — readme data-file discovery', () => {
+describe('observationsSync — index data-file discovery', () => {
   /** Run the sync against the cu survey, capturing the data-file URLs fetched. */
-  async function captureDataUrls(readme: string): Promise<string[]> {
+  async function captureDataUrls(index: string, log?: MirrorLogger): Promise<string[]> {
     const fetchedDataUrls: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes('/cu/') && u.includes('.readme')) {
+      if (u.endsWith('/cu/cu.txt')) {
         return Promise.resolve(
-          new Response(readme, {
+          new Response(index, {
             status: 200,
             headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
           }),
@@ -312,26 +356,95 @@ describe('observationsSync — readme data-file discovery', () => {
     for await (const _page of observationsSync(ctx, {
       catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
       userAgent: 'test-agent',
+      ...(log && { log }),
     })) {
       if (fetchedDataUrls.length >= 2) break; // cu is the first survey
     }
     return fetchedDataUrls;
   }
 
-  it('discovers multiple data files from a "Name of file:" readme', async () => {
-    const urls = await captureDataUrls(README_WITH_TWO_FILES);
+  it('discovers multiple data files from a "Name of file:" index', async () => {
+    const urls = await captureDataUrls(INDEX_WITH_TWO_FILES);
     expect(urls.some((u) => u.includes('cu.data.1.allitems'))).toBe(true);
     expect(urls.some((u) => u.includes('cu.data.2'))).toBe(true);
   });
 
-  it('falls back to the default data file when the readme lists none', async () => {
-    const urls = await captureDataUrls(README_WITH_NO_FILES);
-    expect(urls.some((u) => u.includes('cu.data.1.alldata'))).toBe(true);
+  it('warns and fetches nothing when the index lists no data files', async () => {
+    // No guessed filename: `{abbr}.data.1.AllData` exists for 5 of the 13
+    // harvested surveys, so requesting it for the rest only 404s.
+    const log = recordingLog();
+    const urls = await captureDataUrls(INDEX_WITH_NO_FILES, log);
+    expect(urls).toHaveLength(0);
+    expect(log.warnings.some((w) => w.includes('"survey":"cu"'))).toBe(true);
   });
 
-  it('discovers a bare-filename data file from an alternate readme format', async () => {
-    const urls = await captureDataUrls(README_ALT_FORMAT);
+  it('discovers a bare-filename data file from an alternate index format', async () => {
+    const urls = await captureDataUrls(INDEX_ALT_FORMAT);
     expect(urls.some((u) => u.includes('cu.data.0.alldata'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — the `{abbr}.txt` index is the only published file list
+// ---------------------------------------------------------------------------
+
+describe('observationsSync — {abbr}.txt index (#78)', () => {
+  it('reads the data-file list from the survey index', async () => {
+    // LABSTAT serves no `{abbr}.readme`; the index every survey publishes is
+    // `{abbr}.txt`. Reading the wrong name left 8 of 13 surveys unharvested
+    // while the sync still reported success.
+    const fetched: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = String(url);
+      fetched.push(u.toLowerCase());
+      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
+      if (u.endsWith('/cu/cu.txt')) {
+        return Promise.resolve(new Response(CU_INDEX, { status: 200, headers }));
+      }
+      if (u.includes('/cu/') && u.includes('.data.')) {
+        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const log = recordingLog();
+    for await (const _page of observationsSync(makeCtx(), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+      log,
+    })) {
+      if (fetched.some((u) => u.includes('cu.data.1.allitems'))) break;
+    }
+
+    expect(fetched).toContain('https://download.bls.gov/pub/time.series/cu/cu.txt');
+    expect(fetched.some((u) => u.includes('cu.data.0.current'))).toBe(true);
+    expect(fetched.some((u) => u.includes('cu.data.1.allitems'))).toBe(true);
+    expect(fetched.some((u) => u.includes('cu.readme'))).toBe(false);
+  });
+
+  it('warns and harvests nothing when a survey yields no data files', async () => {
+    // Guessing `{abbr}.data.1.AllData` is wrong for most surveys, and a silent
+    // fall-through reports an empty survey as a harvested one.
+    const fetched: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      fetched.push(String(url).toLowerCase());
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const log = recordingLog();
+    const pages: unknown[] = [];
+    for await (const page of observationsSync(makeCtx(), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+      log,
+    })) {
+      pages.push(page);
+    }
+
+    expect(pages).toHaveLength(0);
+    expect(fetched.some((u) => u.includes('cu.data.1.alldata'))).toBe(false);
+    expect(log.warnings.some((w) => w.includes('cu'))).toBe(true);
+    expect(log.warnings).toHaveLength(SURVEY_ABBRS.length);
   });
 });
 
@@ -343,7 +456,7 @@ describe('observationsSync — cursor and checkpoint', () => {
   it('checkpoint is an ISO 8601 string derived from Last-Modified', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes('.readme')) {
+      if (u.endsWith('.txt')) {
         return Promise.resolve(
           new Response('cu.data.1.AllItems\n', {
             status: 200,
@@ -390,7 +503,7 @@ describe('observationsSync — cursor and checkpoint', () => {
     const lastAbbr = SURVEY_ABBRS.at(-1);
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      if (u.includes(`/${lastAbbr}/`) && u.includes('.readme')) {
+      if (u.endsWith(`/${lastAbbr}/${lastAbbr}.txt`)) {
         return Promise.resolve(
           new Response(`${lastAbbr}.data.1.AllData\n`, {
             status: 200,

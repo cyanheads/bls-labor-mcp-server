@@ -1,8 +1,8 @@
 /**
  * @fileoverview LABSTAT observation ingester — the `sync` generator for the
  * BLS observations mirror. For each surveyed abbreviation it discovers data
- * files by parsing the survey's `{abbr}.readme`, fetches them, parses the
- * tab-delimited rows, and yields pages for the framework's runner.
+ * files by parsing the survey's `{abbr}.txt` directory index, fetches them,
+ * parses the tab-delimited rows, and yields pages for the framework's runner.
  *
  * Checkpoint: ISO 8601 datestamp of the last `Last-Modified` response header
  * seen (lexicographically monotonic). On a `refresh` run the checkpoint seeds
@@ -12,7 +12,7 @@
  * @module services/bls-observations/ingester
  */
 
-import type { MirrorRow, SyncContext, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
+import type { MirrorLogger, MirrorRow, SyncContext, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
 import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { ObservationRow } from './types.js';
 
@@ -24,9 +24,6 @@ const FETCH_TIMEOUT_MS = 30_000;
 
 /** Retry budget for a single HTTP fetch (3 attempts, linear backoff). */
 const MAX_FETCH_ATTEMPTS = 3;
-
-/** Min value string that represents an actual number (excludes '-'). */
-const NULL_VALUE = '-';
 
 // ---------------------------------------------------------------------------
 // Cursor encoding — `{abbrIndex}:{fileIndex}:{rowOffset}`
@@ -102,22 +99,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// README parser — discovers data file names in `{abbr}.readme`
+// Index parser — discovers data file names in `{abbr}.txt`
 // ---------------------------------------------------------------------------
 
 /**
- * Parse `{abbr}.readme` text to extract the list of `{abbr}.data.*` filenames.
- * The readme lists files in a section that begins with lines like:
+ * Parse `{abbr}.txt` text to extract the list of `{abbr}.data.*` filenames.
+ * The index is a directory listing, one file per line alongside its size and
+ * timestamp:
+ *   01/15/2026  08:30 AM    123456789 cu.data.1.AllItems
+ * Older survey documentation wrote the same names as:
  *   Name of file:  cu.data.1.AllItems
- * or in some surveys:
- *   cu.data.0.AllData
- * We look for any token that starts with `{abbr}.data.`.
+ * We look for any token that starts with `{abbr}.data.`, so both shapes match.
  */
-function parseReadmeDataFiles(readmeText: string, abbr: string): string[] {
+function parseIndexDataFiles(indexText: string, abbr: string): string[] {
   const prefix = `${abbr}.data.`;
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const line of readmeText.split('\n')) {
+  for (const line of indexText.split('\n')) {
     // Find any token on the line that looks like {abbr}.data.{...}
     const matches = line.match(new RegExp(`${abbr}\\.data\\.\\S+`, 'gi'));
     if (matches) {
@@ -145,6 +143,7 @@ function parseReadmeDataFiles(readmeText: string, abbr: string): string[] {
  * Expected header (tab-delimited):
  *   series_id  year  period  value  footnote_codes
  * The footnote_codes column is optional and may be absent entirely.
+ * Values are stored verbatim, the `-` missing-value sentinel included.
  */
 function parseDataFile(text: string, startRow: number): ObservationRow[] {
   const lines = text.split('\n');
@@ -171,9 +170,13 @@ function parseDataFile(text: string, startRow: number): ObservationRow[] {
     const period = parts[colPeriod]?.trim();
     const value = parts[colValue]?.trim();
 
+    /**
+     * An empty cell is a malformed row and is dropped. The BLS `-` sentinel is
+     * not: it is a published observation saying the period has no figure, with
+     * a footnote for why. Stored verbatim, it reaches the shared normalization
+     * as `available: false` — the same answer the live API gives.
+     */
     if (!series_id || !year || !period || !value) continue;
-    // Skip rows with no meaningful value
-    if (value === NULL_VALUE) continue;
 
     const footnote_codes = colFootnote >= 0 ? (parts[colFootnote]?.trim() ?? '') : '';
     const row_key = `${series_id}|${year}|${period}`;
@@ -192,6 +195,12 @@ function parseDataFile(text: string, startRow: number): ObservationRow[] {
  */
 export interface IngesterOptions {
   catalogBaseUrl: string;
+  /**
+   * Sink for the harvest's own records. A sync runs outside the request
+   * pipeline, so there is no `ctx.log` to reach for; the service supplies the
+   * same duck-typed logger shape the framework runner consumes.
+   */
+  log?: MirrorLogger;
   userAgent: string;
 }
 
@@ -211,7 +220,7 @@ export async function* observationsSync(
   opts: IngesterOptions,
 ): AsyncGenerator<SyncPage> {
   const { mode, cursor: rawCursor, checkpoint: priorCheckpoint, signal } = ctx;
-  const { catalogBaseUrl, userAgent } = opts;
+  const { catalogBaseUrl, userAgent, log } = opts;
 
   // Decode intra-run resume cursor (init mode only)
   const resume: IngestCursor =
@@ -226,17 +235,26 @@ export async function* observationsSync(
     if (abbrIdx < resume.abbrIdx) continue;
     const baseDir = `${catalogBaseUrl}/${abbr}`;
 
-    // Discover data files from the readme
-    const readmeResult = await fetchText(`${baseDir}/${abbr}.readme`, userAgent, signal);
+    // Discover data files from the survey's directory index
+    const indexUrl = `${baseDir}/${abbr}.txt`;
+    const indexResult = await fetchText(indexUrl, userAgent, signal);
     if (signal.aborted) break;
 
-    let dataFiles: string[] = [];
-    if (readmeResult) {
-      dataFiles = parseReadmeDataFiles(readmeResult.text, abbr);
-    }
-    // Fallback: try the canonical single-file name that many surveys use
+    const dataFiles = indexResult ? parseIndexDataFiles(indexResult.text, abbr) : [];
+    /**
+     * The index is the only published list of a survey's data files, and the
+     * names differ per survey — guessing one would harvest the wrong file for
+     * most of them. A survey that yields none is reported rather than passed
+     * over: without this the sync exits 0 and the mirror answers every request
+     * for that survey as a miss.
+     */
     if (dataFiles.length === 0) {
-      dataFiles = [`${abbr}.data.1.AllData`];
+      log?.warning?.('Survey skipped — no data files listed in its index', {
+        survey: abbr,
+        indexUrl,
+        indexFetched: indexResult !== null,
+      });
+      continue;
     }
 
     const startFileIdx = abbrIdx === resume.abbrIdx ? resume.fileIdx : 0;

@@ -33,7 +33,7 @@ import {
   shutdownBlsObservationsService,
 } from '@/services/bls-observations/bls-observations-service.js';
 
-/** `init*` takes the core handles positionally and reads neither. */
+/** `initBlsCatalogService` takes the core handles positionally and reads neither. */
 const coreConfig = {} as AppConfig;
 const coreStorage = {} as StorageService;
 
@@ -74,7 +74,7 @@ describe('shutdownBlsObservationsService', () => {
   it('closes the mirror and clears the accessor when the mirror is enabled', async () => {
     vi.stubEnv('BLS_OBSERVATIONS_MIRROR_ENABLED', 'true');
     resetServerConfig();
-    initBlsObservationsService(coreConfig, coreStorage);
+    initBlsObservationsService();
     expect(isBlsObservationsServiceReady()).toBe(true);
 
     await shutdownBlsObservationsService();
@@ -88,7 +88,7 @@ describe('shutdownBlsObservationsService', () => {
     // to close and must not raise on the way out.
     vi.stubEnv('BLS_OBSERVATIONS_MIRROR_ENABLED', 'false');
     resetServerConfig();
-    initBlsObservationsService(coreConfig, coreStorage);
+    initBlsObservationsService();
     expect(isBlsObservationsServiceReady()).toBe(false);
 
     await expect(shutdownBlsObservationsService()).resolves.toBeUndefined();
