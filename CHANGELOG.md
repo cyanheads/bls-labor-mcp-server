@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.6](changelog/0.5.x/0.5.6.md) — 2026-09-23
+
+bls_get_series and bls_get_latest keep the series already answered when a live fallback fails or BLS sends its generic rejection, and canvas dataframes carry declared or canvas-reported column types and survive a failed drop.
+
 ## [0.5.5](changelog/0.5.x/0.5.5.md) — 2026-09-23 · 🛡️ Security
 
 The catalog index now refreshes hourly and drops retired series, indexes the current ECEC (CM) and ECI (CI) surveys, and labels publication frequency; bls_search_series matches at word starts and bounds the cost of long queries.

@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-09-24 03:46:01
+Generated on: 2026-09-24 06:29:54
 
 ```text
 bls-labor-mcp-server/
@@ -172,6 +172,9 @@ bls-labor-mcp-server/
 │   │       └── canvas-bridge.ts
 │   └── index.ts
 ├── tests/
+│   ├── fixtures/
+│   │   ├── bls-live-responses.ts
+│   │   └── duckdb-canvas.ts
 │   ├── integration/
 │   ├── prompts/
 │   ├── resources/
@@ -196,10 +199,12 @@ bls-labor-mcp-server/
 │   │   │   └── canvas-bridge.test.ts
 │   │   └── service-shutdown.test.ts
 │   ├── tools/
+│   │   ├── bls-data-tools.service.test.ts
 │   │   ├── bls-dataframe-describe.tool.test.ts
 │   │   ├── bls-dataframe-drop.tool.test.ts
 │   │   ├── bls-dataframe-query.tool.test.ts
 │   │   ├── bls-get-latest.tool.test.ts
+│   │   ├── bls-get-series.canvas.test.ts
 │   │   ├── bls-get-series.tool.test.ts
 │   │   ├── bls-list-surveys.tool.test.ts
 │   │   ├── bls-search-series.catalog.test.ts
