@@ -6,19 +6,25 @@
  * (the framework's FTS5-capable `sqliteMirrorStore`). Search runs as an FTS5
  * candidate query rescored by a bespoke relevance function — the index lives on
  * disk, not the JS heap, so large surveys do not inflate memory. No API quota is
- * consumed; the BLS FAQ confirms there is no API catalog endpoint.
+ * consumed; the BLS FAQ confirms there is no API catalog endpoint. An hourly
+ * scheduler job re-harvests the index once its TTL lapses, so a long-running
+ * process stays current without a restart.
  * @module services/bls-catalog/bls-catalog-service
  */
 
+import { setImmediate as nextTurn, setTimeout as sleep } from 'node:timers/promises';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { internalError } from '@cyanheads/mcp-ts-core/errors';
 import {
   type MirrorRow,
   type MirrorStore,
+  type SqliteHandle,
   type SqlValue,
+  type SyncState,
   sqliteMirrorStore,
 } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
+import { schedulerService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
   CatalogSearchInput,
@@ -37,12 +43,20 @@ function dim(table: string, ...key: string[]): CodeDimension {
  * Surveys fetched at startup. Chosen to cover >95% of real-world queries.
  * Each entry maps the LABSTAT file abbreviation to its program name and the
  * `.series` columns decoded through companion code tables: `area` and `item`
- * for every row, `title` for surveys whose `.series` file ships no
- * `series_title` (JT, EC, PR). Only the tables these dimensions name are
+ * for every row, `frequency` for surveys that publish one series at several
+ * frequencies under the same `series_title` (CU and CW monthly/semiannual, LN
+ * monthly/quarterly/annual), and `title` for surveys whose `.series` file ships
+ * no `series_title` (JT, EC, PR). Only the tables these dimensions name are
  * fetched, and each exists in the survey's LABSTAT directory.
  */
 const SURVEYS: SurveyDefinition[] = [
-  { abbr: 'cu', name: 'CPI - All Urban Consumers', area: dim('area'), item: dim('item') },
+  {
+    abbr: 'cu',
+    name: 'CPI - All Urban Consumers',
+    area: dim('area'),
+    item: dim('item'),
+    frequency: dim('periodicity'),
+  },
   {
     abbr: 'ap',
     name: 'Consumer Price Index - Average Price Data',
@@ -50,7 +64,7 @@ const SURVEYS: SurveyDefinition[] = [
     item: dim('item'),
   },
   { abbr: 'ce', name: 'CES - Employment, Hours, and Earnings', item: dim('industry') },
-  { abbr: 'ln', name: 'CPS - Labor Force Statistics' },
+  { abbr: 'ln', name: 'CPS - Labor Force Statistics', frequency: dim('periodicity') },
   /**
    * No `item`: every LAUS title already opens with its measure ("Unemployment
    * Rate: Texas (S)"), and repeating it in `item_name` lifts ~8K state and local
@@ -103,7 +117,21 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'CPI-W - Urban Wage Earners and Clerical Workers',
     area: dim('area'),
     item: dim('item'),
+    frequency: dim('periodicity'),
   },
+  /**
+   * The current compensation-cost surveys, which replaced EC. Both ship
+   * `series_title`; the estimate (total compensation, wages and salaries, a
+   * benefit) is the item. CI's `periodicity_code` names a measure (index,
+   * 12-month percent change), already in its titles, so it is not a frequency.
+   */
+  {
+    abbr: 'cm',
+    name: 'ECEC - Employer Costs for Employee Compensation',
+    area: dim('area'),
+    item: dim('estimate'),
+  },
+  { abbr: 'ci', name: 'ECI - Employment Cost Index', area: dim('area'), item: dim('estimate') },
 ];
 
 /**
@@ -118,11 +146,29 @@ export const SURVEY_ABBRS: readonly string[] = SURVEYS.map((s) => s.abbr);
 /**
  * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.2 GB, 32× every
  * other survey combined. It is excluded from the catalog unless explicitly opted
- * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~160K
+ * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~170K
  * series), the first harvest fast, and on-disk size modest. OES series remain
  * fetchable by ID via bls_get_series; they are simply not in the search index.
  */
 export const OES_SURVEY_ABBR = 'oe';
+
+/** The surveys a harvest fetches: every `SURVEYS` entry, less OES unless opted in. */
+function configuredSurveys(includeOes: boolean): SurveyDefinition[] {
+  return includeOes ? SURVEYS : SURVEYS.filter((s) => s.abbr !== OES_SURVEY_ABBR);
+}
+
+/**
+ * The configured survey list as a completed harvest persists it in the sync
+ * state's `checkpoint`: the harvested abbreviations in `SURVEYS` order,
+ * comma-joined. `load()` treats an index whose stored list is missing or
+ * different as stale, so a changed `BLS_CATALOG_INCLUDE_OES` or survey set
+ * re-harvests on the next boot even inside the TTL.
+ */
+export function catalogSurveyList(includeOes: boolean): string {
+  return configuredSurveys(includeOes)
+    .map((s) => s.abbr)
+    .join(',');
+}
 
 /** Known common series to boost in search rankings. */
 const COMMON_SERIES: Record<string, string> = {
@@ -136,6 +182,28 @@ const COMMON_SERIES: Record<string, string> = {
   LNS12000000: 'civilian employment level',
 };
 
+const WORD_CHAR = /\w/;
+
+/**
+ * Whether `needle` occurs in `text` where a word starts: at the start of `text`
+ * or after a character that is not a letter, digit, or underscore (a needle
+ * opening on punctuation matches anywhere). Its end may run on into the word,
+ * so `payroll` matches "payrolls" and `manufactur` "manufacturing", but `all`
+ * never matches inside "seasonally". The concept aliases and the rescore share
+ * it. A literal scan rather than a `RegExp` built from caller text, which V8
+ * refuses to compile past ~32K characters. Callers pair long text with a short
+ * needle (a query against an alias phrase) or a long needle with short text (a
+ * query against a title), and both stay linear.
+ */
+export function startsWord(text: string, needle: string): boolean {
+  if (!needle) return false;
+  const anywhere = !WORD_CHAR.test(needle[0] ?? '');
+  for (let i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1)) {
+    if (anywhere || i === 0 || !WORD_CHAR.test(text[i - 1] ?? '')) return true;
+  }
+  return false;
+}
+
 /**
  * Concept/synonym → survey code(s). Canonical economic vocabulary often names a
  * survey by a word its series titles never contain (BLS titles never say
@@ -144,6 +212,10 @@ const COMMON_SERIES: Record<string, string> = {
  * phrases, the matching surveys' candidates get a relevance boost in the rescore —
  * combined with the always-unioned COMMON_SERIES, this floats the headline series
  * to the top. Codes are uppercase to match the stored `survey_abbr`.
+ *
+ * A phrase matches where a word starts (`startsWord`), and its end may run
+ * on into the word: `ppi` never fires inside "shopping", while `job vacanc`
+ * matches "job vacancies" and `payroll` matches "payrolls".
  */
 const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: readonly string[] }> = [
   { phrases: ['inflation', 'cost of living', 'consumer price', 'cpi'], surveys: ['CU'] },
@@ -152,8 +224,43 @@ const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: read
   { phrases: ['job opening', 'labor turnover', 'job vacanc', 'quits', 'jolts'], surveys: ['JT'] },
   { phrases: ['unemployment', 'jobless', 'labor force participation'], surveys: ['LN'] },
   { phrases: ['productivity', 'output per hour'], surveys: ['PR', 'MP'] },
-  { phrases: ['compensation', 'employer cost'], surveys: ['EC'] },
+  /** No CI title says "cost", and no CM or CI title says "employer". */
+  { phrases: ['compensation', 'employer cost', 'ecec'], surveys: ['CM', 'CI'] },
+  /** Safe only at a word start: "eci" sits inside "special", "decision", "precision". */
+  { phrases: ['employment cost index', 'eci'], surveys: ['CI'] },
 ];
+
+/**
+ * Survey codes whose concept aliases the lowercased `query` names. One linear
+ * scan per alias phrase over caller text.
+ */
+export function conceptAliasSurveys(query: string): Set<string> {
+  const surveys = new Set<string>();
+  for (const alias of CONCEPT_ALIASES) {
+    if (alias.phrases.some((p) => startsWord(query, p))) {
+      for (const s of alias.surveys) surveys.add(s);
+    }
+  }
+  return surveys;
+}
+
+/**
+ * Frequency words a query can name, as whole words. `annual` is deliberately
+ * absent: it names the annual-average period (M13) that monthly series carry
+ * too, and matching it would also lift annual-only CPS series over the
+ * canonical monthly ones.
+ */
+const FREQUENCY_WORDS = /\b(?:monthly|quarterly|semi[- ]?annual)\b/g;
+
+/** A frequency word or label reduced to its letters: `Semi-Annual` → `semiannual`. */
+function frequencyKey(text: string): string {
+  return text.toLowerCase().replace(/[^a-z]/g, '');
+}
+
+/** The publication frequencies the lowercased `query` names, as `frequencyKey`s. */
+export function queryFrequencies(query: string): Set<string> {
+  return new Set(query.match(FREQUENCY_WORDS)?.map(frequencyKey));
+}
 
 /** Relevance boost for a candidate whose survey matches a query concept alias. */
 const ALIAS_SURVEY_BOOST = 6;
@@ -161,11 +268,41 @@ const ALIAS_SURVEY_BOOST = 6;
 /** Max surveys fetched concurrently during a harvest. Keeps the request burst small. */
 const SURVEY_FETCH_CONCURRENCY = 3;
 
-/** Rows per SQLite upsert transaction during a harvest. Bounds the write batch size. */
-const UPSERT_CHUNK_SIZE = 5_000;
+/**
+ * Rows per SQLite transaction during a harvest, upserts and deletes alike. The
+ * driver is synchronous, so this bounds how long one write holds the event
+ * loop; the harvest yields a turn between chunks so searches interleave.
+ */
+const HARVEST_CHUNK_SIZE = 5_000;
+
+/** Scheduler job id of the hourly catalog refresh. */
+export const CATALOG_REFRESH_JOB_ID = 'bls-catalog-refresh';
+
+/** Top of every hour. */
+const CATALOG_REFRESH_CRON = '0 * * * *';
 
 /** Max FTS candidates pulled before the bespoke rescore. Generous so `total` stays accurate. */
 const CANDIDATE_LIMIT = 1_000;
+
+/**
+ * Distinct query tokens the FTS match and the token rescore use; later ones
+ * are ignored there (the full-query, alias, and frequency checks still read the
+ * whole query, in linear time). Each token is an FTS prefix term run
+ * synchronously against SQLite, so search cost grows with this count, not with
+ * query length. On the 2026-09-23 index the costliest 32 distinct tokens
+ * (single-letter prefixes) search in ~0.7–0.8 s, and each token past that would
+ * add ~5 ms. No title in that index holds more than 28 distinct tokens, so a
+ * pasted title is never cut.
+ */
+const MAX_QUERY_TOKENS = 32;
+
+/**
+ * An `area` longer than this is longer than any indexed title, area name, or
+ * SeriesID (≤ 242 characters on the 2026-09-23 files), so no row can contain
+ * it. The FTS query is skipped for it: SQLite rejects a `LIKE` pattern over
+ * 50,000 bytes.
+ */
+const MAX_AREA_LENGTH = 1_000;
 
 /** The catalog table; its FTS5 index is `${CATALOG_TABLE}_fts`. */
 const CATALOG_TABLE = 'bls_catalog';
@@ -176,11 +313,17 @@ const AREA_MATCH_COLUMNS = ['area_name', 'title', 'series_id'] as const;
 
 /**
  * The decoded area labels that mean "the whole country": the CPI/AP
- * `U.S. city average`, the JOLTS `Total US` state code, and the opt-in OEWS
- * `National` area. Rows carrying one, and rows with no decoded area (CE, LN,
- * and the other national surveys), are national for the rescore's tie-break.
+ * `U.S. city average`, the JOLTS `Total US` state code, the CM/CI
+ * `United States (National)` area, and the opt-in OEWS `National` area. Rows
+ * carrying one, and rows with no decoded area (CE, LN, and the other national
+ * surveys), are national for the rescore's tie-break.
  */
-const NATIONAL_AREAS: ReadonlySet<string> = new Set(['U.S. city average', 'Total US', 'National']);
+const NATIONAL_AREAS: ReadonlySet<string> = new Set([
+  'U.S. city average',
+  'Total US',
+  'United States (National)',
+  'National',
+]);
 
 /**
  * Escape `text` for a `LIKE … ESCAPE '\'` pattern so `%`, `_`, and `\` match
@@ -193,14 +336,17 @@ export function escapeLike(text: string): string {
 
 /**
  * Catalog index version. Bump it whenever the harvest's output changes (titles,
- * decoded area/item, the survey set) so an index persisted by an earlier
- * release re-harvests on its first boot after the upgrade. The migration clears
- * the completion marker — `writeState` cannot, since it COALESCEs
- * `completed_at` — so `load()` sees a stale index, keeps serving it, and
- * refreshes it. On a brand-new database the marker is already NULL.
+ * decoded area/item, columns) so an index persisted by an earlier release
+ * re-harvests on its first boot after the upgrade. A change to the configured
+ * survey set alone needs no bump: the persisted survey list
+ * (`catalogSurveyList`) already marks the index stale. The migration clears the
+ * completion marker — `writeState` cannot, since it COALESCEs `completed_at` —
+ * so `load()` sees a stale index, keeps serving it, and refreshes it. On a
+ * brand-new database the marker is already NULL.
  * Version 2: header-keyed code tables and synthesized JT/EC/PR titles.
+ * Version 3: the `frequency` column (CU, CW, LN) and the CM/CI surveys.
  */
-const CATALOG_INDEX_VERSION = 2;
+const CATALOG_INDEX_VERSION = 3;
 
 /** Code-table key (the key column values joined by a tab, which no field contains) → label. */
 type CodeLabels = Map<string, string>;
@@ -213,6 +359,26 @@ interface Decoder {
 
 function warn(message: string): void {
   process.stderr.write(`[bls-labor-mcp-server] Catalog: ${message}\n`);
+}
+
+/**
+ * Wait `ms` — or, with no `ms`, one event-loop turn — and throw the abort
+ * reason if `signal` aborts first.
+ */
+async function pause(signal: AbortSignal, ms?: number): Promise<void> {
+  const wait =
+    ms === undefined ? nextTurn(undefined, { signal }) : sleep(ms, undefined, { signal });
+  await wait.catch(() => signal.throwIfAborted());
+}
+
+/** Distinct survey codes in the index, sorted — a covering scan of the `survey_abbr` index. */
+function distinctSurveys(db: SqliteHandle): string[] {
+  return db
+    .prepare<{ survey_abbr: string }>(
+      `SELECT DISTINCT survey_abbr FROM ${CATALOG_TABLE} ORDER BY survey_abbr`,
+    )
+    .all()
+    .map((r) => r.survey_abbr);
 }
 
 /**
@@ -254,8 +420,14 @@ function decode(decoder: Decoder | undefined, parts: string[]): string | undefin
 
 /**
  * Parse a `.series` file into catalog entries, decoding each row's area, item,
- * and — when the row has no `series_title` — its synthesized title through the
- * survey's code tables (`tables`: table suffix → file text).
+ * frequency, and — when the row has no `series_title` — its synthesized title
+ * through the survey's code tables (`tables`: table suffix → file text). Two
+ * bodies yield no entries, so the survey keeps its indexed rows: one whose
+ * header has no `series_id` column (an HTML error page served with a 200), and
+ * one that ends mid-line. Every LABSTAT file ends in a line break; a
+ * close-delimited response cut short resolves with a partial body instead of
+ * rejecting, and parsing it would delete the missing tail and index the
+ * fragment of its last line.
  */
 function parseSeries(
   text: string,
@@ -264,9 +436,17 @@ function parseSeries(
 ): CatalogSeries[] {
   const lines = text.split('\n');
   if (lines.length < 2) return [];
+  if (lines.at(-1) !== '') {
+    warn(`${survey.abbr}.series ends mid-line — a truncated download; its indexed rows are kept.`);
+    return [];
+  }
 
   const header = splitFields(lines[0] ?? '', false).map((h) => h.toLowerCase());
-  const seriesIdCol = Math.max(header.indexOf('series_id'), 0);
+  const seriesIdCol = header.indexOf('series_id');
+  if (seriesIdCol < 0) {
+    warn(`${survey.abbr}.series has no series_id header column — its indexed rows are kept.`);
+    return [];
+  }
   const titleCol = header.indexOf('series_title');
   const seasonalCol = header.findIndex((h) => h.includes('seasonal'));
 
@@ -295,6 +475,7 @@ function parseSeries(
 
   const area = resolve(survey.area);
   const item = resolve(survey.item);
+  const frequencyDecoder = resolve(survey.frequency);
   const titleDecoders = survey.title ? survey.title.map(resolve) : [item, area];
   const surveyAbbr = survey.abbr.toUpperCase();
 
@@ -307,6 +488,7 @@ function parseSeries(
 
     const areaName = decode(area, parts);
     const itemName = decode(item, parts);
+    const frequency = decode(frequencyDecoder, parts);
     const title =
       (titleCol >= 0 ? parts[titleCol] : undefined) ||
       [survey.name, ...titleDecoders.map((d) => decode(d, parts))]
@@ -324,6 +506,7 @@ function parseSeries(
       surveyAbbr,
       ...(areaName && { areaName }),
       ...(itemName && { itemName }),
+      ...(frequency && { frequency }),
       seasonal,
     });
   }
@@ -339,6 +522,7 @@ function toRow(s: CatalogSeries): MirrorRow {
     area_name: s.areaName ?? null,
     item_name: s.itemName ?? null,
     seasonal: s.seasonal ? 1 : 0,
+    frequency: s.frequency ?? null,
   };
 }
 
@@ -350,26 +534,38 @@ function toCatalog(row: MirrorRow): CatalogSeries {
     surveyAbbr: row.survey_abbr as string,
     ...(row.area_name != null ? { areaName: row.area_name as string } : {}),
     ...(row.item_name != null ? { itemName: row.item_name as string } : {}),
+    ...(row.frequency != null ? { frequency: row.frequency as string } : {}),
     seasonal: row.seasonal === 1,
   };
 }
 
 /**
+ * The index-version migration. It runs after the declarative
+ * `CREATE TABLE IF NOT EXISTS`, which never alters an existing table: an index
+ * from an earlier release gains the `frequency` column here, while a brand-new
+ * database already has it. Then it clears the completion marker so the next
+ * `load()` re-harvests.
+ */
+function migrateCatalogIndex(db: SqliteHandle): void {
+  const columns = db.prepare<{ name: string }>(`PRAGMA table_info(${CATALOG_TABLE})`).all();
+  if (!columns.some((c) => c.name === 'frequency')) {
+    db.exec(`ALTER TABLE ${CATALOG_TABLE} ADD COLUMN frequency TEXT`);
+  }
+  db.exec('UPDATE mirror_sync_state SET completed_at = NULL WHERE id = 1');
+}
+
+/**
  * Build the SQLite-backed catalog store. The FTS5 index spans the text columns
  * the rescorer reads (series id, title, area, item); `survey_abbr`/`seasonal`
- * are indexed for the structured filters. Exported so tests can seed a store at
- * the same path/schema the service opens.
+ * are indexed for the structured filters. `frequency` is a plain column: FTS
+ * would let "annual" match "semi-annual" rows. Exported so tests can seed a
+ * store at the same path/schema the service opens.
  */
 export function createCatalogStore(dbPath: string): MirrorStore {
   return sqliteMirrorStore({
     path: dbPath || ':memory:',
     version: CATALOG_INDEX_VERSION,
-    migrations: [
-      {
-        version: CATALOG_INDEX_VERSION,
-        up: (db) => db.exec('UPDATE mirror_sync_state SET completed_at = NULL WHERE id = 1'),
-      },
-    ],
+    migrations: [{ version: CATALOG_INDEX_VERSION, up: migrateCatalogIndex }],
     table: CATALOG_TABLE,
     primaryKey: 'series_id',
     columns: {
@@ -379,6 +575,7 @@ export function createCatalogStore(dbPath: string): MirrorStore {
       area_name: 'TEXT',
       item_name: 'TEXT',
       seasonal: 'INTEGER',
+      frequency: 'TEXT',
     },
     fts: ['series_id', 'title', 'area_name', 'item_name'],
     indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
@@ -391,6 +588,13 @@ export class BlsCatalogService {
   private loadError: string | undefined;
   private cachedTotal = 0;
   private cachedSurveys: readonly string[] = [];
+  /** The surveys this deployment harvests, and their list as the sync state persists it. */
+  private readonly surveys: readonly SurveyDefinition[];
+  private readonly surveyList: string;
+  /** The running load, shared by every concurrent `load()` call. */
+  private inFlight: Promise<void> | undefined;
+  /** Aborted by `shutdown()`; every fetch, backoff, and write of a harvest observes it. */
+  private readonly stopping = new AbortController();
 
   constructor(
     private readonly catalogBaseUrl: string,
@@ -401,68 +605,76 @@ export class BlsCatalogService {
     readonly includeOes = false,
   ) {
     this.store = createCatalogStore(dbPath);
+    this.surveys = configuredSurveys(includeOes);
+    this.surveyList = catalogSurveyList(includeOes);
   }
 
   /**
    * Re-read the row total and the distinct survey codes from the index. Runs
-   * once per load and after each harvest — the index changes only then — so
-   * search never pays for it. The DISTINCT is a covering scan of
-   * `bls_catalog_survey_abbr_idx`. `count()` runs first so the store finishes
-   * opening inside its own call: a `shutdown()` racing a first load then
-   * cannot close the raw handle between `raw()` resolving and the query.
+   * on the first load and after each harvest — the index changes only then —
+   * so search never pays for it. `count()` runs first so the store finishes
+   * opening inside its own call, before `raw()` hands out the handle.
    */
   private async readIndexStats(): Promise<void> {
     this.cachedTotal = await this.store.count();
-    const db = await this.store.raw();
-    this.cachedSurveys = db
-      .prepare<{ survey_abbr: string }>(
-        `SELECT DISTINCT survey_abbr FROM ${CATALOG_TABLE} ORDER BY survey_abbr`,
-      )
-      .all()
-      .map((r) => r.survey_abbr);
+    this.cachedSurveys = distinctSurveys(await this.store.raw());
   }
 
   /**
    * Ensure the on-disk index is present and fresh. Serves an existing index
-   * immediately (queryable during any refresh); harvests when the store is empty
-   * or its last completion is older than the TTL. Retries a fully-empty harvest
-   * up to `maxAttempts` times with linear backoff. Sets `loaded = true` after the
-   * final outcome so callers can distinguish "still loading" from "load failed".
+   * immediately (queryable during any refresh); harvests when the store is
+   * empty, its last completion is older than the TTL, or that completion
+   * harvested a different survey list than this deployment configures.
+   * Retries a fully-empty harvest up to `maxAttempts` times with linear
+   * backoff. Sets `loaded = true` after the final outcome so callers can
+   * distinguish "still loading" from "load failed".
+   *
+   * Concurrent calls — the boot load and an hourly refresh tick — share one
+   * in-flight run, so a second harvest never starts while one is running. A
+   * run that `shutdown()` stops rejects with the shutdown reason.
    */
-  async load(maxAttempts = 3): Promise<void> {
-    await this.readIndexStats();
+  load(maxAttempts = 3): Promise<void> {
+    this.inFlight ??= this.refresh(maxAttempts).finally(() => {
+      this.inFlight = undefined;
+    });
+    return this.inFlight;
+  }
+
+  private async refresh(maxAttempts: number): Promise<void> {
+    const { signal } = this.stopping;
+    signal.throwIfAborted();
+    if (!this.loaded) await this.readIndexStats();
     const existing = this.cachedTotal;
     if (existing > 0) {
       this.loaded = true;
       this.loadError = undefined;
-      const state = await this.store.readState();
-      if (this.isFresh(state.completedAt)) return; // warm + fresh — nothing to do
+      if (this.isFresh(await this.store.readState())) return; // warm + fresh — nothing to do
     }
 
     let applied = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      applied = await this.harvest();
+      applied = await this.harvest(signal);
       if (applied > 0) break;
-      if (attempt < maxAttempts) {
-        await new Promise<void>((resolve) => setTimeout(resolve, attempt * 5_000));
-      }
+      if (attempt < maxAttempts) await pause(signal, attempt * 5_000);
     }
 
     if (applied > 0) {
       await this.readIndexStats();
       this.loaded = true;
       this.loadError = undefined;
+      signal.throwIfAborted();
       await this.store.writeState({
         status: 'complete',
         completedAt: new Date().toISOString(),
         total: this.cachedTotal,
+        checkpoint: this.surveyList,
       });
       return;
     }
 
     if (existing > 0) {
       // Refresh fetched nothing, but a prior index is still queryable — keep
-      // serving it and retry on the next boot rather than tearing it down.
+      // serving it and retry on the next hourly check rather than tearing it down.
       process.stderr.write(
         '[bls-labor-mcp-server] Catalog refresh fetched no rows — serving the existing index.\n',
       );
@@ -471,56 +683,117 @@ export class BlsCatalogService {
 
     this.loaded = true; // empty, but "loaded" so search surfaces the empty-catalog error
     this.loadError = `Catalog load failed after ${maxAttempts} attempts — all LABSTAT downloads returned empty.`;
+    signal.throwIfAborted();
     await this.store.writeState({ status: 'error', error: this.loadError });
   }
 
-  /** True when a completion marker exists and is within the TTL window. */
-  private isFresh(completedAt: string | undefined): boolean {
-    if (!completedAt) return false;
+  /**
+   * True when the last completion is within the TTL window and harvested the
+   * survey list this deployment configures (persisted in `checkpoint`). A
+   * missing list — an index from an earlier release — counts as stale.
+   */
+  private isFresh({ completedAt, checkpoint }: SyncState): boolean {
+    if (!completedAt || checkpoint !== this.surveyList) return false;
     const age = Date.now() - Date.parse(completedAt);
     return Number.isFinite(age) && age <= this.cacheTtlHours * 3_600_000;
   }
 
   /**
-   * Fetch every (opted-in) survey with bounded concurrency and upsert the parsed
-   * rows into the store in chunks. Returns the number of rows applied.
+   * Fetch every configured survey with bounded concurrency and upsert the
+   * parsed rows into the store in chunks. After a survey's upserts, its indexed
+   * rows absent from the new `.series` file are deleted; once every survey is
+   * done, so are the rows of surveys no longer configured (OES after its
+   * opt-in turns off). A survey that yields no rows — its `.series` request
+   * failed, returned non-200, carried no `series_id` header, or ended mid-line
+   * — keeps its rows, and a harvest that applies no rows deletes nothing. Returns the
+   * number of rows applied.
    */
-  private async harvest(): Promise<number> {
-    const surveys = this.includeOes ? SURVEYS : SURVEYS.filter((s) => s.abbr !== OES_SURVEY_ABBR);
-
+  private async harvest(signal: AbortSignal): Promise<number> {
     let applied = 0;
-    for (let i = 0; i < surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
-      const batch = surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
-      const results = await Promise.allSettled(batch.map((survey) => this.loadSurvey(survey)));
+    for (let i = 0; i < this.surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
+      const batch = this.surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map((survey) => this.loadSurvey(survey, signal)),
+      );
       for (const r of results) {
-        if (r.status !== 'fulfilled') continue;
-        for (let j = 0; j < r.value.length; j += UPSERT_CHUNK_SIZE) {
-          const chunk = r.value.slice(j, j + UPSERT_CHUNK_SIZE);
+        signal.throwIfAborted();
+        if (r.status !== 'fulfilled' || r.value.length === 0) continue;
+        for (let j = 0; j < r.value.length; j += HARVEST_CHUNK_SIZE) {
+          const chunk = r.value.slice(j, j + HARVEST_CHUNK_SIZE);
+          signal.throwIfAborted();
           await this.store.applyBatch(chunk.map(toRow), []);
           applied += chunk.length;
+          await pause(signal);
         }
+        const [first] = r.value;
+        if (first) {
+          await this.deleteRows(first.surveyAbbr, new Set(r.value.map((s) => s.seriesId)), signal);
+        }
+      }
+    }
+
+    if (applied > 0) {
+      const configured = new Set(this.surveys.map((s) => s.abbr.toUpperCase()));
+      for (const survey of distinctSurveys(await this.store.raw())) {
+        if (!configured.has(survey)) await this.deleteRows(survey, undefined, signal);
       }
     }
     return applied;
   }
 
   /**
+   * Delete `survey`'s indexed rows whose series id is not in `keep` — every row
+   * when `keep` is omitted. Walks the survey's rows a chunk at a time in rowid
+   * order off the `survey_abbr` index, deleting each chunk's stale ids in one
+   * transaction and yielding a turn between chunks, so no transaction spans a
+   * whole survey.
+   */
+  private async deleteRows(
+    survey: string,
+    keep: ReadonlySet<string> | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const page = (await this.store.raw()).prepare<{ rowid: number; series_id: string }>(
+      `SELECT rowid, series_id FROM ${CATALOG_TABLE}
+       WHERE survey_abbr = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
+    );
+    let after = 0;
+    for (;;) {
+      signal.throwIfAborted();
+      const rows = page.all(survey, after, HARVEST_CHUNK_SIZE);
+      const last = rows.at(-1);
+      if (!last) return;
+      after = last.rowid;
+      const stale = rows.filter((r) => !keep?.has(r.series_id)).map((r) => r.series_id);
+      if (stale.length > 0) await this.store.applyBatch([], stale);
+      await pause(signal);
+    }
+  }
+
+  /**
    * Fetch a survey's `.series` file and the code tables its dimensions name,
    * then parse. A missing `.series` file yields no rows; a missing code table
-   * leaves that dimension undecoded and is reported on stderr.
+   * leaves that dimension undecoded and is reported on stderr. Every request
+   * also aborts on `signal`.
    */
-  private async loadSurvey(survey: SurveyDefinition): Promise<CatalogSeries[]> {
+  private async loadSurvey(
+    survey: SurveyDefinition,
+    signal: AbortSignal,
+  ): Promise<CatalogSeries[]> {
     const { abbr } = survey;
     const url = (file: string) => `${this.catalogBaseUrl}/${abbr}/${abbr}.${file}`;
     const headers = { 'User-Agent': this.userAgent };
-    const dimensions = [survey.area, survey.item, ...(survey.title ?? [])];
+    const dimensions = [survey.area, survey.item, survey.frequency, ...(survey.title ?? [])];
     const tableNames = [...new Set(dimensions.flatMap((d) => (d ? [d.table] : [])))];
+    const request = (file: string, timeoutMs: number) =>
+      fetch(url(file), {
+        headers,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+      });
 
     const [seriesRes, ...tableResults] = await Promise.allSettled([
-      fetch(url('series'), { headers, signal: AbortSignal.timeout(30_000) }),
-      ...tableNames.map((table) =>
-        fetch(url(table), { headers, signal: AbortSignal.timeout(15_000) }),
-      ),
+      request('series', 30_000),
+      ...tableNames.map((table) => request(table, 15_000)),
     ]);
 
     if (seriesRes.status !== 'fulfilled' || !seriesRes.value.ok) return [];
@@ -561,13 +834,10 @@ export class BlsCatalogService {
 
     // Concept/synonym resolution: surveys whose canonical vocabulary the query
     // names but whose series titles never contain (e.g. "inflation" → CU). Their
-    // candidates get a relevance boost in the rescore below.
-    const aliasSurveys = new Set<string>();
-    for (const alias of CONCEPT_ALIASES) {
-      if (alias.phrases.some((p) => query.includes(p))) {
-        for (const s of alias.surveys) aliasSurveys.add(s);
-      }
-    }
+    // candidates get a relevance boost in the rescore below, as do rows of a
+    // publication frequency the query names ("quarterly unemployment rate").
+    const aliasSurveys = conceptAliasSurveys(query);
+    const frequencies = queryFrequencies(query);
 
     // Candidate set: an exact-id lookup (guarantees the precise SeriesID is in
     // play) unioned with the FTS5 matches, deduped by series id.
@@ -586,9 +856,12 @@ export class BlsCatalogService {
     for (const row of common) candidates.set(row.series_id as string, toCatalog(row));
 
     let ftsCapped = false;
-    const tokens = query.match(/[a-z0-9]+/gi) ?? [];
-    if (tokens.length > 0) {
-      const match = tokens.map((t) => `"${t.toLowerCase()}"*`).join(' OR ');
+    // Each distinct token once, up to MAX_QUERY_TOKENS: a repeat adds nothing
+    // to the match, and the FTS query and the rescore both cost per token.
+    const tokens = [...new Set(query.match(/[a-z0-9]+/g))].slice(0, MAX_QUERY_TOKENS);
+    const areaMatchable = !areaFilter || areaFilter.length <= MAX_AREA_LENGTH;
+    if (tokens.length > 0 && areaMatchable) {
+      const match = tokens.map((t) => `"${t}"*`).join(' OR ');
       const rows = await this.candidateRows(match, surveyFilter, seasonFilter, areaFilter);
       // If the FTS query returned exactly CANDIDATE_LIMIT rows the full index likely
       // has more matches — total will be a lower bound.
@@ -627,25 +900,43 @@ export class BlsCatalogService {
         score += 5;
       }
 
-      // Full-query match
-      if (titleLower.includes(query)) score += 10;
-      if (commonText?.includes(query)) score += 15;
+      // Full-query and token matches count where a word starts, so "all" never
+      // scores inside "seasonally". SeriesIDs are not words — their item and
+      // area codes sit mid-ID (`SEHA` in CUSR0000SEHA) — so a token still scores
+      // anywhere in one.
+      if (startsWord(titleLower, query)) score += 10;
+      if (commonText !== undefined && startsWord(commonText, query)) score += 15;
 
-      // Token-level match
-      for (const token of tokens) {
-        const t = token.toLowerCase();
-        if (titleLower.includes(t)) score += 2;
-        if (areaLower.includes(t)) score += 1;
-        if (itemLower.includes(t)) score += 1;
-        if (s.seriesId.toLowerCase().includes(t)) score += 3;
+      // Token-level match. `matched` counts the tokens the row matches anywhere,
+      // its headline description included, for the headline gate below.
+      const idLower = s.seriesId.toLowerCase();
+      let matched = 0;
+      for (const t of tokens) {
+        const inTitle = startsWord(titleLower, t);
+        const inArea = startsWord(areaLower, t);
+        const inItem = startsWord(itemLower, t);
+        const inId = idLower.includes(t);
+        if (inTitle) score += 2;
+        if (inArea) score += 1;
+        if (inItem) score += 1;
+        if (inId) score += 3;
+        if (inTitle || inArea || inItem || inId || (commonText && startsWord(commonText, t))) {
+          matched++;
+        }
       }
 
-      if (aliasSurveys.size > 0 && aliasSurveys.has(s.surveyAbbr.toUpperCase())) {
-        score += ALIAS_SURVEY_BOOST;
-      }
+      const aliasHit = aliasSurveys.has(s.surveyAbbr.toUpperCase());
+      if (aliasHit) score += ALIAS_SURVEY_BOOST;
 
       if (score === 0) continue;
-      if (isCommon) score += 8;
+      // The item-match weight, after the zero-score gate: a frequency word
+      // qualifies a match but never makes one on its own.
+      if (s.frequency && frequencies.has(frequencyKey(s.frequency))) score += 1;
+      // A headline earns its boost only when the query names it: through its
+      // survey's alias, or by matching most of the distinct tokens scored. One shared
+      // word ("all" in "All employees") does not make CES the answer to
+      // "annual average all items".
+      if (isCommon && (aliasHit || matched * 2 > tokens.length)) score += 8;
       scored.push({ s, score });
     }
 
@@ -715,11 +1006,17 @@ export class BlsCatalogService {
   }
 
   /**
-   * Close the on-disk SQLite index. The store lazy-opens, so closing one that
-   * was never queried is a no-op; a harvest still in flight fails its next
-   * write, which `load()`'s caller already reports.
+   * Stop any in-flight harvest, wait for it to settle, then close the on-disk
+   * SQLite index. The store reopens on its next call after `close()`, so a
+   * harvest left running would keep writing to a reopened handle; aborting
+   * first — the fetches, the retry backoff, and the check before every write
+   * all observe it — means no write follows this call. The stopped `load()`
+   * rejects with the shutdown reason for its caller to report. The store
+   * lazy-opens, so closing one that was never queried is a no-op.
    */
   async shutdown(): Promise<void> {
+    this.stopping.abort(new Error('Catalog harvest stopped by shutdown.'));
+    await Promise.allSettled([this.inFlight]);
     await this.store.close();
   }
 
@@ -733,8 +1030,8 @@ export class BlsCatalogService {
 
   /**
    * Uppercase survey codes present in the index, sorted — what the index holds,
-   * not what `SURVEYS` asks for: a survey whose download failed is absent, and
-   * an index inside its TTL keeps the survey set of its last harvest.
+   * not what `SURVEYS` asks for: a survey whose download failed is absent (or
+   * keeps its rows from an earlier harvest). Updated when a harvest completes.
    */
   get indexedSurveys(): readonly string[] {
     return this.cachedSurveys;
@@ -766,8 +1063,38 @@ export function getBlsCatalogService(): BlsCatalogService {
   return _service;
 }
 
-/** Release the catalog's SQLite handle. Wired to `createApp({ teardown })`. */
+let refreshScheduled = false;
+
+/**
+ * Register and start the hourly catalog refresh on the framework scheduler,
+ * on every transport. Each tick calls `load()`, which re-harvests only once
+ * the index's TTL has lapsed or its survey list no longer matches, and
+ * otherwise returns after one sync-state read. An hourly check rather than a
+ * `setTimeout(ttl)`: timers clamp delays above 2^31−1 ms (~596 h), and
+ * `BLS_CATALOG_CACHE_TTL_HOURS` has no upper bound. The scheduler skips a tick
+ * while the previous one runs, and `load()` shares its in-flight run with the
+ * boot load. `shutdownBlsCatalogService()` removes the job.
+ */
+export async function scheduleBlsCatalogRefresh(): Promise<void> {
+  await schedulerService.schedule(
+    CATALOG_REFRESH_JOB_ID,
+    CATALOG_REFRESH_CRON,
+    () => getBlsCatalogService().load(),
+    'Hourly check that re-harvests the LABSTAT catalog index once its TTL lapses.',
+  );
+  schedulerService.start(CATALOG_REFRESH_JOB_ID);
+  refreshScheduled = true;
+}
+
+/**
+ * Stop the refresh job, then stop any in-flight harvest and release the
+ * catalog's SQLite handle. Wired to `createApp({ teardown })`.
+ */
 export async function shutdownBlsCatalogService(): Promise<void> {
+  if (refreshScheduled) {
+    schedulerService.remove(CATALOG_REFRESH_JOB_ID);
+    refreshScheduled = false;
+  }
   const service = _service;
   _service = undefined;
   await service?.shutdown();

@@ -20,6 +20,7 @@ import { initBlsApiService } from './services/bls-api/bls-api-service.js';
 import {
   getBlsCatalogService,
   initBlsCatalogService,
+  scheduleBlsCatalogRefresh,
   shutdownBlsCatalogService,
 } from './services/bls-catalog/bls-catalog-service.js';
 import {
@@ -83,13 +84,16 @@ await createApp({
     initCanvasBridge(core.canvas);
 
     // Load catalog in background — non-blocking. bls_search_series throws
-    // catalog_unavailable if called before loading completes.
+    // catalog_unavailable if called before loading completes. The hourly job
+    // re-harvests once the index outlives BLS_CATALOG_CACHE_TTL_HOURS, on
+    // every transport; teardown removes it.
     getBlsCatalogService()
       .load()
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[bls-labor-mcp-server] Catalog load error: ${msg}\n`);
       });
+    await scheduleBlsCatalogRefresh();
 
     // Schedule observation mirror refresh — HTTP transport only.
     // Stdio operators run syncs out-of-band (e.g. `node dist/services/bls-observations/subprocess.js`).
@@ -135,7 +139,9 @@ await createApp({
   /**
    * Release the two SQLite handles setup() opened — the catalog index and the
    * observations mirror. Both are started before awaiting, so a failure in one
-   * still closes the other. The canvas and the scheduled refresh job are
+   * still closes the other. The catalog shutdown first removes its refresh job
+   * and stops an in-flight harvest, which would otherwise reopen the store
+   * after close(). The canvas and the observations refresh job are
    * framework-owned and disposed without a hook.
    */
   async teardown() {

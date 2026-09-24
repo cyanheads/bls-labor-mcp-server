@@ -16,8 +16,12 @@ import { type MirrorRow, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   BlsCatalogService,
+  catalogSurveyList,
+  conceptAliasSurveys,
   createCatalogStore,
   escapeLike,
+  queryFrequencies,
+  startsWord,
 } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
 
@@ -43,10 +47,14 @@ function toMirrorRow(s: CatalogSeries): MirrorRow {
     area_name: s.areaName ?? null,
     item_name: s.itemName ?? null,
     seasonal: s.seasonal ? 1 : 0,
+    frequency: s.frequency ?? null,
   };
 }
 
-/** Seed a fresh SQLite catalog with `entries`, then return a loaded service over it. */
+/**
+ * Seed a fresh SQLite catalog with `entries` and the default survey list, then
+ * return a loaded service over it (warm path, no harvest).
+ */
 async function seedAndLoad(entries: CatalogSeries[]): Promise<BlsCatalogService> {
   const dbPath = join(tmpDir, `catalog-${dbCounter++}.db`);
   const store = createCatalogStore(dbPath);
@@ -55,6 +63,7 @@ async function seedAndLoad(entries: CatalogSeries[]): Promise<BlsCatalogService>
     status: 'complete',
     completedAt: new Date().toISOString(),
     total: entries.length,
+    checkpoint: catalogSurveyList(false),
   });
   await store.close();
 
@@ -1344,6 +1353,8 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
       ce: 'datatype industry period seasonal series supersector',
       cu: 'area aspect base item period periodicity seasonal series',
       cw: 'area aspect base item period periodicity seasonal series',
+      cm: 'area aspect contacts datatype estimate footnote industry occupation owner seasonal series subcell',
+      ci: 'area aspect contacts estimate footnote industry occupation owner periodicity seasonal series subcell',
       ec: 'compensation group ownership period periodicity seasonal series',
       jt: 'area dataelement industry period ratelevel seasonal series sizeclass state',
       la: 'area area_type areamaps map_info measure period seasonal series state_region_division',
@@ -1362,7 +1373,7 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
     const files = Object.fromEntries([...listed].map((f) => [f, 'header_only\r\n']));
 
     const { requested } = await harvestFrom(files, { includeOes: true });
-    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(13);
+    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(15);
     expect(requested.filter((f) => !listed.has(f))).toEqual([]);
   });
 
@@ -1412,7 +1423,10 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
 
   const LEGACY_TITLE = 'JOLTS - Job Openings and Labor Turnover - All areas';
 
-  /** Persist a fresh (inside-TTL) legacy index holding the pre-fix JT QUR row. */
+  /**
+   * Persist a fresh (inside-TTL) legacy index holding the pre-fix JT QUR row,
+   * with the configured survey list, so only the index version marks it stale.
+   */
   async function seedLegacy(path: string): Promise<void> {
     const legacy = legacyStore(path);
     await legacy.applyBatch(
@@ -1432,6 +1446,7 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
       status: 'complete',
       completedAt: new Date().toISOString(),
       total: 1,
+      checkpoint: catalogSurveyList(false),
     });
     await legacy.close();
   }
@@ -1497,6 +1512,489 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
     await next.load(1);
     expect(fetchSpy).toHaveBeenCalled();
     await next.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Publication frequency (#85)
+// ---------------------------------------------------------------------------
+
+const CU_HEADER = [
+  'series_id        ',
+  'area_code',
+  'item_code',
+  'seasonal',
+  'periodicity_code',
+  'base_code',
+  'base_period',
+  'series_title',
+  'footnote_codes',
+  'begin_year',
+  'begin_period',
+  'end_year',
+  'end_period',
+];
+
+/** A CPI-family `.series` row (CU and CW share the layout). */
+const cpiRow = (id: string, area: string, seasonal: string, periodicity: string, title: string) => [
+  id,
+  area,
+  'SA0',
+  seasonal,
+  periodicity,
+  'S',
+  '1982-84=100',
+  title,
+  '',
+  '1947',
+  'M01',
+  '2026',
+  'M08',
+];
+
+/** CPI periodicity table as upstream ships it: `periodicity_name` labels. */
+const CPI_PERIODICITY = tsv(
+  ['periodicity_code', 'periodicity_name'],
+  ['R', 'Monthly'],
+  ['S', 'Semi-Annual'],
+);
+
+const CPI_AREA = tsv(
+  ['area_code', 'area_name', 'display_level', 'selectable', 'sort_sequence'],
+  ['0000', 'U.S. city average', '0', 'T', '1'],
+  ['S49D', 'Seattle-Tacoma-Bellevue, WA', '1', 'T', '79'],
+);
+const CPI_ITEM = tsv(
+  ['item_code', 'item_name', 'display_level', 'selectable', 'sort_sequence'],
+  ['SA0', 'All items', '0', 'T', '1'],
+);
+
+const US_NSA = 'All items in U.S. city average, all urban consumers, not seasonally adjusted';
+const SEA_NSA =
+  'All items in Seattle-Tacoma-Bellevue, WA, all urban consumers, not seasonally adjusted';
+const CW_NSA =
+  'All items in U.S. city average, urban wage earners and clerical workers, not seasonally adjusted';
+
+/**
+ * Real cu/cw/ln rows (2026-09-23): monthly/semiannual CPI twins that share a
+ * title, and CPS monthly/quarterly twins plus an annual-only series. `ln.periodicity`
+ * labels its codes in `periodicity_text`, the CPI tables in `periodicity_name`.
+ */
+const FREQUENCY_FILES: Record<string, string> = {
+  'cu.series': tsv(
+    CU_HEADER,
+    cpiRow(
+      'CUSR0000SA0      ',
+      '0000',
+      'S',
+      'R',
+      'All items in U.S. city average, all urban consumers, seasonally adjusted',
+    ),
+    cpiRow('CUUR0000SA0      ', '0000', 'U', 'R', US_NSA),
+    cpiRow('CUUS0000SA0      ', '0000', 'U', 'S', US_NSA),
+    cpiRow('CUURS49DSA0      ', 'S49D', 'U', 'R', SEA_NSA),
+    cpiRow('CUUSS49DSA0      ', 'S49D', 'U', 'S', SEA_NSA),
+    // A code the periodicity table does not list: the row keeps no frequency.
+    cpiRow(
+      'CUUX0000SA0      ',
+      '0000',
+      'U',
+      'X',
+      'All items test row with an unlisted periodicity',
+    ),
+  ),
+  'cu.periodicity': CPI_PERIODICITY,
+  'cu.area': CPI_AREA,
+  'cu.item': CPI_ITEM,
+  'cw.series': tsv(
+    CU_HEADER,
+    cpiRow('CWUR0000SA0      ', '0000', 'U', 'R', CW_NSA),
+    cpiRow('CWUS0000SA0      ', '0000', 'U', 'S', CW_NSA),
+  ),
+  'cw.periodicity': CPI_PERIODICITY,
+  'cw.area': CPI_AREA,
+  'cw.item': CPI_ITEM,
+  'ln.series': tsv(
+    [
+      'series_id        ',
+      'lfst_code',
+      'periodicity_code',
+      'series_title',
+      'seasonal',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'LNS14000000      ',
+      '40',
+      'M',
+      '(Seas) Unemployment Rate',
+      'S',
+      '',
+      '1948',
+      'M01',
+      '2026',
+      'M08',
+    ],
+    [
+      'LNS14000000Q     ',
+      '40',
+      'Q',
+      '(Seas) Unemployment Rate',
+      'S',
+      '',
+      '1948',
+      'Q01',
+      '2026',
+      'Q02',
+    ],
+    [
+      'LNU04000000      ',
+      '40',
+      'M',
+      '(Unadj) Unemployment Rate',
+      'U',
+      '',
+      '1948',
+      'M01',
+      '2026',
+      'M08',
+    ],
+    [
+      'LNU04000000Q     ',
+      '40',
+      'Q',
+      '(Unadj) Unemployment Rate',
+      'U',
+      '',
+      '1948',
+      'Q01',
+      '2026',
+      'Q02',
+    ],
+    [
+      'LNU04079823      ',
+      '40',
+      'A',
+      '(unadj) Unemployment rate - Divorced',
+      'U',
+      '',
+      '1994',
+      'A01',
+      '2025',
+      'A01',
+    ],
+  ),
+  'ln.periodicity': tsv(
+    ['periodicity_code', 'periodicity_text'],
+    ['A', 'Annual'],
+    ['M', 'Monthly'],
+    ['Q', 'Quarterly'],
+  ),
+};
+
+describe('BlsCatalogService.load — publication frequency (#85)', () => {
+  it('decodes CU, CW, and LN periodicity codes into a frequency and leaves titles unchanged', async () => {
+    const { svc, requested } = await harvestFrom(FREQUENCY_FILES);
+    const rows = await svc.lookupByIds([
+      'CUSR0000SA0',
+      'CUUR0000SA0',
+      'CUUS0000SA0',
+      'CWUR0000SA0',
+      'CWUS0000SA0',
+      'LNS14000000',
+      'LNS14000000Q',
+      'LNU04079823',
+    ]);
+    const freq = Object.fromEntries([...rows].map(([id, s]) => [id, s.frequency]));
+    expect(freq).toEqual({
+      CUSR0000SA0: 'Monthly',
+      CUUR0000SA0: 'Monthly',
+      CUUS0000SA0: 'Semi-Annual',
+      CWUR0000SA0: 'Monthly',
+      CWUS0000SA0: 'Semi-Annual',
+      LNS14000000: 'Monthly',
+      LNS14000000Q: 'Quarterly',
+      LNU04079823: 'Annual',
+    });
+    expect(rows.get('CUUS0000SA0')?.title).toBe(US_NSA);
+    expect(rows.get('CWUS0000SA0')?.title).toBe(CW_NSA);
+    expect(rows.get('LNS14000000Q')?.title).toBe('(Seas) Unemployment Rate');
+    expect(requested).toEqual(
+      expect.arrayContaining(['cu.periodicity', 'cw.periodicity', 'ln.periodicity']),
+    );
+  });
+
+  it('separates every twin that shares a title and seasonal flag', async () => {
+    const { svc } = await harvestFrom(FREQUENCY_FILES);
+    const ids = [
+      ...Object.values(FREQUENCY_FILES)
+        .join('\n')
+        .matchAll(/^((?:CU|CW|LN)\w+)/gm),
+    ].map((m) => m[1]!);
+    const rows = [...(await svc.lookupByIds(ids)).values()];
+    expect(rows).toHaveLength(ids.length);
+    const withFrequency = new Set(rows.map((s) => `${s.title}|${s.seasonal}|${s.frequency}`));
+    expect(withFrequency.size).toBe(ids.length);
+    expect(new Set(rows.map((s) => `${s.title}|${s.seasonal}`)).size).toBeLessThan(ids.length);
+  });
+
+  it('leaves the frequency unset for an unlisted code and for surveys without the dimension', async () => {
+    const { svc } = await harvestFrom({ ...FREQUENCY_FILES, ...EC_FILES, ...CM_CI_FILES });
+    const rows = await svc.lookupByIds(['CUUX0000SA0', 'ECS20002Q', 'CIU1010000000000A']);
+    expect(rows.size).toBe(3);
+    // CI's periodicity_code is a measure type (12-month percent change), not a frequency.
+    for (const s of rows.values()) expect(s).not.toHaveProperty('frequency');
+  });
+});
+
+describe('BlsCatalogService.search — frequency words (#85)', () => {
+  /**
+   * Regional monthly/semiannual CPI twins and monthly/quarterly/annual CPS rows,
+   * semiannual and quarterly seeded first. No row is a `COMMON_SERIES` headline,
+   * whose own boost would decide the order.
+   */
+  const cpiTwin = (seriesId: string, areaName: string, frequency: string): CatalogSeries => ({
+    seriesId,
+    title: `All items in ${areaName}, all urban consumers, not seasonally adjusted`,
+    surveyAbbr: 'CU',
+    seasonal: false,
+    areaName,
+    itemName: 'All items',
+    frequency,
+  });
+  const lnRow = (seriesId: string, title: string, frequency?: string): CatalogSeries => ({
+    seriesId,
+    title,
+    surveyAbbr: 'LN',
+    seasonal: false,
+    ...(frequency && { frequency }),
+  });
+  const ROWS: CatalogSeries[] = [
+    cpiTwin('CUUS0100SA0', 'Northeast urban', 'Semi-Annual'),
+    cpiTwin('CUUR0100SA0', 'Northeast urban', 'Monthly'),
+    cpiTwin('CUUSS49DSA0', 'Seattle-Tacoma-Bellevue, WA', 'Semi-Annual'),
+    cpiTwin('CUURS49DSA0', 'Seattle-Tacoma-Bellevue, WA', 'Monthly'),
+    lnRow('LNU04000000Q', '(Unadj) Unemployment Rate', 'Quarterly'),
+    lnRow('LNU04000000', '(Unadj) Unemployment Rate', 'Monthly'),
+    lnRow('LNU04079823', '(unadj) Unemployment rate - Divorced', 'Annual'),
+    lnRow('LNU04000001', '(Unadj) Unemployment Rate - test'),
+  ];
+  const idsFor = async (svc: BlsCatalogService, query: string, survey?: string) =>
+    (await svc.search(search(query, survey ? { survey } : {}))).series.map((s) => s.seriesId);
+
+  it('keeps candidate order at equal score when the query names no frequency — never a tie-break', async () => {
+    const svc = await seedAndLoad(ROWS);
+    expect(await idsFor(svc, 'all items', 'CU')).toEqual([
+      'CUUS0100SA0',
+      'CUUR0100SA0',
+      'CUUSS49DSA0',
+      'CUURS49DSA0',
+    ]);
+    expect((await idsFor(svc, 'unemployment rate', 'LN')).slice(0, 2)).toEqual([
+      'LNU04000000Q',
+      'LNU04000000',
+    ]);
+  });
+
+  it.each(['monthly all items', 'all items monthly', 'MONTHLY all items'])(
+    '%j lifts the monthly twins over their semiannual twins',
+    async (query) => {
+      const svc = await seedAndLoad(ROWS);
+      expect(await idsFor(svc, query, 'CU')).toEqual([
+        'CUUR0100SA0',
+        'CUURS49DSA0',
+        'CUUS0100SA0',
+        'CUUSS49DSA0',
+      ]);
+    },
+  );
+
+  it.each(['semiannual all items', 'semi-annual all items', 'semi annual all items'])(
+    '%j keeps the semiannual twins first and lifts them over equal monthly rows',
+    async (query) => {
+      const svc = await seedAndLoad([...ROWS].reverse());
+      const ids = await idsFor(svc, query, 'CU');
+      expect(ids.slice(0, 2).sort()).toEqual(['CUUS0100SA0', 'CUUSS49DSA0']);
+    },
+  );
+
+  it('lifts the quarterly twin for "quarterly unemployment rate"', async () => {
+    const svc = await seedAndLoad([...ROWS].reverse());
+    const ids = await idsFor(svc, 'quarterly unemployment rate', 'LN');
+    expect(ids.indexOf('LNU04000000Q')).toBeLessThan(ids.indexOf('LNU04000000'));
+  });
+
+  it('never matches "annual", which names the annual-average period monthly series also carry', async () => {
+    const svc = await seedAndLoad(ROWS);
+    expect(await idsFor(svc, 'annual all items', 'CU')).toEqual(
+      await idsFor(svc, 'all items', 'CU'),
+    );
+    expect(await idsFor(svc, 'annual unemployment rate', 'LN')).toEqual(
+      await idsFor(svc, 'unemployment rate', 'LN'),
+    );
+  });
+
+  it('matches frequency words only as whole words', async () => {
+    const svc = await seedAndLoad(ROWS);
+    expect(await idsFor(svc, 'bimonthly all items', 'CU')).toEqual(
+      await idsFor(svc, 'all items', 'CU'),
+    );
+  });
+
+  it('qualifies a match but never makes one: a frequency word alone surfaces no headline row', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNS14000000',
+        title: '(Seas) Unemployment Rate',
+        surveyAbbr: 'LN',
+        seasonal: true,
+        frequency: 'Monthly',
+      },
+      {
+        seriesId: 'TEST_BANANA_01',
+        title: 'Banana retail price',
+        surveyAbbr: 'AP',
+        seasonal: false,
+      },
+    ]);
+    expect(await idsFor(svc, 'monthly banana')).toEqual(['TEST_BANANA_01']);
+  });
+
+  it('returns the stored frequency on each result', async () => {
+    const svc = await seedAndLoad(ROWS);
+    const result = await svc.search(search('LNU04000000Q'));
+    expect(result.series[0]).toMatchObject({ seriesId: 'LNU04000000Q', frequency: 'Quarterly' });
+    const plain = await svc.search(search('LNU04000001'));
+    expect(plain.series[0]).not.toHaveProperty('frequency');
+  });
+});
+
+describe('queryFrequencies (#85)', () => {
+  it('names each frequency word once, normalized', () => {
+    expect([...queryFrequencies('semi-annual and semi annual and semiannual cpi')]).toEqual([
+      'semiannual',
+    ]);
+    expect([...queryFrequencies('monthly vs quarterly')].sort()).toEqual(['monthly', 'quarterly']);
+    expect([...queryFrequencies('annual average bimonthly semiannually')]).toEqual([]);
+  });
+});
+
+describe('BlsCatalogService.load — index version 3 adds the frequency column (#85)', () => {
+  /** The catalog store as 0.5.x persisted it: index version 2, no frequency column. */
+  function v2Store(path: string) {
+    return sqliteMirrorStore({
+      path,
+      version: 2,
+      table: 'bls_catalog',
+      primaryKey: 'series_id',
+      columns: {
+        series_id: 'TEXT',
+        title: 'TEXT',
+        survey_abbr: 'TEXT',
+        area_name: 'TEXT',
+        item_name: 'TEXT',
+        seasonal: 'INTEGER',
+      },
+      fts: ['series_id', 'title', 'area_name', 'item_name'],
+      indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
+    });
+  }
+
+  async function columnsOf(dbPath: string): Promise<{ columns: string[]; version: number }> {
+    const store = createCatalogStore(dbPath);
+    const db = await store.raw();
+    const columns = db
+      .prepare<{ name: string }>('PRAGMA table_info(bls_catalog)')
+      .all()
+      .map((c) => c.name);
+    const version = db
+      .prepare<{ v: number }>('SELECT MAX(version) AS v FROM schema_version')
+      .get()?.v;
+    await store.close();
+    return { columns, version: version ?? 0 };
+  }
+
+  it('adds the column to a fresh v2 index, re-harvests once, and serves the old rows meanwhile', async () => {
+    const dbPath = join(tmpDir, 'v2.db');
+    const legacy = v2Store(dbPath);
+    await legacy.applyBatch(
+      [
+        {
+          series_id: 'LNS14000000Q',
+          title: '(Seas) Unemployment Rate',
+          survey_abbr: 'LN',
+          area_name: null,
+          item_name: null,
+          seasonal: 1,
+        },
+      ],
+      [],
+    );
+    await legacy.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      total: 1,
+      checkpoint: catalogSurveyList(false),
+    });
+    await legacy.close();
+
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      const u = String(url);
+      await gate;
+      const body = FREQUENCY_FILES[u.slice(u.lastIndexOf('/') + 1)];
+      return body === undefined ? new Response('', { status: 404 }) : new Response(body);
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+    const loading = svc.load(1);
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const during = await svc.search(searchInput('LNS14000000Q'));
+    expect(during.series[0]).toMatchObject({
+      seriesId: 'LNS14000000Q',
+      title: '(Seas) Unemployment Rate',
+    });
+    expect(during.series[0]).not.toHaveProperty('frequency');
+
+    release();
+    await loading;
+    expect((await svc.lookupByIds(['LNS14000000Q'])).get('LNS14000000Q')?.frequency).toBe(
+      'Quarterly',
+    );
+    await svc.shutdown();
+
+    const { columns, version } = await columnsOf(dbPath);
+    expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
+    expect(version).toBe(3);
+
+    fetchSpy.mockClear();
+    const next = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+    await next.load(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    await next.shutdown();
+  });
+
+  it('creates the column on a fresh database, which the migration tolerates, and runs it once', async () => {
+    const dbPath = join(tmpDir, 'fresh-v3.db');
+    const { columns, version } = await columnsOf(dbPath);
+    expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
+    expect(version).toBe(3);
+
+    const store = createCatalogStore(dbPath);
+    const completedAt = new Date().toISOString();
+    await store.writeState({ status: 'complete', completedAt, total: 0 });
+    await store.close();
+    const reopened = createCatalogStore(dbPath);
+    expect((await reopened.readState()).completedAt).toBe(completedAt);
+    await reopened.close();
   });
 });
 
@@ -1711,6 +2209,39 @@ describe('BlsCatalogService.search — area before the candidate cap (#69)', () 
   });
 });
 
+/**
+ * Assert that `run` takes linear time in its input's length. Times 10-call
+ * batches of `run` on the 5K, 20K, and 80K-character `text` in five
+ * interleaved rounds and keeps each size's fastest batch: noise only adds
+ * time, and a GC pause or preemption must then slow the same size in every
+ * round to count. The 5K time is floored at 10 µs, since several inputs finish
+ * near timer resolution there, where a ratio is noise. Linear growth predicts
+ * 16× from 5K to 80K; quadratic would be 256×.
+ */
+function expectLinearTime(
+  run: (input: string) => void,
+  text: (length: number) => string,
+  label: string,
+): void {
+  const time = (input: string) => {
+    const start = performance.now();
+    for (let i = 0; i < 10; i++) run(input);
+    return (performance.now() - start) / 10;
+  };
+  const [small, mid, large] = [text(5_000), text(20_000), text(80_000)];
+  time(small); // warm the JIT
+  let [t5k, t20k, t80k] = [Infinity, Infinity, Infinity];
+  for (let round = 0; round < 5; round++) {
+    t5k = Math.min(t5k, time(small));
+    t20k = Math.min(t20k, time(mid));
+    t80k = Math.min(t80k, time(large));
+  }
+  t5k = Math.max(t5k, 0.01);
+  expect(t80k / t5k, label).toBeLessThan(64);
+  expect(t20k, label).toBeLessThan(t80k * 2);
+  expect(t80k, label).toBeLessThan(50);
+}
+
 describe('escapeLike (#69)', () => {
   it('escapes the LIKE wildcards and the escape character, leaving other text alone', () => {
     expect(escapeLike('100%_a\\b')).toBe('100\\%\\_a\\\\b');
@@ -1718,20 +2249,8 @@ describe('escapeLike (#69)', () => {
   });
 
   it('runs in linear time on worst-case caller text', () => {
-    const time = (input: string) => {
-      const start = performance.now();
-      for (let i = 0; i < 20; i++) escapeLike(input);
-      return (performance.now() - start) / 20;
-    };
     for (const ch of ['%', '\\', '_']) {
-      time(ch.repeat(5_000)); // warm the JIT
-      const t5k = Math.max(time(ch.repeat(5_000)), 0.001);
-      const t20k = time(ch.repeat(20_000));
-      const t80k = time(ch.repeat(80_000));
-      // Linear growth predicts 16× from 5k to 80k; quadratic would be 256×.
-      expect(t80k / t5k).toBeLessThan(64);
-      expect(t20k).toBeLessThan(t80k * 2);
-      expect(t80k).toBeLessThan(50);
+      expectLinearTime(escapeLike, (n) => ch.repeat(n), ch);
       expect(escapeLike(ch.repeat(80_000))).toHaveLength(160_000);
     }
   });
@@ -1820,6 +2339,7 @@ describe('BlsCatalogService.indexedSurveys (#64)', () => {
       status: 'complete',
       completedAt: new Date(Date.now() - 1_000 * 3_600_000).toISOString(),
       total: FIXTURES.length,
+      checkpoint: catalogSurveyList(false),
     });
     await store.close();
 
@@ -1937,7 +2457,11 @@ describe('BlsCatalogService.load racing shutdown', () => {
     const dbPath = join(tmpDir, 'race.db');
     const store = createCatalogStore(dbPath);
     await store.applyBatch(FIXTURES.map(toMirrorRow), []);
-    await store.writeState({ status: 'complete', completedAt: new Date().toISOString() });
+    await store.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      checkpoint: catalogSurveyList(false),
+    });
     await store.close();
 
     const svc = new BlsCatalogService('http://unused', 'ua/1.0', dbPath, 168, false);
@@ -1947,5 +2471,741 @@ describe('BlsCatalogService.load racing shutdown', () => {
     await closing;
     expect(svc.indexedSurveys).toEqual(['CE', 'CU', 'LN']);
     await svc.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ECEC (CM) and ECI (CI) (#86)
+// ---------------------------------------------------------------------------
+
+const COMP_HEADER = (measureCol: string) => [
+  'series_id        ',
+  'seasonal',
+  'owner_code',
+  'industry_code',
+  'occupation_code',
+  'subcell_code',
+  'area_code',
+  measureCol,
+  'estimate_code',
+  'series_title',
+  'footnote_codes',
+  'begin_year',
+  'begin_period',
+  'end_year',
+  'end_period',
+];
+
+/** A cm/ci `.series` row: national (`99999`) or the Seattle CSA (`00500`), per estimate. */
+const compRow = (
+  id: string,
+  seasonal: string,
+  owner: string,
+  area: string,
+  measure: string,
+  estimate: string,
+  title: string,
+) => [
+  id,
+  seasonal,
+  owner,
+  '000000',
+  '000000',
+  '00',
+  area,
+  measure,
+  estimate,
+  title,
+  '',
+  '2004',
+  'Q01',
+  '2026',
+  'Q02',
+];
+
+const COMP_AREA = tsv(
+  ['area_code', 'area_text', 'display_level', 'selectable', 'sort_sequence'],
+  ['00500', 'Seattle-Tacoma, WA CSA', '3', 'T', '31'],
+  ['99999', 'United States (National)', '0', 'T', '1'],
+);
+const COMP_ESTIMATE = tsv(
+  ['estimate_code', 'estimate_text', 'display_level', 'selectable', 'sort_sequence'],
+  ['01', 'Total compensation', '0', 'T', '1'],
+  ['02', 'Wages and salaries', '1', 'T', '2'],
+  ['03', 'Total benefits', '1', 'T', '3'],
+  ['15', 'Health insurance', '2', 'T', '4'],
+);
+
+/** Real cm/ci rows (2026-09-23): national and Seattle CSA rows across estimates. */
+const CM_CI_FILES: Record<string, string> = {
+  'cm.series': tsv(
+    COMP_HEADER('datatype_code'),
+    compRow(
+      'CMU1010000000000D',
+      'U',
+      '1',
+      '99999',
+      'D',
+      '01',
+      'Total compensation cost per hour worked for civilian workers',
+    ),
+    compRow(
+      'CMU1020000000000D',
+      'U',
+      '1',
+      '99999',
+      'D',
+      '02',
+      'Wages and salaries cost per hour worked for civilian workers',
+    ),
+    compRow(
+      'CMU1150000000000D',
+      'U',
+      '1',
+      '99999',
+      'D',
+      '15',
+      'Health insurance cost per hour worked for civilian workers',
+    ),
+    compRow(
+      'CMU20100000000LLD',
+      'U',
+      '2',
+      '00500',
+      'D',
+      '01',
+      'Total compensation for private industry workers in the Seattle-Tacoma, WA CSA; Cost per hour worked',
+    ),
+    compRow(
+      'CMU20200000000LLD',
+      'U',
+      '2',
+      '00500',
+      'D',
+      '02',
+      'Wages and salaries for private industry workers in the Seattle-Tacoma, WA CSA; Cost per hour worked',
+    ),
+  ),
+  'cm.area': COMP_AREA,
+  'cm.estimate': COMP_ESTIMATE,
+  'ci.series': tsv(
+    COMP_HEADER('periodicity_code'),
+    compRow(
+      'CIU1010000000000A',
+      'U',
+      '1',
+      '99999',
+      'A',
+      '01',
+      'Total compensation for all civilian workers, 12-month percent change, current dollars',
+    ),
+    compRow(
+      'CIU1020000000000A',
+      'U',
+      '1',
+      '99999',
+      'A',
+      '02',
+      'Wages and salaries for all civilian workers, 12-month percent change, current dollars',
+    ),
+    compRow(
+      'CIS1010000000000I',
+      'S',
+      '1',
+      '99999',
+      'I',
+      '01',
+      'Total compensation for all civilian workers, current dollar index',
+    ),
+    compRow(
+      'CIU20100000000LLA',
+      'U',
+      '2',
+      '00500',
+      'A',
+      '01',
+      'Total compensation for private industry workers in the Seattle-Tacoma, WA CSA, 12-month percent change, current dollars',
+    ),
+    compRow(
+      'CIU20200000000LLA',
+      'U',
+      '2',
+      '00500',
+      'A',
+      '02',
+      'Wages and salaries for private industry workers in the Seattle-Tacoma, WA CSA, 12-month percent change, current dollars',
+    ),
+  ),
+  'ci.area': COMP_AREA,
+  'ci.estimate': COMP_ESTIMATE,
+};
+
+describe('BlsCatalogService — ECEC (CM) and ECI (CI) (#86)', () => {
+  it('harvests CM and CI with the area and estimate decoded and series_title kept', async () => {
+    const { svc, requested } = await harvestFrom(CM_CI_FILES);
+    const rows = await svc.lookupByIds([
+      'CMU1010000000000D',
+      'CMU1150000000000D',
+      'CMU20200000000LLD',
+      'CIU1020000000000A',
+      'CIS1010000000000I',
+      'CIU20100000000LLA',
+    ]);
+    const decoded = Object.fromEntries(
+      [...rows].map(([id, s]) => [id, [s.surveyAbbr, s.areaName, s.itemName, s.seasonal]]),
+    );
+    expect(decoded).toEqual({
+      CMU1010000000000D: ['CM', 'United States (National)', 'Total compensation', false],
+      CMU1150000000000D: ['CM', 'United States (National)', 'Health insurance', false],
+      CMU20200000000LLD: ['CM', 'Seattle-Tacoma, WA CSA', 'Wages and salaries', false],
+      CIU1020000000000A: ['CI', 'United States (National)', 'Wages and salaries', false],
+      CIS1010000000000I: ['CI', 'United States (National)', 'Total compensation', true],
+      CIU20100000000LLA: ['CI', 'Seattle-Tacoma, WA CSA', 'Total compensation', false],
+    });
+    expect(rows.get('CIS1010000000000I')?.title).toBe(
+      'Total compensation for all civilian workers, current dollar index',
+    );
+    expect(svc.indexedSurveys).toEqual(['CI', 'CM']);
+    expect(requested.filter((f) => /^c[mi]\./.test(f)).sort()).toEqual([
+      'ci.area',
+      'ci.estimate',
+      'ci.series',
+      'cm.area',
+      'cm.estimate',
+      'cm.series',
+    ]);
+  });
+
+  /**
+   * The fixture holds too few current rows to fill a top 10, so rank the whole
+   * list: every row of `surveys` carrying the asked estimate must outrank every EC row.
+   */
+  async function rankEstimate(
+    svc: BlsCatalogService,
+    query: string,
+    item: string,
+    surveys = ['CM', 'CI'],
+  ) {
+    const series = (await svc.search(searchInput(query, { limit: 50 }))).series;
+    const firstEc = series.findIndex((s) => s.surveyAbbr === 'EC');
+    const current = series.flatMap((s, i) =>
+      surveys.includes(s.surveyAbbr) && s.itemName === item ? [i] : [],
+    );
+    expect(current.length).toBeGreaterThan(0);
+    return {
+      top: series[0],
+      firstEc: firstEc < 0 ? Infinity : firstEc,
+      lastCurrent: Math.max(...current),
+    };
+  }
+
+  it.each([
+    ['compensation', 'Total compensation'],
+    ['employer cost compensation', 'Total compensation'],
+    ['employer costs for employee compensation', 'Total compensation'],
+    ['total compensation cost per hour worked', 'Total compensation'],
+    ['health insurance cost per hour', 'Health insurance'],
+  ])('%j ranks CM first and its %s rows above every EC row', async (query, item) => {
+    const { svc } = await harvestFrom({ ...CM_CI_FILES, ...EC_FILES });
+    const { top, firstEc, lastCurrent } = await rankEstimate(svc, query, item);
+    expect(top?.surveyAbbr).toBe('CM');
+    expect(firstEc).toBeGreaterThan(lastCurrent);
+  });
+
+  it('ranks CI first for "eci wages and salaries 12-month percent change", EC rows below', async () => {
+    const { svc } = await harvestFrom({ ...CM_CI_FILES, ...EC_FILES });
+    const query = 'eci wages and salaries 12-month percent change';
+    const { top, firstEc, lastCurrent } = await rankEstimate(svc, query, 'Wages and salaries', [
+      'CI',
+    ]);
+    expect(top?.seriesId).toBe('CIU1020000000000A');
+    expect(firstEc).toBeGreaterThan(lastCurrent);
+  });
+
+  it('returns a CI series in the top 3 for "employment cost index"', async () => {
+    const { svc } = await harvestFrom({ ...CM_CI_FILES, ...EC_FILES });
+    const result = await svc.search(searchInput('employment cost index', { limit: 3 }));
+    expect(result.series.some((s) => s.surveyAbbr === 'CI')).toBe(true);
+  });
+
+  it('reaches the Seattle CM and CI rows through the area filter', async () => {
+    const { svc } = await harvestFrom(CM_CI_FILES);
+    const total = await svc.search(searchInput('total compensation', { area: 'Seattle' }));
+    expect(total.series.map((s) => s.seriesId).sort()).toEqual([
+      'CIU20100000000LLA',
+      'CMU20100000000LLD',
+    ]);
+    const wages = await svc.search(searchInput('wages and salaries', { area: 'seattle' }));
+    expect(wages.series.map((s) => s.seriesId).sort()).toEqual([
+      'CIU20200000000LLA',
+      'CMU20200000000LLD',
+    ]);
+  });
+
+  it('still reaches EC with survey: "EC"', async () => {
+    const { svc } = await harvestFrom({ ...CM_CI_FILES, ...EC_FILES });
+    const result = await svc.search(searchInput('total compensation', { survey: 'EC' }));
+    expect(result.series.length).toBeGreaterThan(0);
+    expect(result.series.every((s) => s.surveyAbbr === 'EC')).toBe(true);
+  });
+
+  it('ranks a national CM row above a regional row that ties it', async () => {
+    // Equal rescore; the longer national row trails on bm25, so candidate order puts Seattle first.
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'CMU20100000000LLD',
+        title: 'Total compensation cost per hour, Seattle',
+        surveyAbbr: 'CM',
+        seasonal: false,
+        areaName: 'Seattle-Tacoma, WA CSA',
+        itemName: 'Total compensation',
+      },
+      {
+        seriesId: 'CMU1010000000000D',
+        title: 'Total compensation cost per hour worked for civilian workers in every area',
+        surveyAbbr: 'CM',
+        seasonal: false,
+        areaName: 'United States (National)',
+        itemName: 'Total compensation',
+      },
+    ]);
+    const result = await svc.search(searchInput('total compensation cost per hour'));
+    expect(result.series.map((s) => s.seriesId)).toEqual([
+      'CMU1010000000000D',
+      'CMU20100000000LLD',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concept aliases on word boundaries (#89)
+// ---------------------------------------------------------------------------
+
+describe('BlsCatalogService.search — concept aliases (#89)', () => {
+  /**
+   * One probe row per survey under an identical title, so only an alias boost
+   * separates them. LA and AP carry no alias and seed first: the rows ranked
+   * above `PROBE_LA` are exactly the boosted surveys.
+   */
+  const PROBES: CatalogSeries[] = [
+    'LA',
+    'AP',
+    'CU',
+    'WP',
+    'PC',
+    'CE',
+    'JT',
+    'LN',
+    'PR',
+    'MP',
+    'EC',
+    'CM',
+    'CI',
+  ].map((surveyAbbr) => ({
+    seriesId: `PROBE_${surveyAbbr}`,
+    title: 'Alias probe row',
+    surveyAbbr,
+    seasonal: false,
+  }));
+
+  async function boosted(svc: BlsCatalogService, phrase: string): Promise<string[]> {
+    const result = await svc.search(search(`${phrase} probe`, { limit: 20 }));
+    const ids = result.series.map((s) => s.seriesId);
+    expect(ids).toHaveLength(PROBES.length);
+    return ids
+      .slice(0, ids.indexOf('PROBE_LA'))
+      .map((id) => id.replace('PROBE_', ''))
+      .sort();
+  }
+
+  it.each<[string, string[]]>([
+    ['inflation', ['CU']],
+    ['cost of living', ['CU']],
+    ['consumer prices', ['CU']],
+    ['cpi', ['CU']],
+    ['cpi-u', ['CU']],
+    ['producer prices', ['PC', 'WP']],
+    ['wholesale price', ['PC', 'WP']],
+    ['ppi', ['PC', 'WP']],
+    ['(ppi)', ['PC', 'WP']],
+    ['jobs', ['CE']],
+    ['job growth', ['CE']],
+    ['payrolls', ['CE']],
+    ['nonfarm', ['CE']],
+    ['wages', ['CE']],
+    ['earnings', ['CE']],
+    ['job openings', ['JT']],
+    ['labor turnover', ['JT']],
+    ['job vacancies', ['JT']],
+    ['quits', ['JT']],
+    ['jolts', ['JT']],
+    ['unemployment', ['LN']],
+    ['jobless', ['LN']],
+    ['labor force participation', ['LN']],
+    ['productivity', ['MP', 'PR']],
+    ['output per hour', ['MP', 'PR']],
+    ['compensation', ['CI', 'CM']],
+    ['employer costs', ['CI', 'CM']],
+    ['ecec', ['CI', 'CM']],
+    ['employment cost index', ['CI']],
+    ['eci', ['CI']],
+    ['eci benefits', ['CI']],
+  ])('%j boosts %j', async (phrase, surveys) => {
+    const svc = await seedAndLoad(PROBES);
+    expect(await boosted(svc, phrase)).toEqual(surveys);
+  });
+
+  it.each([
+    'grocery shopping',
+    'happiness',
+    'shopping centers',
+    'special',
+    'decision',
+    'precision',
+    'overcompensation',
+  ])('%j matches no alias inside a word', async (phrase) => {
+    const svc = await seedAndLoad(PROBES);
+    expect(await boosted(svc, phrase)).toEqual([]);
+  });
+});
+
+describe('conceptAliasSurveys (#89)', () => {
+  it('matches alias phrases at word starts, a stem phrase completing inside its word', () => {
+    expect([...conceptAliasSurveys('job vacancies')]).toEqual(['JT']);
+    expect([...conceptAliasSurveys('ppi')].sort()).toEqual(['PC', 'WP']);
+    expect([...conceptAliasSurveys('happiness while shopping')]).toEqual([]);
+  });
+
+  it('runs in linear time on worst-case caller text', () => {
+    const run = (input: string) => {
+      conceptAliasSurveys(input);
+      queryFrequencies(input);
+    };
+    /**
+     * Near-misses, where each position starts a phrase or frequency word that
+     * fails late, plus a unit that matches at every word.
+     */
+    const units = [
+      'job ',
+      'cost of ',
+      'labor force ',
+      'semi-',
+      'semi ',
+      'employ',
+      'p',
+      'a',
+      'monthly ',
+    ];
+    for (const unit of units) {
+      const text = (n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+      expectLinearTime(run, text, unit);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query tokens score at word starts (#91)
+// ---------------------------------------------------------------------------
+
+describe('BlsCatalogService.search — tokens score at word starts (#91)', () => {
+  const US = 'U.S. city average';
+  const cpi = (
+    seriesId: string,
+    item: string,
+    seasonal: boolean,
+    frequency = 'Monthly',
+  ): CatalogSeries => ({
+    seriesId,
+    title: `${item} in ${US}, all urban consumers, ${seasonal ? '' : 'not '}seasonally adjusted`,
+    surveyAbbr: 'CU',
+    seasonal,
+    areaName: US,
+    itemName: item,
+    frequency,
+  });
+  /** Real 2026-09-23 rows: the headline series plus CPI all-items rows they outranked. */
+  const HEADLINES: CatalogSeries[] = [
+    cpi('CUUR0000SA0', 'All items', false),
+    cpi('CUSR0000SA0', 'All items', true),
+    {
+      seriesId: 'CES0000000001',
+      title: 'All employees, thousands, total nonfarm, seasonally adjusted',
+      surveyAbbr: 'CE',
+      seasonal: true,
+      itemName: 'Total nonfarm',
+    },
+    {
+      seriesId: 'WPUFD49104',
+      title: 'PPI Commodity data for Final demand less foods and energy, not seasonally adjusted',
+      surveyAbbr: 'WP',
+      seasonal: false,
+      itemName: 'Final demand less foods and energy',
+    },
+    {
+      seriesId: 'JTS000000000000000JOL',
+      title:
+        'JOLTS - Job openings - Total nonfarm - Total US - All size classes - Level - In Thousands',
+      surveyAbbr: 'JT',
+      seasonal: true,
+      areaName: 'Total US',
+    },
+    {
+      seriesId: 'LNS14000000',
+      title: '(Seas) Unemployment Rate',
+      surveyAbbr: 'LN',
+      seasonal: true,
+      frequency: 'Monthly',
+    },
+    cpi('CUUS0000SA0', 'All items', false, 'Semi-Annual'),
+    cpi('CUSR0000SA0L1', 'All items less food', true),
+    cpi('CUSR0000SA0L2', 'All items less shelter', true),
+    cpi('CUUR0000AA0', 'All items - old base', false),
+    cpi('CUUR0000SA0R', 'Purchasing power of the consumer dollar', false),
+    cpi('CUSR0000SEHA', 'Rent of primary residence', true),
+    cpi('CUUR0000SEHA', 'Rent of primary residence', false),
+    {
+      seriesId: 'CES2000000057',
+      title:
+        'Aggregate weekly payrolls of all employees, thousands, construction, seasonally adjusted',
+      surveyAbbr: 'CE',
+      seasonal: true,
+      itemName: 'Construction',
+    },
+    {
+      seriesId: 'JTS230000000000000JOR',
+      title: 'JOLTS - Job openings - Construction - Total US - All size classes - Rate',
+      surveyAbbr: 'JT',
+      seasonal: true,
+      areaName: 'Total US',
+    },
+  ];
+  const idsFor = async (svc: BlsCatalogService, query: string, limit = 10) =>
+    (await svc.search(search(query, { limit }))).series.map((s) => s.seriesId);
+
+  it('keeps the CE, WP, and JT headlines out of the top 5 for "annual average all items"', async () => {
+    const svc = await seedAndLoad(HEADLINES);
+    const top5 = (await svc.search(search('annual average all items', { limit: 5 }))).series;
+    expect(top5.map((s) => s.surveyAbbr)).toEqual(['CU', 'CU', 'CU', 'CU', 'CU']);
+    expect(top5.slice(0, 2).map((s) => s.seriesId)).toEqual(['CUUR0000SA0', 'CUSR0000SA0']);
+  });
+
+  it('never counts a token found only inside another word', async () => {
+    const svc = await seedAndLoad(HEADLINES);
+    // "all" sits inside "seasonally"; WPUFD49104 has no other match.
+    expect(await idsFor(svc, 'all', 50)).not.toContain('WPUFD49104');
+    // "employ" starts "employees" but sits inside "unemployment".
+    const employ = await idsFor(svc, 'employ', 50);
+    expect(employ).toContain('CES0000000001');
+    expect(employ).not.toContain('LNS14000000');
+  });
+
+  it('never counts a token inside a word of the area or item', async () => {
+    // Headline ids make both rows candidates without an FTS match; "all" sits only inside "Dallas" and "Small".
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNS12000000',
+        title: 'Price index',
+        surveyAbbr: 'AP',
+        seasonal: false,
+        areaName: 'Dallas-Fort Worth-Arlington, TX',
+      },
+      {
+        seriesId: 'LNS11300000',
+        title: 'Price index',
+        surveyAbbr: 'AP',
+        seasonal: false,
+        itemName: 'Small appliances',
+      },
+    ]);
+    expect(await idsFor(svc, 'all', 50)).toEqual([]);
+  });
+
+  it('counts a match in the headline description toward the headline gate', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'JTS000000000000000JOL',
+        title:
+          'JOLTS - Job openings - Total nonfarm - Total US - All size classes - Level - In Thousands',
+        surveyAbbr: 'JT',
+        seasonal: true,
+        areaName: 'Total US',
+      },
+      {
+        seriesId: 'TEST_INDUSTRIES',
+        title: 'Industries, all sizes',
+        surveyAbbr: 'AP',
+        seasonal: false,
+      },
+    ]);
+    // "industries" is only in the headline's description ("jolts job openings all industries"),
+    // and "all" in its title: 2 of 2 tokens, so the +8 lifts it over a row matching both in its title.
+    expect(await idsFor(svc, 'industries all')).toEqual([
+      'JTS000000000000000JOL',
+      'TEST_INDUSTRIES',
+    ]);
+  });
+
+  it.each<[string, string[]]>([
+    ['payrolls', ['CES0000000001', 'CES2000000057']],
+    ['job openings', ['JTS000000000000000JOL', 'JTS230000000000000JOR']],
+    ['consumer prices', ['CUUR0000SA0', 'CUSR0000SA0', 'CUUR0000SA0R']],
+  ])('keeps the top results for the plural or stem query %j', async (query, top) => {
+    const svc = await seedAndLoad(HEADLINES);
+    expect((await idsFor(svc, query)).slice(0, top.length)).toEqual(top);
+  });
+
+  it('matches a stem at a word start: "manufactur" finds "manufacturing"', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'CES3000000001',
+        title: 'All employees, thousands, manufacturing, seasonally adjusted',
+        surveyAbbr: 'CE',
+        seasonal: true,
+        itemName: 'Manufacturing',
+      },
+    ]);
+    expect(await idsFor(svc, 'manufactur')).toEqual(['CES3000000001']);
+  });
+
+  it('keeps matching a SeriesID fragment inside the ID, where the item code sits', async () => {
+    const svc = await seedAndLoad(HEADLINES);
+    expect((await idsFor(svc, 'seha rent')).slice(0, 2).sort()).toEqual([
+      'CUSR0000SEHA',
+      'CUUR0000SEHA',
+    ]);
+    expect((await idsFor(svc, 'sa0')).slice(0, 2)).toEqual(['CUUR0000SA0', 'CUSR0000SA0']);
+  });
+
+  it('still lifts a headline its survey alias names, with no title token match', async () => {
+    const svc = await seedAndLoad(HEADLINES);
+    expect((await idsFor(svc, 'jobs'))[0]).toBe('CES0000000001');
+    expect((await idsFor(svc, 'inflation')).slice(0, 2)).toEqual(['CUUR0000SA0', 'CUSR0000SA0']);
+  });
+});
+
+describe('startsWord (#91)', () => {
+  it('matches where a word starts, literally, and lets the end run on', () => {
+    expect(startsWord('all items', 'all')).toBe(true);
+    expect(startsWord('seasonally adjusted', 'all')).toBe(false);
+    expect(startsWord('seasonally adjusted, all items', 'all')).toBe(true);
+    expect(startsWord('aggregate weekly payrolls', 'payroll')).toBe(true);
+    expect(startsWord('in u.s. city average', 'u.s.')).toBe(true);
+    expect(startsWord('in uxsx city', 'u.s.')).toBe(false);
+    expect(startsWord('state_rate', 'rate')).toBe(false);
+    expect(startsWord('ppi (final)', '(final')).toBe(true);
+    expect(startsWord('anything', '')).toBe(false);
+  });
+
+  it('takes caller text of any length that a RegExp would refuse to compile', () => {
+    const title = 'All items in U.S. city average, all urban consumers, not seasonally adjusted';
+    expect(startsWord(title, 'all '.repeat(20_000))).toBe(false);
+    expect(startsWord(`${'all '.repeat(20_000)}x`, 'all')).toBe(true);
+  });
+
+  it('runs in linear time on worst-case caller text, as haystack or needle', () => {
+    const title = 'All items in U.S. city average, all urban consumers, not seasonally adjusted';
+    const run = (input: string) => {
+      startsWord(title, input);
+      startsWord(input, 'all');
+      startsWord(input, 'job vacanc');
+    };
+    /** Units whose every position holds a near-miss: an in-word "all", or a phrase that fails late. */
+    for (const unit of ['xall', 'all ', 'job ', 'a', '(']) {
+      const text = (n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+      expectLinearTime(run, text, unit);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long and repetitive queries stay bounded (#92)
+// ---------------------------------------------------------------------------
+
+describe('BlsCatalogService.search — long and repetitive queries (#92)', () => {
+  /** An items-only row that scores 3, a row matching only "all" (2), and the CES headline. */
+  const ROWS: CatalogSeries[] = [
+    {
+      seriesId: 'TEST_ITEMS',
+      title: 'Items index',
+      surveyAbbr: 'AP',
+      seasonal: false,
+      itemName: 'Items',
+    },
+    { seriesId: 'TEST_ALL', title: 'All data series', surveyAbbr: 'AP', seasonal: false },
+    {
+      seriesId: 'CES0000000001',
+      title: 'All employees, thousands, total nonfarm, seasonally adjusted',
+      surveyAbbr: 'CE',
+      seasonal: true,
+      itemName: 'Total nonfarm',
+    },
+  ];
+  const idsFor = async (svc: BlsCatalogService, query: string, area?: string) =>
+    (
+      await svc.search(search(query, { limit: 50, ...(area !== undefined && { area }) }))
+    ).series.map((s) => s.seriesId);
+
+  it('scores a repeated token once: "all all all items" ranks as "all items"', async () => {
+    const svc = await seedAndLoad(ROWS);
+    const once = await idsFor(svc, 'all items');
+    expect(once).toEqual(['TEST_ITEMS', 'TEST_ALL', 'CES0000000001']);
+    expect(await idsFor(svc, 'all all all items')).toEqual(once);
+    expect(await idsFor(svc, `${'all '.repeat(800)}items`)).toEqual(once);
+  });
+
+  it('keeps the headline gate on distinct tokens: repeating "all" earns CES no boost', async () => {
+    const svc = await seedAndLoad(ROWS);
+    const result = await svc.search(search('all all all items'));
+    expect(result.series.at(-1)?.seriesId).toBe('CES0000000001');
+  });
+
+  it('scores the first 32 distinct tokens and ignores the rest', async () => {
+    const svc = await seedAndLoad([
+      { seriesId: 'TEST_W31', title: 'Word w31 row', surveyAbbr: 'AP', seasonal: false },
+      { seriesId: 'TEST_W32', title: 'Word w32 row', surveyAbbr: 'AP', seasonal: false },
+    ]);
+    // Two-digit words, so no token is a word-start prefix of another ("w3" of "w32").
+    const words = Array.from({ length: 40 }, (_, i) => `w${String(i).padStart(2, '0')}`);
+    // Repeats before the cap do not use it up: w00 twice still leaves w31 the 32nd distinct token.
+    const ids = await idsFor(svc, ['w00', ...words].join(' '));
+    expect(ids).toEqual(['TEST_W31']);
+  });
+
+  it('stays bounded in time however many distinct tokens the query holds', async () => {
+    const svc = await seedAndLoad(
+      Array.from({ length: 2_000 }, (_, i) => ({
+        seriesId: `TEST_BOUND${String(i).padStart(4, '0')}`,
+        title: `Series w${i} a${i % 7} b${i % 11} all items`,
+        surveyAbbr: 'AP',
+        seasonal: false,
+      })),
+    );
+    /** Median of five runs, so one GC pause cannot decide the ratio. */
+    const time = async (query: string) => {
+      const runs: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const start = performance.now();
+        await svc.search(search(query));
+        runs.push(performance.now() - start);
+      }
+      return runs.sort((a, b) => a - b)[2] ?? 0;
+    };
+    const distinct = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ');
+    await time(distinct(32)); // warm the statement cache and the JIT
+    const t32 = Math.max(await time(distinct(32)), 5);
+    const t5000 = await time(distinct(5_000));
+    const tRepeat = await time('all '.repeat(5_000));
+    // The cap makes cost independent of query length; uncapped, 5,000 terms cost ~90× 32.
+    expect(t5000 / t32).toBeLessThan(8);
+    expect(t5000).toBeLessThan(250);
+    expect(tRepeat).toBeLessThan(250);
+  });
+
+  it('matches nothing for an area longer than any indexed text, without a SQLite error', async () => {
+    const svc = await seedAndLoad(ROWS);
+    const area = 'a'.repeat(60_000);
+    expect(await idsFor(svc, 'all items', area)).toEqual([]);
+    // An exact SeriesID still scores before the area gate, as it does for any area.
+    expect(await idsFor(svc, 'TEST_ITEMS', area)).toEqual(['TEST_ITEMS']);
   });
 });

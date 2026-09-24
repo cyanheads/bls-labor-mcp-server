@@ -25,7 +25,7 @@ function normalizeFilter(value: string | undefined): string | undefined {
 
 export const blsSearchSeriesTool = tool('bls_search_series', {
   title: 'Search BLS Series',
-  description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE only when the server sets BLS_CATALOG_INCLUDE_OES=true); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts state names, MSA names, or FIPS area codes.`,
+  description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag, and publication frequency for surveys that publish one series at several frequencies) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE only when the server sets BLS_CATALOG_INCLUDE_OES=true); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts state names, MSA names, or FIPS area codes.`,
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -97,6 +97,12 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
               .string()
               .describe(
                 'Seasonality descriptor matching the data-tool form: "Seasonally Adjusted" or "Not Seasonally Adjusted".',
+              ),
+            frequency: z
+              .string()
+              .optional()
+              .describe(
+                'Publication frequency — "Monthly", "Semi-Annual", "Quarterly", or "Annual" — for CU, CW, and LN, which publish one series at several frequencies under the same title. Absent for other surveys.',
               ),
           })
           .describe('A matching BLS series entry.'),
@@ -260,6 +266,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
         ...(s.areaName ? { area: s.areaName } : {}),
         ...(s.itemName ? { item: s.itemName } : {}),
         seasonal: s.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted',
+        ...(s.frequency ? { frequency: s.frequency } : {}),
       })),
     };
   },
@@ -275,7 +282,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       const parts: string[] = [`**${s.seriesId}**`];
       parts.push(`— ${s.title}`);
       if (s.area) parts.push(`· ${s.area}`);
-      if (s.seasonal) parts.push(`(${s.seasonal})`);
+      if (s.seasonal) parts.push(`(${[s.seasonal, s.frequency].filter(Boolean).join(', ')})`);
       parts.push(`[${s.survey}]`);
       lines.push(parts.join(' '));
       if (s.item) lines.push(`  _${s.item}_`);

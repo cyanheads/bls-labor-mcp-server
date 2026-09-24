@@ -37,7 +37,7 @@ const ServerConfigSchema = z.object({
     .positive()
     .default(168)
     .describe(
-      'Catalog freshness window in hours — re-harvest into the SQLite index once its last completion is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). The existing index stays queryable throughout a refresh.',
+      'Catalog freshness window in hours — re-harvest into the SQLite index once its last completion is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). Checked at startup and hourly while the server runs, so a long-running process refreshes without a restart. The existing index stays queryable throughout a refresh.',
     ),
   catalogIncludeOes: z
     .stringbool()

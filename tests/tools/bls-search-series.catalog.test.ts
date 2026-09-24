@@ -1,9 +1,10 @@
 /**
  * @fileoverview End-to-end tests for bls_search_series over a real seeded
- * SQLite catalog: the service loads a pre-built index (warm path, no harvest)
- * and the tool runs through `runToolContract`, so the filter normalization,
- * the SQL candidate query, the rescore, offset paging, and the enrichment
- * notices all run for real on both `structuredContent` and `content[]`.
+ * SQLite catalog: the service loads a pre-built index (warm path, no harvest;
+ * the OES opt-in case re-harvests and every download fails) and the tool runs
+ * through `runToolContract`, so the filter normalization, the SQL candidate
+ * query, the rescore, offset paging, and the enrichment notices all run for
+ * real on both `structuredContent` and `content[]`.
  * @module tests/tools/bls-search-series.catalog.test
  */
 
@@ -18,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
 import { blsSearchSeriesTool } from '@/mcp-server/tools/definitions/bls-search-series.tool.js';
 import {
+  catalogSurveyList,
   createCatalogStore,
   getBlsCatalogService,
   initBlsCatalogService,
@@ -39,7 +41,14 @@ interface SearchStructured {
   nextOffset?: number;
   notice?: string;
   offsetApplied?: number;
-  series: Array<{ seriesId: string; area?: string; survey: string }>;
+  series: Array<{
+    seriesId: string;
+    area?: string;
+    frequency?: string;
+    item?: string;
+    seasonal: string;
+    survey: string;
+  }>;
   shown?: number;
   surveyFilter?: string;
   totalCount: number;
@@ -144,6 +153,7 @@ async function seedCatalog(dbPath: string, rows: CatalogSeries[]): Promise<void>
       area_name: s.areaName ?? null,
       item_name: s.itemName ?? null,
       seasonal: s.seasonal ? 1 : 0,
+      frequency: s.frequency ?? null,
     })),
     [],
   );
@@ -151,19 +161,34 @@ async function seedCatalog(dbPath: string, rows: CatalogSeries[]): Promise<void>
     status: 'complete',
     completedAt: new Date().toISOString(),
     total: rows.length,
+    checkpoint: catalogSurveyList(false),
   });
   await store.close();
 }
 
+/**
+ * URLs the service fetched since the last `startService()`. Kept here because
+ * Vitest clears a spy's call history before each test, which would hide a
+ * fetch made in `beforeAll`.
+ */
+const fetched: string[] = [];
+
 /** Point the service at a freshly seeded index and load it. Any fetch fails the load loudly. */
-async function startService(env: Record<string, string> = {}): Promise<void> {
+async function startService(
+  env: Record<string, string> = {},
+  rows: CatalogSeries[] = ALL_ROWS,
+): Promise<void> {
   tmpDir = await mkdtemp(join(tmpdir(), 'bls-search-catalog-'));
   const dbPath = join(tmpDir, 'catalog.db');
-  await seedCatalog(dbPath, ALL_ROWS);
+  await seedCatalog(dbPath, rows);
   resetServerConfig();
   vi.stubEnv('BLS_CATALOG_DB_PATH', dbPath);
   for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
-  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unmocked fetch'));
+  fetched.length = 0;
+  vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+    fetched.push(String(url));
+    return Promise.reject(new Error('unmocked fetch'));
+  });
   initBlsCatalogService(coreConfig, coreStorage);
   await getBlsCatalogService().load(1);
 }
@@ -195,6 +220,7 @@ describe('bls_search_series over a seeded catalog', () => {
   it('loads the seeded index without fetching', () => {
     expect(getBlsCatalogService().totalSeries).toBe(ALL_ROWS.length);
     expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(fetched).toEqual([]);
   });
 
   describe('offset omitted (characterization)', () => {
@@ -481,13 +507,164 @@ describe('bls_search_series over a seeded catalog', () => {
       expect(surveyCodes.length).toBeGreaterThan(0);
       expect(surveyCodes.filter((c) => !codes.has(c))).toEqual([]);
       expect(text).toMatch(/OE[^.]*BLS_CATALOG_INCLUDE_OES=true/);
+      expect(text).toContain('CW, CM, CI;');
     });
   });
 });
 
+const FREQUENCY_ROWS: CatalogSeries[] = [
+  {
+    seriesId: 'CUUR0100SA0',
+    title: 'All items in Northeast urban, all urban consumers, not seasonally adjusted',
+    surveyAbbr: 'CU',
+    seasonal: false,
+    areaName: 'Northeast urban',
+    itemName: 'All items',
+    frequency: 'Monthly',
+  },
+  {
+    seriesId: 'CUUS0100SA0',
+    title: 'All items in Northeast urban, all urban consumers, not seasonally adjusted',
+    surveyAbbr: 'CU',
+    seasonal: false,
+    areaName: 'Northeast urban',
+    itemName: 'All items',
+    frequency: 'Semi-Annual',
+  },
+  {
+    seriesId: 'LNS14000000Q',
+    title: '(Seas) Unemployment Rate',
+    surveyAbbr: 'LN',
+    seasonal: true,
+    frequency: 'Quarterly',
+  },
+  {
+    seriesId: 'CMU1010000000000D',
+    title: 'Total compensation cost per hour worked for civilian workers',
+    surveyAbbr: 'CM',
+    seasonal: false,
+    areaName: 'United States (National)',
+    itemName: 'Total compensation',
+  },
+  {
+    seriesId: 'CIU1010000000000A',
+    title: 'Total compensation for all civilian workers, 12-month percent change, current dollars',
+    surveyAbbr: 'CI',
+    seasonal: false,
+    areaName: 'United States (National)',
+    itemName: 'Total compensation',
+  },
+  {
+    seriesId: 'CIU20100000000LLA',
+    title:
+      'Total compensation for private industry workers in the Seattle-Tacoma, WA CSA, 12-month percent change, current dollars',
+    surveyAbbr: 'CI',
+    seasonal: false,
+    areaName: 'Seattle-Tacoma, WA CSA',
+    itemName: 'Total compensation',
+  },
+];
+
+describe('bls_search_series — frequency field and CM/CI rows (#85, #86)', () => {
+  beforeAll(() => startService({}, FREQUENCY_ROWS));
+  afterAll(() => stopService());
+
+  it('carries frequency on both surfaces for a semiannual query, lifting the semiannual twin', async () => {
+    const { structured, text } = await call({ query: 'semiannual all items', survey: 'CU' });
+    expect(structured.series.map((s) => [s.seriesId, s.frequency])).toEqual([
+      ['CUUS0100SA0', 'Semi-Annual'],
+      ['CUUR0100SA0', 'Monthly'],
+    ]);
+    expect(text).toContain(
+      '**CUUS0100SA0** — All items in Northeast urban, all urban consumers, not seasonally adjusted · Northeast urban (Not Seasonally Adjusted, Semi-Annual) [CU]',
+    );
+    expect(text).toContain('**CUUR0100SA0** —');
+    expect(text).toContain('(Not Seasonally Adjusted, Monthly) [CU]');
+  });
+
+  it('carries the quarterly frequency for an exact LN SeriesID', async () => {
+    const { structured, text } = await call({ query: 'LNS14000000Q' });
+    expect(structured.series[0]).toEqual({
+      seriesId: 'LNS14000000Q',
+      title: '(Seas) Unemployment Rate',
+      survey: 'LN',
+      seasonal: 'Seasonally Adjusted',
+      frequency: 'Quarterly',
+    });
+    expect(text).toContain('(Seasonally Adjusted, Quarterly) [LN]');
+  });
+
+  it('omits frequency on both surfaces for a row without one (CM/CI)', async () => {
+    const { structured, text } = await call({ query: 'compensation' });
+    expect(
+      structured.series
+        .map((s) => s.survey)
+        .slice(0, 3)
+        .sort(),
+    ).toEqual(['CI', 'CI', 'CM']);
+    for (const s of structured.series) expect(s).not.toHaveProperty('frequency');
+    expect(structured.series.find((s) => s.seriesId === 'CMU1010000000000D')).toEqual({
+      seriesId: 'CMU1010000000000D',
+      title: 'Total compensation cost per hour worked for civilian workers',
+      survey: 'CM',
+      area: 'United States (National)',
+      item: 'Total compensation',
+      seasonal: 'Not Seasonally Adjusted',
+    });
+    expect(text).toContain(
+      '**CMU1010000000000D** — Total compensation cost per hour worked for civilian workers · United States (National) (Not Seasonally Adjusted) [CM]',
+    );
+    expect(text).toContain('  _Total compensation_');
+  });
+
+  it('pages the CM/CI rows and names the next page', async () => {
+    const first = await call({ query: 'total compensation', limit: 2 });
+    expect(first.structured.totalCount).toBe(3);
+    expect(first.structured.nextOffset).toBe(2);
+    expect(first.text).toContain('Pass offset: 2 for the next page.');
+    const past = await call({ query: 'total compensation', limit: 2, offset: 3 });
+    expect(past.structured.series).toEqual([]);
+    expect(past.structured.notice).toContain('Offset 3 is past the last of 3 results.');
+    expect(past.text).toContain('No series returned.');
+  });
+
+  it('filters CM/CI to an area and a survey', async () => {
+    const seattle = await call({ query: 'total compensation', area: 'Seattle' });
+    expect(ids(seattle.structured)).toEqual(['CIU20100000000LLA']);
+    const cm = await call({ query: 'total compensation', survey: 'cm' });
+    expect(ids(cm.structured)).toEqual(['CMU1010000000000D']);
+    expect(cm.structured.surveyFilter).toBe('CM');
+  });
+
+  it('returns nothing, with the no-match notice, for a frequency word alone', async () => {
+    const { structured, text } = await call({ query: 'semiannual' });
+    expect(structured.series).toEqual([]);
+    expect(structured.notice).toContain('No matching series found.');
+    expect(text).toContain('No series returned.');
+  });
+
+  it('rejects an out-of-range limit as invalid params', async () => {
+    const { result } = await call({ query: 'semiannual all items', limit: 0 });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams },
+    });
+  });
+});
+
+/**
+ * The seeded index was harvested without OES, so the opt-in makes the boot
+ * load re-harvest; every download fails, the load applies nothing, and the
+ * index is kept — the state a failed OE download leaves behind.
+ */
 describe('bls_search_series with the OES opt-in on but no OE rows indexed (#64)', () => {
   beforeAll(() => startService({ BLS_CATALOG_INCLUDE_OES: 'true' }));
   afterAll(() => stopService());
+
+  it('re-harvested for the opt-in and kept the index when the downloads failed', () => {
+    expect(fetched).toContain('https://download.bls.gov/pub/time.series/oe/oe.series');
+    expect(getBlsCatalogService().totalSeries).toBe(ALL_ROWS.length);
+  });
 
   it('gives the not-indexed notice without the opt-in instruction', async () => {
     const { structured } = await call({ query: 'registered nurses wage', survey: 'OE' });

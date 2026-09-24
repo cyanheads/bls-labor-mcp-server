@@ -60,9 +60,10 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 - `limit` 1–50 (default 10) and `offset` (default 0) page through the ranked results; `nextOffset` names the next page while `truncated` is true
 - Without `area`, national series rank ahead of state and metro series that match equally well
 - Decodes BLS's opaque positional SeriesIDs (e.g. `LNS14000000`) into survey, area, item, and seasonal-flag components alongside the plain-language title
+- CPI (CU, CW) and CPS (LN) publish one series at several frequencies under the same title; each result carries `frequency` (`Monthly`, `Semi-Annual`, `Quarterly`, `Annual`) to tell the twins apart, and a query naming `monthly`, `quarterly`, or `semiannual` lifts rows of that frequency over their twins
 - Also accepts a SeriesID directly for exact lookup
 - `capped: true` means the ~1000-candidate FTS pool, after the survey/area/seasonal filters, was exhausted — `totalCount` is then a lower bound, not an exact match count, and paging stops at the pool
-- Searches the surveys in its offline index: AP, CE, CU, CW, EC, JT, LA, LN, MP, PC, PR, and WP by default, plus OE when `BLS_CATALOG_INCLUDE_OES=true`. A survey outside the index gets a notice listing the indexed codes; its series are still fetchable by SeriesID with `bls_get_series`
+- Searches the surveys in its offline index: AP, CE, CI, CM, CU, CW, EC, JT, LA, LN, MP, PC, PR, and WP by default, plus OE when `BLS_CATALOG_INCLUDE_OES=true`. Compensation queries ("compensation", "employer costs", "employment cost index", or ECI/ECEC with a subject, as in "ECI benefits") surface the current ECEC (CM) and Employment Cost Index (CI) ahead of EC, the SIC-basis ECI that ended in 2005; a bare "ECI" still matches only EC, whose titles carry the acronym. A survey outside the index gets a notice listing the indexed codes; its series are still fetchable by SeriesID with `bls_get_series`
 - Operates entirely offline against the LABSTAT catalog index — consumes no BLS API quota
 
 ---
@@ -252,7 +253,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `BLS_BASE_URL` | BLS API v2 base URL. | `https://api.bls.gov/publicAPI/v2` |
 | `BLS_CATALOG_BASE_URL` | LABSTAT flat-file base URL. Override to point at a local mirror. | `https://download.bls.gov/pub/time.series` |
 | `BLS_CATALOG_DB_PATH` | On-disk SQLite catalog index — queried on demand and persisted across restarts. Empty uses an in-memory DB (re-harvested each boot). Mount a volume here in containers. | `.cache/bls-catalog.db` |
-| `BLS_CATALOG_CACHE_TTL_HOURS` | Catalog freshness window in hours — re-harvest once the index is older. | `168` (7 days) |
+| `BLS_CATALOG_CACHE_TTL_HOURS` | Catalog freshness window in hours — re-harvest once the index is older, checked at startup and hourly while running. | `168` (7 days) |
 | `BLS_CATALOG_INCLUDE_OES` | Include the OES/OEWS wage survey (~6M series / ~1.2 GB; multi-minute first harvest). Off by default — OES series stay fetchable by ID. | `false` |
 | `BLS_OBSERVATIONS_MIRROR_ENABLED` | Serve observations from a local SQLite mirror instead of the live API (requires a one-time bootstrap — see below). | `false` |
 | `BLS_DATASET_TTL_SECONDS` | Per-dataframe TTL for canvas-registered tables, in seconds. | `86400` (24 h) |
@@ -279,7 +280,7 @@ For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls
    node dist/services/bls-observations/subprocess.js --init
    ```
 
-Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
+The mirror harvests every survey in the catalog's survey list — OE included, whatever `BLS_CATALOG_INCLUDE_OES` says — so it covers CM and CI too (about 55 MB of `cm.data.*` / `ci.data.*` files). An incremental refresh reads only files published after the mirror's last one, so a mirror bootstrapped before CM and CI joined picks each file up at its next BLS publication; until then those series come from the live API when fallback is on. Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
 
 **Upgrading an existing mirror.** A mirror bootstrapped before sentinel rows were stored is missing the periods BLS publishes with its `-` missing-value marker. Opening such a mirror clears its sync checkpoint once, so the next refresh re-reads every LABSTAT file and fills them in — no operator action beyond letting that refresh run, and it takes as long as a full read. The mirror keeps serving throughout.
 

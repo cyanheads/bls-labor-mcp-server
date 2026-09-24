@@ -6,6 +6,12 @@
 /** One entry in the loaded series index. */
 export interface CatalogSeries {
   areaName?: string;
+  /**
+   * Publication frequency label from the survey's periodicity table (`Monthly`,
+   * `Semi-Annual`, `Quarterly`, `Annual`) — set for surveys that publish one
+   * series at several frequencies under the same title (CU, CW, LN).
+   */
+  frequency?: string;
   itemName?: string;
   seasonal: boolean;
   seriesId: string;
@@ -52,13 +58,19 @@ export interface CodeDimension {
 /**
  * Represents a single survey's LABSTAT files. The catalog loader fetches
  * `{abbr}.series` plus the code tables its dimensions name, and decodes each
- * row's area, item, and — when the file ships no `series_title` — its title.
+ * row's area, item, frequency, and — when the file ships no `series_title` —
+ * its title.
  */
 export interface SurveyDefinition {
   /** Two-letter LABSTAT survey abbreviation (e.g. `cu`, `ce`, `ln`). */
   abbr: string;
   /** Dimension decoded as the series `area` (geography). */
   area?: CodeDimension;
+  /**
+   * Dimension decoded as the series publication `frequency` — only for surveys
+   * whose periodicity code means publication frequency rather than a measure type.
+   */
+  frequency?: CodeDimension;
   /** Dimension decoded as the series `item` (the item, product, industry, or measure). */
   item?: CodeDimension;
   /** Program label; prefixes every title the loader synthesizes for this survey. */

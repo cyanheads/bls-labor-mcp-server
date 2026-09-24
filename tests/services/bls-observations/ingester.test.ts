@@ -370,7 +370,7 @@ describe('observationsSync — index data-file discovery', () => {
   });
 
   it('warns and fetches nothing when the index lists no data files', async () => {
-    // No guessed filename: `{abbr}.data.1.AllData` exists for 5 of the 13
+    // No guessed filename: `{abbr}.data.1.AllData` exists for only some
     // harvested surveys, so requesting it for the rest only 404s.
     const log = recordingLog();
     const urls = await captureDataUrls(INDEX_WITH_NO_FILES, log);
@@ -420,6 +420,52 @@ describe('observationsSync — {abbr}.txt index (#78)', () => {
     expect(fetched.some((u) => u.includes('cu.data.0.current'))).toBe(true);
     expect(fetched.some((u) => u.includes('cu.data.1.allitems'))).toBe(true);
     expect(fetched.some((u) => u.includes('cu.readme'))).toBe(false);
+  });
+
+  it.each([
+    [
+      'cm',
+      [
+        '\tcm.data.1.AllData\t- all estimates\t\t\tdata file',
+        '\tcm.data.0.Current\t- All most recent reference \tdata file',
+        '\t1.  cm.data.0.Current\t- Most recent reference period estimates',
+        '\t2.  cm.data.1.AllData\t- All estimates',
+        'File Name: cm.data.0.Current',
+      ],
+    ],
+    [
+      'ci',
+      [
+        '\tci.data.0.Current\t- all most recent reference ',
+        '\tci.data.1.AllData\t- all estimates\t\t\tdata file',
+        '\t1. ci.data.0.Current\t- All recent reference period estimates',
+        '\t2. ci.data.1.AllData\t- All estimates',
+      ],
+    ],
+  ])('harvests both %s data files its real index lists (#86)', async (abbr, lines) => {
+    const dataUrls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = String(url);
+      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
+      if (u.endsWith(`/${abbr}/${abbr}.txt`)) {
+        return Promise.resolve(new Response(lines.join('\r\n'), { status: 200, headers }));
+      }
+      if (u.includes(`/${abbr}/`) && u.includes('.data.')) {
+        dataUrls.push(u.slice(u.lastIndexOf('/') + 1));
+        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const pages: Array<{ records: unknown[] }> = [];
+    for await (const page of observationsSync(makeCtx(), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+    })) {
+      pages.push(page);
+    }
+    expect(dataUrls.sort()).toEqual([`${abbr}.data.0.current`, `${abbr}.data.1.alldata`]);
+    expect(pages.flatMap((p) => p.records)).toHaveLength(6);
   });
 
   it('warns and harvests nothing when a survey yields no data files', async () => {
@@ -609,6 +655,8 @@ describe('SURVEY_ABBRS — canonical survey list (#49)', () => {
       'pr',
       'mp',
       'cw',
+      'cm',
+      'ci',
     ]);
   });
 });
