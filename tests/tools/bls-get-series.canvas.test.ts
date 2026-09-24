@@ -195,6 +195,20 @@ describe('bls_get_series spill schema on the DuckDB canvas (#97)', () => {
     expect(result.rows).toEqual([{ rows_with_value: '0' }]);
   });
 
+  it('stores NULL, not 0, in value_numeric for an available observation with a blank value', async () => {
+    const { name } = await spillAndDescribe(
+      spillingSeries((i) => (i % 10 === 0 ? '' : (4 + i / 100).toFixed(2))),
+    );
+
+    const blank = await query(
+      `SELECT COUNT(*) AS n FROM ${name} WHERE available AND value = '' AND value_numeric IS NULL`,
+    );
+    const zero = await query(`SELECT COUNT(*) AS n FROM ${name} WHERE value_numeric = 0`);
+    // COUNT is BIGINT, which canvas rows carry as a JSON string.
+    expect(blank.rows).toEqual([{ n: '90' }]);
+    expect(zero.rows).toEqual([{ n: '0' }]);
+  });
+
   it('keeps the inline observations on BLS strings', async () => {
     fetchSeriesMock.mockResolvedValue([
       spillingSeries((i) => (300 + i / 10).toFixed(1), { pctChange12Month: '2.9' }),
