@@ -732,7 +732,7 @@ describe('blsGetSeriesTool', () => {
     expect(text).toContain('Preliminary');
   });
 
-  it('formats series with no observations with a helpful message', () => {
+  it('formats series with no observations by deferring to the notice (#80)', () => {
     const output = {
       series: [
         {
@@ -747,7 +747,9 @@ describe('blsGetSeriesTool', () => {
     const blocks = blsGetSeriesTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('No observations');
-    expect(text).toContain('bls_search_series');
+    // Only the notice knows the reason — a quota wall must not read as a bad SeriesID.
+    expect(text).toContain('The notice names the reason');
+    expect(text).not.toContain('bls_search_series');
   });
 
   it('throws canvas_unavailable when the result spills and canvas is not configured', async () => {

@@ -440,7 +440,10 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
       responseTime: 10,
       message: ['Your request has failed. Please check your input parameters, and try again.'],
     };
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
+    // The generic rejection earns one catalog-free re-issue, rejected the same way (#81).
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okJson(unknownError))
+      .mockResolvedValueOnce(okJson(unknownError));
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
@@ -460,7 +463,10 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
       responseTime: 10,
       message: ['Your request has failed.'],
     };
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
+    // The generic rejection earns one catalog-free re-issue, rejected the same way (#81).
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okJson(unknownError))
+      .mockResolvedValueOnce(okJson(unknownError));
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     // The service has no contract of its own — it spreads ctx.recoveryFor(), so the
@@ -492,7 +498,10 @@ describe('BlsApiService.fetchSeries — error message parsing', () => {
       responseTime: 10,
       message: ['Your request has failed.'],
     };
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(okJson(unknownError));
+    // The generic rejection earns one catalog-free re-issue, rejected the same way (#81).
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okJson(unknownError))
+      .mockResolvedValueOnce(okJson(unknownError));
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();

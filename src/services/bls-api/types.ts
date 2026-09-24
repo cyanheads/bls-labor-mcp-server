@@ -72,9 +72,23 @@ export interface SeriesData {
     reason: 'no_data_for_period' | 'series_not_found';
   };
   item?: string;
+  /**
+   * Why the live fallback returned nothing for a series the observations mirror
+   * does not hold. Set only on a partial result — the mirror served other
+   * requested series — and kept apart from `failure`, which reports a BLS
+   * advisory about the series itself. `reason` is absent for an untyped failure
+   * such as a network error.
+   */
+  liveFailure?: {
+    message: string;
+    reason?: string;
+    recovery?: string;
+  };
   observations: Observation[];
   seasonal?: string;
   seriesId: string;
+  /** `'mirror'` when the local observation mirror served the series; its rows carry no BLS calculations. */
+  source?: 'mirror';
   title?: string;
 }
 

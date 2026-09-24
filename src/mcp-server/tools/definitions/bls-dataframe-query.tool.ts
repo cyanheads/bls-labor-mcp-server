@@ -1,6 +1,7 @@
 /**
  * @fileoverview Run a single-statement SELECT against canvas dataframes
- * registered by bls_get_series. Layered SQL gate: framework (single-statement →
+ * registered by bls_get_series or an earlier register_as. Layered SQL gate:
+ * framework (single-statement →
  * SELECT only → plan-walk allowlist + denied table functions) plus bridge-layer
  * denial of DuckDB system catalogs. Requires CANVAS_PROVIDER_TYPE=duckdb.
  * @module mcp-server/tools/definitions/bls-dataframe-query
@@ -21,7 +22,7 @@ const escapeCell = (s: string): string => s.replace(/\\/g, '\\\\').replace(/\|/g
 export const blsDataframeQueryTool = tool('bls_dataframe_query', {
   title: 'Query BLS Dataframes',
   description:
-    'Run a single-statement SELECT against the canvas dataframes registered by bls_get_series. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied at the bridge layer — use bls_dataframe_describe to list available dataframes. Supports JOINs, aggregates, window functions, and CTEs. Optional register_as persists the result as a new dataframe with a fresh TTL for chained analysis. Canvas SQL operations consume zero BLS API quota. Requires CANVAS_PROVIDER_TYPE=duckdb.',
+    'Run a single-statement SELECT against the canvas dataframes registered by bls_get_series or by an earlier register_as. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied at the bridge layer — use bls_dataframe_describe to list available dataframes. Supports JOINs, aggregates, window functions, and CTEs. Optional register_as persists the result as a new dataframe with a fresh TTL for chained analysis. Canvas SQL operations consume zero BLS API quota. Requires CANVAS_PROVIDER_TYPE=duckdb.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [

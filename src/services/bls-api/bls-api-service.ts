@@ -18,7 +18,12 @@
  * least one full sync, `fetchSeries` and `fetchLatest` are routed through the
  * local SQLite mirror instead of the BLS API, bypassing the 500/day quota cap.
  * Series IDs missing from the mirror fall back to the live API when
- * `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=true` (the default).
+ * `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=true` (the default); a fallback that
+ * fails leaves those IDs empty, with the failure attached, rather than
+ * discarding what the mirror served.
+ *
+ * Both live calls request BLS catalog metadata, and re-issue a request once
+ * without it when BLS answers with its generic, series-less rejection.
  * @module services/bls-api/bls-api-service
  */
 
@@ -26,7 +31,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   configurationError,
-  type McpError,
+  McpError,
   notFound,
   serializationError,
   serviceUnavailable,
@@ -180,6 +185,47 @@ function alignToRequestOrder(seriesIds: string[], resolved: SeriesData[]): Serie
   return seriesIds.map((seriesId) => byId.get(seriesId) ?? { seriesId, observations: [] });
 }
 
+/**
+ * Describe a failed live fallback for the entries it left empty: the typed
+ * `reason` and the recovery hint the calling tool's contract resolved, or the
+ * bare message for an untyped failure such as a network error.
+ */
+function describeLiveFailure(error: unknown): NonNullable<SeriesData['liveFailure']> {
+  const message = error instanceof Error ? error.message : String(error);
+  const data = error instanceof McpError ? error.data : undefined;
+  const reason = data?.reason;
+  const hint = (data?.recovery as { hint?: unknown } | undefined)?.hint;
+  return {
+    message,
+    ...(typeof reason === 'string' && { reason }),
+    ...(typeof hint === 'string' && { recovery: hint }),
+  };
+}
+
+/** Title, area, item, and seasonality as the catalog index records them. */
+function catalogFields(
+  match: CatalogSeries | undefined,
+): Pick<SeriesData, 'area' | 'item' | 'seasonal' | 'title'> {
+  if (!match) return {};
+  return {
+    ...(match.title && { title: match.title }),
+    ...(match.areaName && { area: match.areaName }),
+    ...(match.itemName && { item: match.itemName }),
+    seasonal: match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted',
+  };
+}
+
+/** Catalog-index metadata for `ids`, or none while the index is unavailable. */
+async function lookupCatalogMetadata(ids: string[]): Promise<Map<string, CatalogSeries>> {
+  let catalog: ReturnType<typeof getBlsCatalogService>;
+  try {
+    catalog = getBlsCatalogService();
+  } catch {
+    return new Map();
+  }
+  return catalog.isLoaded ? await catalog.lookupByIds(ids) : new Map();
+}
+
 /** One BLS advisory about a requested SeriesID. */
 type SeriesAdvisory = NonNullable<SeriesData['failure']>;
 
@@ -234,20 +280,41 @@ export class BlsApiService {
         });
 
         const resolved = await this.mirrorRowsToSeriesData(mirrorResult.observations);
+        const { missedIds } = mirrorResult;
 
-        if (mirrorResult.missedIds.length > 0) {
+        if (missedIds.length > 0) {
           if (cfg.observationsMirrorFallbackLive) {
-            ctx.log.notice('fetchSeries: mirror miss, falling back to live API', {
-              missedIds: mirrorResult.missedIds,
-            });
-            const liveSeries = await this.fetchSeriesLive(
-              { ...options, seriesIds: mirrorResult.missedIds },
-              ctx,
-            );
-            resolved.push(...liveSeries);
+            ctx.log.notice('fetchSeries: mirror miss, falling back to live API', { missedIds });
+            try {
+              resolved.push(
+                ...(await this.fetchSeriesLive({ ...options, seriesIds: missedIds }, ctx)),
+              );
+            } catch (error) {
+              /**
+               * The mirror exists to answer without the live API, so a failed
+               * fallback is a fact about the missed IDs rather than a verdict on
+               * the request — least of all a quota wall, which leaves the mirror
+               * the only source still answering. With no mirrored observations
+               * there is nothing to keep, and a cancelled caller is gone: both
+               * still fail, with the live error as thrown.
+               */
+              if (ctx.signal.aborted || !resolved.some((s) => s.observations.length > 0)) {
+                throw error;
+              }
+              const liveFailure = describeLiveFailure(error);
+              // Not `message`: the client-facing log line would take it as its own text.
+              ctx.log.warning('fetchSeries: live fallback failed; answering from the mirror', {
+                missedIds,
+                reason: liveFailure.reason,
+                error: liveFailure.message,
+              });
+              resolved.push(
+                ...missedIds.map((seriesId) => ({ seriesId, observations: [], liveFailure })),
+              );
+            }
           } else {
             ctx.log.notice('fetchSeries: mirror_partial — some series IDs not in mirror', {
-              missedIds: mirrorResult.missedIds,
+              missedIds,
             });
           }
         }
@@ -276,35 +343,70 @@ export class BlsApiService {
     return this.fetchSeriesLive(options, ctx);
   }
 
-  /** Live API batch fetch — the original implementation. */
+  /** Live API batch fetch — one `POST /timeseries/data`, re-issued once on the generic rejection. */
   private fetchSeriesLive(options: BatchFetchOptions, ctx: Context): Promise<SeriesData[]> {
-    return withRetry(
-      async () => {
-        const body: Record<string, unknown> = {
-          seriesid: options.seriesIds,
-          registrationkey: this.apiKey,
-          catalog: true,
-        };
-        if (options.startYear !== undefined) body.startyear = String(options.startYear);
-        if (options.endYear !== undefined) body.endyear = String(options.endYear);
-        if (options.calculations) body.calculations = true;
-        if (options.annualAverage) body.annualaverage = true;
+    return this.withCatalogReissue(
+      (catalog) =>
+        withRetry(
+          async () => {
+            const body: Record<string, unknown> = {
+              seriesid: options.seriesIds,
+              registrationkey: this.apiKey,
+            };
+            if (catalog) body.catalog = true;
+            if (options.startYear !== undefined) body.startyear = String(options.startYear);
+            if (options.endYear !== undefined) body.endyear = String(options.endYear);
+            if (options.calculations) body.calculations = true;
+            if (options.annualAverage) body.annualaverage = true;
 
-        const response = await fetch(`${this.baseUrl}/timeseries/data`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'User-Agent': this.userAgent },
-          body: JSON.stringify(body),
-          signal: ctx.signal,
-        });
+            const response = await fetch(`${this.baseUrl}/timeseries/data`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'User-Agent': this.userAgent },
+              body: JSON.stringify(body),
+              signal: ctx.signal,
+            });
 
-        return this.parseSeriesResponse(await response.text(), options, ctx);
-      },
-      {
-        operation: 'BlsApiService.fetchSeries',
-        baseDelayMs: 1500,
-        signal: ctx.signal,
-      },
+            return this.parseSeriesResponse(await response.text(), options, ctx);
+          },
+          {
+            operation: 'BlsApiService.fetchSeries',
+            baseDelayMs: 1500,
+            signal: ctx.signal,
+          },
+        ),
+      ctx,
     );
+  }
+
+  /**
+   * Send a request with BLS catalog metadata, re-issuing it once without on
+   * BLS's generic rejection.
+   *
+   * With catalog metadata requested, BLS intermittently answers a request
+   * holding a nonexistent SeriesID — malformed or well-formed — with
+   * `REQUEST_FAILED` and a message naming no series (16 of 27 live probes on
+   * 2026-09-24), which loses every valid series in the batch. The same request
+   * without catalog metadata answered per-series every time (0 of 25), so the
+   * re-issue recovers the advisories, and the catalog index supplies the
+   * metadata BLS then leaves out. A second generic answer is a genuine rejection
+   * and stays `request_rejected`. Every other answer — success included — costs
+   * one request, as before. `send` owns its retry loop, so a transient failure on
+   * the re-issue never repeats the catalog request, and a cancelled caller's
+   * re-issue rejects at `fetch` without being sent.
+   */
+  private async withCatalogReissue(
+    send: (catalog: boolean) => Promise<SeriesData[]>,
+    ctx: Context,
+  ): Promise<SeriesData[]> {
+    try {
+      return await send(true);
+    } catch (error) {
+      if (!(error instanceof McpError && error.data?.reason === 'request_rejected')) throw error;
+      ctx.log.notice('BLS rejected a request carrying catalog metadata; re-issuing it without');
+      const series = await send(false);
+      const metadata = await lookupCatalogMetadata(series.map((s) => s.seriesId));
+      return series.map((s) => ({ ...s, ...catalogFields(metadata.get(s.seriesId)) }));
+    }
   }
 
   /** Fetch the single most recent observation for one series. */
@@ -346,37 +448,39 @@ export class BlsApiService {
     }
 
     // ── Live API path (default / fallback) ──────────────────────────────────
-    return withRetry(
-      async () => {
-        const url = `${this.baseUrl}/timeseries/data/${encodeURIComponent(seriesId)}?latest=true&catalog=true&registrationkey=${this.apiKey}`;
-        const response = await fetch(url, {
-          headers: { 'User-Agent': this.userAgent },
-          signal: ctx.signal,
-        });
-        const text = await response.text();
-        const series = this.parseSeriesResponse(text, { seriesIds: [seriesId] }, ctx);
-        const found = series.find((s) => s.seriesId === seriesId);
-        if (!found) {
-          throw notFound(`Series not found: ${seriesId}`, {
-            reason: 'series_not_found',
-            seriesId,
-          });
-        }
-        return found;
-      },
-      {
-        operation: 'BlsApiService.fetchLatest',
-        baseDelayMs: 1500,
-        signal: ctx.signal,
-      },
+    const series = await this.withCatalogReissue(
+      (catalog) =>
+        withRetry(
+          async () => {
+            const url = `${this.baseUrl}/timeseries/data/${encodeURIComponent(seriesId)}?latest=true${catalog ? '&catalog=true' : ''}&registrationkey=${this.apiKey}`;
+            const response = await fetch(url, {
+              headers: { 'User-Agent': this.userAgent },
+              signal: ctx.signal,
+            });
+            return this.parseSeriesResponse(await response.text(), { seriesIds: [seriesId] }, ctx);
+          },
+          {
+            operation: 'BlsApiService.fetchLatest',
+            baseDelayMs: 1500,
+            signal: ctx.signal,
+          },
+        ),
+      ctx,
     );
+    const found = series.find((s) => s.seriesId === seriesId);
+    if (!found) {
+      throw notFound(`Series not found: ${seriesId}`, { reason: 'series_not_found', seriesId });
+    }
+    return found;
   }
 
   /**
    * Convert mirror observation rows to SeriesData, hydrating catalog metadata
    * (title, area, item, seasonal) from the on-disk catalog index.
    * The LABSTAT data files carry only raw observation values — catalog metadata
-   * must be joined from the catalog service's series index.
+   * must be joined from the catalog service's series index. Each series is
+   * marked `source: 'mirror'`: the rows carry no BLS calculations, and
+   * `bls_get_series` reports as much when calculations were requested.
    *
    * Series come back in row order and only for IDs the rows cover; the caller
    * lays them out against the request via {@link alignToRequestOrder}.
@@ -393,35 +497,10 @@ export class BlsApiService {
       list.push(row);
     }
 
-    // Hydrate catalog metadata in one batch lookup when the catalog is available.
-    const catalog = (() => {
-      try {
-        const svc = getBlsCatalogService();
-        return svc.isLoaded ? svc : null;
-      } catch {
-        return null;
-      }
-    })();
-    const metadata: Map<string, CatalogSeries> = catalog
-      ? await catalog.lookupByIds([...grouped.keys()])
-      : new Map();
+    const metadata = await lookupCatalogMetadata([...grouped.keys()]);
 
     const result: SeriesData[] = [];
     for (const [seriesId, obsRows] of grouped) {
-      // Series metadata from the catalog, when present
-      let title: string | undefined;
-      let area: string | undefined;
-      let item: string | undefined;
-      let seasonal: string | undefined;
-
-      const match = metadata.get(seriesId);
-      if (match) {
-        title = match.title;
-        area = match.areaName;
-        item = match.itemName;
-        seasonal = match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted';
-      }
-
       const observations: Observation[] = obsRows
         .slice()
         .sort((a, b) =>
@@ -437,11 +516,9 @@ export class BlsApiService {
 
       result.push({
         seriesId,
-        ...(title && { title }),
-        ...(area && { area }),
-        ...(item && { item }),
-        ...(seasonal && { seasonal }),
+        ...catalogFields(metadata.get(seriesId)),
         observations,
+        source: 'mirror',
       });
     }
     return result;
@@ -628,8 +705,9 @@ export class BlsApiService {
 
       // BLS rejected the request with a message none of the branches above
       // recognize (e.g. "Your request has failed. Please check your input
-      // parameters"). That is a verdict on the request, so identical parameters
-      // will be rejected again — fail fast and let the caller adjust them.
+      // parameters"). Retrying identical parameters cannot help, so this fails
+      // fast; withCatalogReissue sends the request once more without catalog
+      // metadata, the one change measured to clear it.
       throw serviceUnavailable(`BLS API error: ${messages.join('; ') || parsed.status}`, {
         reason: 'request_rejected',
         retryable: false,

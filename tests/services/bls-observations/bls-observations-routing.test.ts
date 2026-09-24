@@ -6,8 +6,9 @@
  * @module tests/services/bls-observations/bls-observations-routing.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, type MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BlsApiService } from '@/services/bls-api/bls-api-service.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
 
@@ -289,6 +290,46 @@ describe('fetchSeries — mirror READY', () => {
     fetchSpy.mockRestore();
   });
 
+  it('serves a mirrored series from the mirror when calculations are requested (#96)', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['LNS14000000'], calculations: true },
+      createMockContext(),
+    );
+
+    // Routing calculations to the live API would spend a daily query the mirror exists to save.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(result[0]?.observations[0]?.value).toBe('4.1');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('carries calculations into the live fallback for missed IDs (#96)', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: MIRROR_OBS,
+      complete: false,
+      missedIds: ['CES0000000001'],
+    });
+    let body: Record<string, unknown> = {};
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementationOnce((_url, init) => {
+      body = JSON.parse(init?.body as string) as Record<string, unknown>;
+      return Promise.resolve(okJson(LIVE_CES_RESPONSE));
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    await svc.fetchSeries(
+      { seriesIds: ['LNS14000000', 'CES0000000001'], calculations: true },
+      createMockContext(),
+    );
+
+    expect(body.calculations).toBe(true);
+    expect(body.seriesid).toEqual(['CES0000000001']);
+
+    fetchSpy.mockRestore();
+  });
+
   it('falls back to live for missed IDs when mirror is partially complete', async () => {
     getMirror().queryBySeries.mockResolvedValue({
       observations: MIRROR_OBS,
@@ -450,6 +491,227 @@ describe('fetchSeries — mirror-routed request order (#73)', () => {
 
     const single = await svc.fetchSeries({ seriesIds: ['HIT_NEW'] }, ctx);
     expect(single.map((s: SeriesData) => s.seriesId)).toEqual(['HIT_NEW']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 3c: Mirror READY — a failed live fallback keeps the mirrored series (#80)
+// ---------------------------------------------------------------------------
+
+describe('fetchSeries — failed live fallback (#80)', () => {
+  /** A contract so `ctx.recoveryFor` resolves the hints the service attaches. */
+  const ERRORS = [
+    {
+      reason: 'quota_exceeded',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'Daily quota is exhausted.',
+      recovery: 'The daily quota resets at UTC midnight.',
+    },
+  ] as const;
+
+  beforeEach(() => {
+    vi.mocked(getServerConfig).mockReturnValue({
+      observationsMirrorEnabled: true,
+      observationsMirrorFallbackLive: true,
+    } as ReturnType<typeof getServerConfig>);
+    vi.mocked(isBlsObservationsServiceReady).mockReturnValue(true);
+    getMirror().ready.mockResolvedValue(true);
+    getMirror().queryBySeries.mockReset();
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: MIRROR_OBS,
+      complete: false,
+      missedIds: ['CES0000000001'],
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Live answers BLS gives for each typed failure, as the service parses them. */
+  const TYPED_FAILURES = [
+    {
+      reason: 'quota_exceeded',
+      body: {
+        status: 'REQUEST_NOT_PROCESSED',
+        responseTime: 10,
+        message: ['Daily threshold of 500 queries reached'],
+      },
+    },
+    {
+      reason: 'series_locked',
+      body: {
+        status: 'REQUEST_FAILED_ERROR',
+        responseTime: 10,
+        message: ['The database is locked for this series'],
+      },
+    },
+    {
+      reason: 'request_rejected',
+      body: {
+        status: 'REQUEST_FAILED',
+        responseTime: 0,
+        message: [
+          'Your request has failed. Please check your input parameters, and try your request again.',
+        ],
+        Results: null,
+      },
+    },
+    {
+      reason: 'calculations_not_supported',
+      body: {
+        status: 'REQUEST_FAILED_ERROR',
+        responseTime: 10,
+        message: ['calculations not supported for this survey'],
+      },
+    },
+    {
+      reason: 'invalid_api_key',
+      body: {
+        status: 'REQUEST_NOT_PROCESSED',
+        responseTime: 0,
+        message: [
+          'The key:test-key provided by the User is invalid. Please provide a proper key for the operation to be successful',
+        ],
+      },
+    },
+  ];
+
+  it.each(TYPED_FAILURES)(
+    'keeps the mirrored series when the fallback fails with $reason',
+    async ({ reason, body }) => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(okJson(body)));
+
+      const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+      const result = await svc.fetchSeries(
+        { seriesIds: ['CES0000000001', 'LNS14000000'] },
+        createMockContext(),
+      );
+
+      expect(result.map((s: SeriesData) => s.seriesId)).toEqual(['CES0000000001', 'LNS14000000']);
+      expect(result[0]).toMatchObject({ observations: [], liveFailure: { reason } });
+      // `failure` stays reserved for BLS advisories about a series (#73).
+      expect(result[0]).not.toHaveProperty('failure');
+      expect(result[1]!.observations).toHaveLength(1);
+    },
+  );
+
+  it('keeps the mirrored series when the fallback cannot reach BLS, naming the message', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(
+      new TypeError('Unable to connect. Is the computer able to access the url?'),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['CES0000000001', 'LNS14000000'] },
+      createMockContext(),
+    );
+
+    expect(result[0]!.liveFailure).toEqual({
+      message: 'Unable to connect. Is the computer able to access the url?',
+    });
+    expect(result[1]!.observations).toHaveLength(1);
+  });
+
+  it('carries the recovery the calling tool declares for the failure', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(okJson(TYPED_FAILURES[0]!.body)),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['LNS14000000', 'CES0000000001'] },
+      createMockContext({ errors: ERRORS }),
+    );
+
+    expect(result[1]!.liveFailure).toMatchObject({
+      reason: 'quota_exceeded',
+      recovery: 'The daily quota resets at UTC midnight.',
+    });
+  });
+
+  it('logs a warning naming the missed IDs and the failure reason', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(okJson(TYPED_FAILURES[0]!.body)),
+    );
+    const ctx = createMockContext();
+
+    await new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+      { seriesIds: ['CES0000000001', 'LNS14000000'] },
+      ctx,
+    );
+
+    const warnings = (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.data).toMatchObject({
+      missedIds: ['CES0000000001'],
+      reason: 'quota_exceeded',
+      error: 'BLS API daily query limit (500/day) reached.',
+    });
+    // ctx.log sends `{ message: msg, ...data }` to the client, so a `message`
+    // key in the data would replace the log line's own text there.
+    expect(warnings[0]!.data).not.toHaveProperty('message');
+  });
+
+  it('propagates the live error unchanged when the mirror served no requested series', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [],
+      complete: false,
+      missedIds: ['CES0000000001', 'LNU00009999'],
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(okJson(TYPED_FAILURES[0]!.body)),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries(
+        { seriesIds: ['CES0000000001', 'LNU00009999'] },
+        createMockContext({ errors: ERRORS }),
+      )
+      .catch((e: unknown) => e);
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'quota_exceeded',
+        retryable: false,
+        recovery: { hint: 'The daily quota resets at UTC midnight.' },
+      },
+    });
+  });
+
+  it('propagates a network error unchanged when the mirror served no requested series', async () => {
+    getMirror().queryBySeries.mockResolvedValue({
+      observations: [],
+      complete: false,
+      missedIds: ['CES0000000001'],
+    });
+    const networkError = new TypeError('Unable to connect.');
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(networkError);
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    await expect(
+      svc.fetchSeries({ seriesIds: ['CES0000000001'] }, createMockContext()),
+    ).rejects.toBe(networkError);
+  });
+
+  it('fails a cancelled request rather than returning a partial result', async () => {
+    const controller = new AbortController();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(controller.signal.reason);
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries(
+        { seriesIds: ['CES0000000001', 'LNS14000000'] },
+        createMockContext({ signal: controller.signal }),
+      )
+      .catch((e: unknown) => e);
+
+    expect((error as Error).name).toBe('AbortError');
   });
 });
 

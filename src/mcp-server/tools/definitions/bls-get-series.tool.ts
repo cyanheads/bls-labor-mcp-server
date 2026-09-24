@@ -8,6 +8,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import type { ColumnSchema, ColumnType } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { type BatchFetchOptions, getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
@@ -103,11 +104,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     {
       reason: 'request_rejected',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'BLS returned a non-success status with a message matching no known failure mode — e.g. a rejected combination of request parameters.',
+      when: 'BLS returned a non-success status with a message matching no known failure mode, both for the request and for its automatic re-issue without catalog metadata — e.g. a rejected combination of request parameters.',
       retryable: false,
       thrownBy: 'service',
       recovery:
-        'Split series_ids into smaller requests to isolate the series BLS rejects, or retry with calculations omitted.',
+        'BLS rejected the request as a whole, not a named series. Retry once; if it recurs, omit calculations or annual_average, or change start_year/end_year.',
     },
     {
       reason: 'series_not_found',
@@ -184,7 +185,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports and omits the rest — CPI and PPI return percent change only (the inflation rate), and a survey that supports neither simply returns its observations without calculation fields. Requesting calculations never fails, so it is always safe to set; consult bls_list_surveys (allowsNetChange / allowsPercentChange) only to predict which fields will come back. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset.',
+        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports and omits the rest — CPI and PPI return percent change only (the inflation rate), and a survey that supports neither simply returns its observations without calculation fields. Requesting calculations never fails, so it is always safe to set; consult bls_list_surveys (allowsNetChange / allowsPercentChange) only to predict which fields will come back. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset. A series served from the local observation mirror, when the server runs one, carries no calculation fields; enrichment.calculationsApplied is then false and notice names it.',
       ),
     annual_average: z
       .boolean()
@@ -269,7 +270,9 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     calculationsApplied: z
       .boolean()
       .optional()
-      .describe('Whether BLS net/percent-change calculations were requested.'),
+      .describe(
+        'Whether BLS net/percent-change calculations were applied. True when calculations=true reached BLS for every returned series; false when calculations=false, or when the local observation mirror served a series, whose rows carry no calculations — notice then names those series. Absent when calculations was omitted.',
+      ),
     annualAverageApplied: z
       .boolean()
       .describe(
@@ -285,7 +288,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .string()
       .optional()
       .describe(
-        'Guidance for agents — names any SeriesID that returned zero observations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.',
+        "Guidance for agents — names any SeriesID that returned zero observations with its reason (including a failed live fallback's reason and recovery for a SeriesID the local observation mirror does not hold), names mirror-served series that lack requested calculations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.",
       ),
   },
 
@@ -377,6 +380,9 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const unavailableObservations = allRows.filter((row) => row.available === false).length;
     const availableObservations = totalObservations - unavailableObservations;
     const annualAverageRows = allRows.filter((r) => r.is_annual_average === true).length;
+    const mirrorServedIds = uniqueSeries
+      .filter((s) => s.source === 'mirror')
+      .map((s) => s.seriesId);
     ctx.enrich({
       totalObservations,
       availableObservations,
@@ -385,7 +391,9 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       annualAverageApplied: input.annual_average,
       ...(startYear !== undefined && { startYearApplied: startYear }),
       ...(endYear !== undefined && { endYearApplied: endYear }),
-      ...(input.calculations !== undefined && { calculationsApplied: input.calculations }),
+      ...(input.calculations !== undefined && {
+        calculationsApplied: input.calculations && mirrorServedIds.length === 0,
+      }),
       ...(input.annual_average && { annualAverageRows }),
     });
 
@@ -402,8 +410,22 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     );
     if (emptySeriesIds.length > 0) {
       const ranged = startYear !== undefined || endYear !== undefined;
+      /**
+       * A live fallback that failed says nothing about the SeriesIDs it was
+       * sent, so they are named under the failure itself — its reason and
+       * recovery — instead of being sent to bls_search_series. The service
+       * issues one fallback per call, so every such entry carries the same one.
+       */
+      const liveFailedIds: string[] = [];
+      let liveFailure: SeriesData['liveFailure'];
       for (const id of emptySeriesIds) {
-        const failure = byId.get(id)?.failure;
+        const entry = byId.get(id);
+        if (entry?.liveFailure) {
+          liveFailedIds.push(id);
+          liveFailure = entry.liveFailure;
+          continue;
+        }
+        const failure = entry?.failure;
         notices.push(
           failure?.reason === 'series_not_found'
             ? `BLS reports ${id} is invalid or does not exist. Use bls_search_series to find a valid SeriesID.`
@@ -412,6 +434,16 @@ export const blsGetSeriesTool = tool('bls_get_series', {
               : `No observations returned for ${id}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
         );
       }
+      if (liveFailure) {
+        notices.push(
+          `The local observation mirror does not hold ${liveFailedIds.join(', ')}, and the live BLS API fallback for ${liveFailedIds.length === 1 ? 'it' : 'them'} failed: ${liveFailure.reason ?? liveFailure.message}. ${liveFailure.recovery ?? 'Retry once the BLS API is reachable.'}`,
+        );
+      }
+    }
+    if (input.calculations && mirrorServedIds.length > 0) {
+      notices.push(
+        `calculations=true was not applied to ${mirrorServedIds.join(', ')}: the local observation mirror served ${mirrorServedIds.length === 1 ? 'it' : 'them'}, and mirror rows carry no BLS net or percent changes. Derive period-over-period changes from the observation values.`,
+      );
     }
     if (unavailableObservations > 0) {
       notices.push(
@@ -455,6 +487,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       // Registration throws if it fails, so a spilled result always has a handle.
       const registered = await bridge.registerDataframe(ctx, {
         rows: allRows,
+        schema: SPILL_SCHEMA,
         sourceTool: 'bls_get_series',
         appliedScope: `The applied window was ${appliedWindow}.`,
         queryParams: {
@@ -550,9 +583,9 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           lines.push(`| ${cells.join(' | ')} |`);
         }
       } else {
-        lines.push(
-          '_No observations returned. If this SeriesID is unverified, use `bls_search_series` to confirm it exists._',
-        );
+        // The notice names every empty SeriesID with its own reason and next step —
+        // an invalid ID, an uncovered range, or a failed live fallback.
+        lines.push('_No observations returned. The notice names the reason and the next step._');
       }
       lines.push('');
     }
@@ -561,12 +594,56 @@ export const blsGetSeriesTool = tool('bls_get_series', {
   },
 });
 
+const spillColumn = (name: string, type: ColumnType): ColumnSchema => ({
+  name,
+  type,
+  nullable: true,
+});
+
+/**
+ * Canvas schema for the rows {@link flattenToRows} builds, in its key order.
+ * Declared rather than inferred from the batch, so a column's type never
+ * depends on the values that arrived: `value_numeric` and every calculation
+ * column are `DOUBLE` whether the batch holds whole numbers, fractions, or only
+ * unavailable rows. Every column is nullable — sparse BLS fields must not trip
+ * a NOT NULL appender rollback.
+ */
+const SPILL_SCHEMA: ColumnSchema[] = [
+  spillColumn('series_id', 'VARCHAR'),
+  spillColumn('series_title', 'VARCHAR'),
+  spillColumn('area', 'VARCHAR'),
+  spillColumn('item', 'VARCHAR'),
+  spillColumn('seasonal', 'VARCHAR'),
+  spillColumn('year', 'VARCHAR'),
+  spillColumn('period', 'VARCHAR'),
+  spillColumn('period_name', 'VARCHAR'),
+  spillColumn('is_annual_average', 'BOOLEAN'),
+  spillColumn('value', 'VARCHAR'),
+  spillColumn('available', 'BOOLEAN'),
+  spillColumn('value_numeric', 'DOUBLE'),
+  spillColumn('footnotes', 'VARCHAR'),
+  spillColumn('net_change_1m', 'DOUBLE'),
+  spillColumn('net_change_3m', 'DOUBLE'),
+  spillColumn('net_change_6m', 'DOUBLE'),
+  spillColumn('net_change_12m', 'DOUBLE'),
+  spillColumn('pct_change_1m', 'DOUBLE'),
+  spillColumn('pct_change_3m', 'DOUBLE'),
+  spillColumn('pct_change_6m', 'DOUBLE'),
+  spillColumn('pct_change_12m', 'DOUBLE'),
+];
+
+/** A BLS numeric string as a number; `null` when absent, blank, or not a number. */
+function parseNumeric(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = [];
   for (const s of series) {
     for (const obs of s.observations) {
       const available = observationAvailable(obs);
-      const numericValue = available ? Number(obs.value) : Number.NaN;
       rows.push({
         series_id: s.seriesId,
         series_title: s.title ?? null,
@@ -580,16 +657,16 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
         is_annual_average: isAnnualAveragePeriod(obs.period),
         value: obs.value,
         available,
-        value_numeric: Number.isFinite(numericValue) ? numericValue : null,
+        value_numeric: available ? parseNumeric(obs.value) : null,
         footnotes: obs.footnotes?.join('; ') ?? null,
-        net_change_1m: obs.netChange1Month ?? null,
-        net_change_3m: obs.netChange3Month ?? null,
-        net_change_6m: obs.netChange6Month ?? null,
-        net_change_12m: obs.netChange12Month ?? null,
-        pct_change_1m: obs.pctChange1Month ?? null,
-        pct_change_3m: obs.pctChange3Month ?? null,
-        pct_change_6m: obs.pctChange6Month ?? null,
-        pct_change_12m: obs.pctChange12Month ?? null,
+        net_change_1m: parseNumeric(obs.netChange1Month),
+        net_change_3m: parseNumeric(obs.netChange3Month),
+        net_change_6m: parseNumeric(obs.netChange6Month),
+        net_change_12m: parseNumeric(obs.netChange12Month),
+        pct_change_1m: parseNumeric(obs.pctChange1Month),
+        pct_change_3m: parseNumeric(obs.pctChange3Month),
+        pct_change_6m: parseNumeric(obs.pctChange6Month),
+        pct_change_12m: parseNumeric(obs.pctChange12Month),
       });
     }
   }

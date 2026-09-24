@@ -11,6 +11,11 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BlsApiService } from '@/services/bls-api/bls-api-service.js';
+import {
+  GENERIC_REJECTION,
+  LATEST_INVALID_WITHOUT_CATALOG,
+  MIXED_INVALID_WITHOUT_CATALOG,
+} from '../../fixtures/bls-live-responses.js';
 
 const apiKey = 'test-key';
 const baseUrl = 'https://api.bls.gov/publicAPI/v2';
@@ -28,15 +33,6 @@ const QUOTA_RESPONSE = {
   status: 'REQUEST_NOT_PROCESSED',
   responseTime: 10,
   message: ['Daily threshold of 500 queries reached'],
-};
-
-/** The generic rejection BLS returns when it dislikes the request parameters. */
-const REJECTED_RESPONSE = {
-  status: 'REQUEST_FAILED_ERROR',
-  responseTime: 10,
-  message: [
-    'Your request has failed. Please check your input parameters, and try your request again.',
-  ],
 };
 
 /** A genuinely transient failure — BLS releases the lock on its own. */
@@ -94,17 +90,174 @@ describe('BlsApiService — retry behavior (real withRetry)', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('fails fast on request_rejected — exactly one request, no retries (#48)', async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, 'fetch')
-      .mockImplementation(() => Promise.resolve(okJson(REJECTED_RESPONSE)));
+  it('fails fast on request_rejected — one catalog-free re-issue, then no retries (#48, #81)', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      bodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+      return Promise.resolve(okJson(GENERIC_REJECTION));
+    });
 
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     const ctx = createMockContext();
 
-    await expect(svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx)).rejects.toMatchObject({
+    await expect(
+      svc.fetchSeries(
+        {
+          seriesIds: ['LNS14000000', 'BOGUS123'],
+          startYear: 2025,
+          endYear: 2025,
+          calculations: true,
+        },
+        ctx,
+      ),
+    ).rejects.toMatchObject({
       data: { reason: 'request_rejected', retryable: false },
     });
+
+    // The generic answer is catalog-correlated, so it earns exactly one re-issue
+    // without catalog metadata; a second generic answer is final.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const { catalog, ...rest } = bodies[0]!;
+    expect(catalog).toBe(true);
+    expect(bodies[1]).toEqual(rest);
+  });
+
+  it('keeps the valid series when a generic rejection yields to a per-series answer (#81)', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okJson(GENERIC_REJECTION))
+      .mockResolvedValueOnce(okJson(MIXED_INVALID_WITHOUT_CATALOG));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries(
+      { seriesIds: ['LNS14000000', 'BOGUS123'], startYear: 2025, endYear: 2025 },
+      createMockContext(),
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.map((s) => s.seriesId)).toEqual(['LNS14000000', 'BOGUS123']);
+    expect(result[0]!.observations).toHaveLength(12);
+    expect(result[1]).toMatchObject({
+      observations: [],
+      failure: { reason: 'series_not_found', message: 'Invalid Series for Series BOGUS123' },
+    });
+  });
+
+  it('re-issues a generic latest GET once without catalog=true (#81)', async () => {
+    const urls: string[] = [];
+    vi.spyOn(globalThis, 'fetch')
+      .mockImplementationOnce((url) => {
+        urls.push(String(url));
+        return Promise.resolve(okJson(GENERIC_REJECTION));
+      })
+      .mockImplementationOnce((url) => {
+        urls.push(String(url));
+        return Promise.resolve(okJson(LATEST_INVALID_WITHOUT_CATALOG));
+      });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const error = await svc.fetchLatest('BOGUS123', createMockContext()).catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'series_not_found' } });
+    expect((error as Error).message).toContain('Invalid Series for Series BOGUS123');
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).toContain('&catalog=true');
+    expect(urls[1]).not.toContain('catalog');
+    expect(urls[1]).toBe(urls[0]!.replace('&catalog=true', ''));
+  });
+
+  it('stays request_rejected on fetchLatest when both answers are generic — no third request (#81)', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(okJson(GENERIC_REJECTION)));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    await expect(svc.fetchLatest('BOGUS123', createMockContext())).rejects.toMatchObject({
+      data: { reason: 'request_rejected', retryable: false },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('never re-issues into a cancelled request (#81)', async () => {
+    const controller = new AbortController();
+    let sent = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      // Behave like the real fetch: an aborted signal rejects before any request.
+      if (init?.signal?.aborted) return Promise.reject(init.signal.reason);
+      sent++;
+      controller.abort();
+      return Promise.resolve(okJson(GENERIC_REJECTION));
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const error = await svc
+      .fetchSeries(
+        { seriesIds: ['LNS14000000', 'BOGUS123'] },
+        createMockContext({ signal: controller.signal }),
+      )
+      .catch((e: unknown) => e);
+
+    expect((error as Error).name).toBe('AbortError');
+    expect(sent).toBe(1);
+  });
+
+  it('sends exactly one request, with catalog metadata, when the first answer succeeds (#81)', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      bodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+      return Promise.resolve(
+        okJson({
+          status: 'REQUEST_SUCCEEDED',
+          responseTime: 10,
+          message: [],
+          Results: {
+            series: [
+              { seriesID: 'LNS14000000', data: [{ year: '2025', period: 'M01', value: '4.0' }] },
+            ],
+          },
+        }),
+      );
+    });
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    const result = await svc.fetchSeries({ seriesIds: ['LNS14000000'] }, createMockContext());
+
+    expect(result[0]!.observations).toHaveLength(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(bodies[0]!.catalog).toBe(true);
+  });
+
+  it('sends exactly one request when the first answer names the failing series (#81)', async () => {
+    // A per-series advisory is a classified answer, not the generic rejection.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(
+        okJson({
+          status: 'REQUEST_SUCCEEDED',
+          responseTime: 10,
+          message: ['Invalid Series for Series BOGUS123'],
+          Results: { series: [{ seriesID: 'BOGUS123', data: [] }] },
+        }),
+      ),
+    );
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    await expect(
+      svc.fetchSeries({ seriesIds: ['BOGUS123'] }, createMockContext()),
+    ).rejects.toMatchObject({ data: { reason: 'series_not_found' } });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends exactly one request when BLS rejects the configured key (#81)', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(okJson(INVALID_KEY_RESPONSE)));
+
+    const svc = new BlsApiService(apiKey, baseUrl, userAgent);
+    await expect(
+      svc.fetchSeries({ seriesIds: ['LNS14000000'] }, createMockContext()),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_api_key', retryable: false } });
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });

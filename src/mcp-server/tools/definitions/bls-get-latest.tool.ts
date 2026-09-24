@@ -11,10 +11,13 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
 /**
- * Failures that are verdicts on the request rather than on one series. Every leg
- * of the fan-out below meets them identically, so they surface as the tool's own
- * error instead of as N copies buried in `failed[]` — a rejected API key read as
- * a per-series problem sends the caller hunting for bad SeriesIDs.
+ * Failures that are verdicts on the request rather than on one series. Every
+ * live leg of the fan-out below meets them identically, so when no series
+ * returned an observation they surface as the tool's own error instead of as N
+ * copies buried in `failed[]` — a rejected API key read as a per-series problem
+ * sends the caller hunting for bad SeriesIDs. When some series did return one —
+ * served by the observations mirror, or by a live leg that finished before the
+ * quota ran out — those are kept, and the notice names the reason instead.
  */
 const REQUEST_LEVEL_REASONS = new Set(['invalid_api_key', 'quota_exceeded', 'series_locked']);
 
@@ -43,7 +46,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     {
       reason: 'invalid_api_key',
       code: JsonRpcErrorCode.ConfigurationError,
-      when: 'BLS rejected the configured BLS_API_KEY as invalid.',
+      when: 'BLS rejected the configured BLS_API_KEY as invalid, and no requested series returned an observation.',
       retryable: false,
       thrownBy: 'service',
       recovery:
@@ -52,7 +55,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     {
       reason: 'quota_exceeded',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The BLS API 500 query/day limit has been reached.',
+      when: 'The BLS API 500 query/day limit has been reached, and no requested series returned an observation.',
       retryable: false,
       thrownBy: 'service',
       recovery:
@@ -61,7 +64,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     {
       reason: 'series_locked',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The BLS database is temporarily locked for the requested series.',
+      when: 'The BLS database is temporarily locked for the requested series, and no requested series returned an observation.',
       thrownBy: 'service',
       recovery: 'The BLS database lock is transient — retry the request after a brief delay.',
     },
@@ -106,7 +109,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
             error: z
               .string()
               .describe(
-                'Error message. Common values: "Series does not exist" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data). BLS does not always name the series it rejected: an invalid SeriesID sometimes comes back as the generic "Your request has failed. Please check your input parameters, and try your request again.", which means the same thing here.',
+                'Error message. Common values: "Series does not exist" or "Invalid Series" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data). The generic "Your request has failed. Please check your input parameters, and try your request again." means BLS rejected the request itself twice, the second time without catalog metadata, rather than naming the SeriesID. A quota, API-key, or database-lock failure lands here only when another series returned an observation; notice then names its reason and recovery.',
               ),
           })
           .describe(
@@ -123,7 +126,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       .string()
       .optional()
       .describe(
-        'Guidance when one or more series failed — e.g. to use bls_search_series to verify SeriesIDs. Absent when all series returned data.',
+        'Guidance when one or more series failed — bls_search_series for a SeriesID BLS rejected, or the reason and recovery for a quota, API-key, or database-lock failure that left other series answered. Absent when all series returned data.',
       ),
   },
 
@@ -139,6 +142,8 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         data: await service.fetchLatest(seriesId, ctx),
       })),
     );
+    // A cancelled caller is gone; the legs that finished first are no answer to give.
+    ctx.signal.throwIfAborted();
 
     const results: Array<{
       seriesId: string;
@@ -156,6 +161,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       };
     }> = [];
     const failed: Array<{ seriesId: string; error: string }> = [];
+    const requestLevel: Array<{ seriesId: string; error: McpError; reason: string }> = [];
     let succeededCount = 0;
     let unavailableCount = 0;
 
@@ -165,8 +171,10 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       if (settlement.status === 'rejected') {
         const err: unknown = settlement.reason;
         if (err instanceof McpError) {
-          const reason = (err.data as Record<string, unknown> | undefined)?.reason;
-          if (typeof reason === 'string' && REQUEST_LEVEL_REASONS.has(reason)) throw err;
+          const reason = err.data?.reason;
+          if (typeof reason === 'string' && REQUEST_LEVEL_REASONS.has(reason)) {
+            requestLevel.push({ seriesId: requestedId, error: err, reason });
+          }
         }
         const errorMsg = err instanceof Error ? err.message : String(err);
         failed.push({ seriesId: requestedId, error: errorMsg });
@@ -203,14 +211,45 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       succeededCount++;
     }
 
+    const [firstRequestLevel] = requestLevel;
+    if (firstRequestLevel && succeededCount === 0) throw firstRequestLevel.error;
+
     const notices: string[] = [];
-    if (failed.length > 0) {
-      const allFailed = succeededCount === 0;
-      notices.push(
-        allFailed
-          ? `All ${failed.length} series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.`
-          : `${failed.length} of ${input.series_ids.length} series failed. Use bls_search_series to verify the failing SeriesIDs.`,
-      );
+    if (requestLevel.length === 0) {
+      if (failed.length > 0) {
+        const allFailed = succeededCount === 0;
+        notices.push(
+          allFailed
+            ? `All ${failed.length} series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.`
+            : `${failed.length} of ${input.series_ids.length} series failed. Use bls_search_series to verify the failing SeriesIDs.`,
+        );
+      }
+    } else {
+      ctx.log.warning('bls_get_latest: answering with the series that succeeded', {
+        seriesIds: requestLevel.map((r) => r.seriesId),
+        reasons: [...new Set(requestLevel.map((r) => r.reason))],
+      });
+      const requestLevelIds = new Set(requestLevel.map((r) => r.seriesId));
+      const unresolved = failed.filter((f) => !requestLevelIds.has(f.seriesId));
+      if (unresolved.length > 0) {
+        notices.push(
+          `${unresolved.map((f) => f.seriesId).join(', ')} failed. Use bls_search_series to verify ${unresolved.length === 1 ? 'that SeriesID' : 'those SeriesIDs'}.`,
+        );
+      }
+      const byReason = new Map<string, { ids: string[]; hint: unknown }>();
+      for (const { seriesId, error, reason } of requestLevel) {
+        const group = byReason.get(reason) ?? {
+          ids: [],
+          hint: (error.data?.recovery as { hint?: unknown } | undefined)?.hint,
+        };
+        group.ids.push(seriesId);
+        byReason.set(reason, group);
+      }
+      for (const [reason, { ids, hint }] of byReason) {
+        notices.push(
+          `${ids.join(', ')} failed with ${reason}, a failure of the request rather than of the SeriesID.${typeof hint === 'string' ? ` ${hint}` : ''}`,
+        );
+      }
     }
     if (unavailableCount > 0) {
       notices.push(

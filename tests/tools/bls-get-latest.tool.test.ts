@@ -4,7 +4,12 @@
  */
 
 import { notFound } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetLatestTool } from '@/mcp-server/tools/definitions/bls-get-latest.tool.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
@@ -191,6 +196,100 @@ describe('blsGetLatestTool — additional coverage', () => {
 
     await expect(blsGetLatestTool.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'series_locked' },
+    });
+  });
+
+  it('rethrows a request-level reason when no series returned an observation (#80)', async () => {
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    fetchLatestMock
+      .mockRejectedValueOnce(notFound('Series does not exist', { reason: 'series_not_found' }))
+      .mockRejectedValueOnce(serviceUnavailable('quota', { reason: 'quota_exceeded' }));
+
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
+    const input = blsGetLatestTool.input.parse({ series_ids: ['BOGUS123', 'LNS14000000'] });
+
+    await expect(blsGetLatestTool.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'quota_exceeded' },
+    });
+  });
+
+  it.each([
+    { reason: 'quota_exceeded', hint: 'UTC midnight' },
+    { reason: 'invalid_api_key', hint: 'BLS_API_KEY' },
+    { reason: 'series_locked', hint: 'brief delay' },
+  ] as const)(
+    'keeps a served series when another fails with $reason, on both surfaces (#80)',
+    async ({ reason, hint }) => {
+      const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+      fetchLatestMock
+        .mockResolvedValueOnce(MOCK_SERIES)
+        .mockImplementationOnce((_seriesId, ctx) =>
+          Promise.reject(
+            serviceUnavailable(`BLS failure: ${reason}`, { reason, ...ctx.recoveryFor(reason) }),
+          ),
+        );
+
+      const result = await runToolContract(
+        blsGetLatestTool,
+        { series_ids: ['LNS14000000', 'LNU00009999'] },
+        { context: { errors: blsGetLatestTool.errors } },
+      );
+
+      expect(result.structuredContent).toMatchObject({
+        results: [{ seriesId: 'LNS14000000', latestObservation: { value: '4.1' } }],
+        succeeded: 1,
+        failed: [{ seriesId: 'LNU00009999', error: expect.stringContaining(reason) }],
+        notice: expect.stringContaining(reason),
+      });
+      const { notice } = result.structuredContent as { notice: string };
+      expect(notice).toContain('LNU00009999');
+      expect(notice).toContain(hint);
+      // The SeriesID is not the problem, so the caller is not sent to re-resolve it.
+      expect(notice).not.toContain('bls_search_series');
+
+      const text = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain('- LNU00009999:');
+      expect(text).toContain(hint);
+    },
+  );
+
+  it('names both classes when a request-level failure sits beside an invalid SeriesID (#80)', async () => {
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    fetchLatestMock
+      .mockResolvedValueOnce(MOCK_SERIES)
+      .mockRejectedValueOnce(notFound('Series does not exist', { reason: 'series_not_found' }))
+      .mockRejectedValueOnce(serviceUnavailable('quota', { reason: 'quota_exceeded' }));
+
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
+    const input = blsGetLatestTool.input.parse({
+      series_ids: ['LNS14000000', 'BOGUS123', 'LNU00009999'],
+    });
+    const result = await blsGetLatestTool.handler(input, ctx);
+
+    expect(result.failed.map((f) => f.seriesId)).toEqual(['BOGUS123', 'LNU00009999']);
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('bls_search_series');
+    expect(notice).toContain('quota_exceeded');
+    expect(notice).toMatch(/LNU00009999[^.]*quota_exceeded/);
+    const warnings = (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
+    expect(warnings[0]?.data).toMatchObject({ seriesIds: ['LNU00009999'] });
+  });
+
+  it('fails a cancelled request rather than returning the legs that finished (#80)', async () => {
+    const controller = new AbortController();
+    fetchLatestMock.mockResolvedValueOnce(MOCK_SERIES).mockImplementationOnce(() => {
+      controller.abort();
+      return Promise.reject(controller.signal.reason);
+    });
+
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors, signal: controller.signal });
+    const input = blsGetLatestTool.input.parse({ series_ids: ['LNS14000000', 'LNU00009999'] });
+
+    await expect(blsGetLatestTool.handler(input, ctx)).rejects.toMatchObject({
+      name: 'AbortError',
     });
   });
 

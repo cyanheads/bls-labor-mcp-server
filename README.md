@@ -39,8 +39,8 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 | `bls_search_series` | Search the BLS series catalog by natural language, survey, area, or keywords to resolve cryptic SeriesIDs. |
 | `bls_get_series` | Fetch time-series data for 1–50 BLS series by SeriesID, with optional year range and period-over-period calculations. |
 | `bls_get_latest` | Return the single most recent observation for one or more BLS series. |
-| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` — provenance, TTL, row count, column schema. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
-| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series`. Supports JOINs, aggregates, window functions, CTEs. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
+| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` or `bls_dataframe_query` — provenance, TTL, row count, column schema. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
+| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series` or an earlier `register_as`. Supports JOINs, aggregates, window functions, CTEs. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
 | `bls_dataframe_drop` | Drop a canvas dataframe by name. Available when `CANVAS_PROVIDER_TYPE=duckdb` and `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default. |
 
 ## Capability reference
@@ -92,9 +92,11 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 ### `bls_dataframe_describe` <sub>tool</sub>
 
 - Available only when `CANVAS_PROVIDER_TYPE=duckdb`
-- Optional `name` describes a single dataframe; omit to list every active dataframe for the tenant
+- Optional `name` (a `df_<id>` or `register_as` name) describes a single dataframe; omit it or leave it blank to list every active dataframe for the tenant
 - Each entry carries source tool, query params, row count, TTL (`created_at`/`expires_at`), and `column_schema` — all BLS dataframe columns are nullable
-- Lazy-sweeps expired entries before responding
+- Spill tables from `bls_get_series` have a fixed schema: `value_numeric` and every `net_change_*`/`pct_change_*` column are `DOUBLE`, `available` and `is_annual_average` are `BOOLEAN`, the rest `VARCHAR`
+- A `register_as` table reports the types the canvas reads back from it; DuckDB types outside the canvas's set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) show as `VARCHAR`
+- Lazy-sweeps expired entries before responding; an expired entry that cannot be dropped stays listed until a later sweep drops it
 
 ---
 
@@ -110,9 +112,10 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 ### `bls_dataframe_drop` <sub>tool</sub>
 
-- Input: single required `name` (`df_XXXXX_XXXXX`) — the canvas table to drop
+- Input: single required `name` (`df_XXXXX_XXXXX`, or a `register_as` name) — the canvas table to drop
 - Available only when `CANVAS_PROVIDER_TYPE=duckdb` and explicitly enabled via `BLS_DATAFRAME_DROP_ENABLED=true` — off by default since per-table TTL handles cleanup
 - Idempotent — returns `dropped: false` when the named dataframe doesn't exist
+- A drop the canvas could not complete fails with a retryable `canvas_drop_failed` and leaves the dataframe in place, never reporting `dropped: true`
 
 ## Features
 
@@ -280,7 +283,7 @@ For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls
    node dist/services/bls-observations/subprocess.js --init
    ```
 
-The mirror harvests every survey in the catalog's survey list — OE included, whatever `BLS_CATALOG_INCLUDE_OES` says — so it covers CM and CI too (about 55 MB of `cm.data.*` / `ci.data.*` files). An incremental refresh reads only files published after the mirror's last one, so a mirror bootstrapped before CM and CI joined picks each file up at its next BLS publication; until then those series come from the live API when fallback is on. Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
+The mirror harvests every survey in the catalog's survey list — OE included, whatever `BLS_CATALOG_INCLUDE_OES` says — so it covers CM and CI too (about 55 MB of `cm.data.*` / `ci.data.*` files). An incremental refresh reads only files published after the mirror's last one, so a mirror bootstrapped before CM and CI joined picks each file up at its next BLS publication; until then those series come from the live API when fallback is on. Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). When a live fallback fails — quota exhausted, BLS unreachable — the series the mirror served are still returned, and `enrichment.notice` names each unserved SeriesID with the failure's reason and recovery. Mirror rows carry no BLS calculations: with `calculations: true`, a mirror-served series comes back without calculation fields, `enrichment.calculationsApplied` is `false`, and the notice names it. On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
 
 **Upgrading an existing mirror.** A mirror bootstrapped before sentinel rows were stored is missing the periods BLS publishes with its `-` missing-value marker. Opening such a mirror clears its sync checkpoint once, so the next refresh re-reads every LABSTAT file and fills them in — no operator action beyond letting that refresh run, and it takes as long as a full read. The mirror keeps serving throughout.
 
