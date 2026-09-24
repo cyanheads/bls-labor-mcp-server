@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.4](changelog/0.5.x/0.5.4.md) — 2026-09-23
+
+bls_search_series gains offset paging and applies its area filter before the candidate cap, and the catalog decodes LABSTAT code tables by header so JOLTS, PR, and EC series get distinct titles.
+
 ## [0.5.3](changelog/0.5.x/0.5.3.md) — 2026-09-22
 
 Fixes the observations-mirror bootstrap (dropped sentinel rows, a subprocess that never initialized the mirror, LABSTAT index discovery) and bls_get_series (out-of-order series[], mis-composed failure reasons, one-sided year ranges).
