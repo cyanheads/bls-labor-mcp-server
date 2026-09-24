@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.5](changelog/0.5.x/0.5.5.md) — 2026-09-23 · 🛡️ Security
+
+The catalog index now refreshes hourly and drops retired series, indexes the current ECEC (CM) and ECI (CI) surveys, and labels publication frequency; bls_search_series matches at word starts and bounds the cost of long queries.
+
 ## [0.5.4](changelog/0.5.x/0.5.4.md) — 2026-09-23
 
 bls_search_series gains offset paging and applies its area filter before the candidate cap, and the catalog decodes LABSTAT code tables by header so JOLTS, PR, and EC series get distinct titles.
