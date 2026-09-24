@@ -185,7 +185,9 @@ describe('bls_search_series over a harvested JOLTS catalog', () => {
 
     const structured = result.structuredContent as { series: unknown[]; notice?: string };
     expect(structured.series).toEqual([]);
-    expect(structured.notice).toContain('filter');
+    expect(structured.notice).toBe(
+      'No matching series found. Try removing the survey/area/seasonal filter or broadening the query.',
+    );
     expect(text(result)).toContain('No matching series found.');
   });
 
