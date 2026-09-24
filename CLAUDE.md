@@ -41,7 +41,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - 50 series per `bls_get_series` request; 20-year history window per request.
 - `calculations: true` requests BLS-server-side net change and percent change; a survey returns whichever it supports (CPI/PPI return percent change only). Only surveys supporting neither return an error — check `bls_list_surveys`.
 
-**Catalog search is offline.** `bls_search_series` queries an on-disk SQLite index of the LABSTAT flat files, harvested at startup when the index is missing or stale — no API quota consumed. Bump `CATALOG_INDEX_VERSION` in `bls-catalog-service.ts` whenever the harvest's output changes, so persisted indexes re-harvest after an upgrade. The BLS FAQ confirms there is no API catalog endpoint.
+**Catalog search is offline.** `bls_search_series` queries an on-disk SQLite index of the LABSTAT flat files, harvested at startup when the index is missing or stale and re-checked by an hourly `bls-catalog-refresh` job — no API quota consumed. A harvest removes rows its survey's `.series` file no longer lists and rows of surveys no longer configured. Bump `CATALOG_INDEX_VERSION` in `bls-catalog-service.ts` whenever the harvest's output changes, so persisted indexes re-harvest after an upgrade; a change to the configured survey set needs no bump, since the persisted survey list marks the index stale on its own. The BLS FAQ confirms there is no API catalog endpoint.
 
 ---
 
@@ -161,7 +161,7 @@ await createApp({
 
 `sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused. This server declares `stateless` — no tool gates on `ctx.requestInput`.
 
-`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). Here it closes the two SQLite handles `setup()` opens: the catalog index and the observations mirror. The canvas and scheduled jobs are framework-owned and need no hook.
+`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). Here it closes the two SQLite handles `setup()` opens: the catalog index and the observations mirror. The catalog's shutdown first removes its `bls-catalog-refresh` job and stops any in-flight harvest — the store reopens on its next call after `close()`, so a harvest left running would keep writing. The canvas and the observations refresh job are framework-owned and need no hook.
 
 ---
 
