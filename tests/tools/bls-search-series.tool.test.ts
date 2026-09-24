@@ -22,7 +22,8 @@ let mockIsLoaded = true;
 let mockTotalSeries = 847000;
 let mockCatalogLoadError: string | undefined;
 
-vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
+vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/bls-catalog/bls-catalog-service.js')>()),
   getBlsCatalogService: () => ({
     get isLoaded() {
       return mockIsLoaded;
@@ -33,6 +34,8 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
     get catalogLoadError() {
       return mockCatalogLoadError;
     },
+    indexedSurveys: ['CE', 'CU', 'LN'],
+    includeOes: false,
     search: mockSearch,
   }),
 }));
@@ -108,6 +111,28 @@ describe('blsSearchSeriesTool', () => {
     expect(enriched.areaFilter).toBe('United States');
     expect(enriched.seasonalFilter).toBe(true);
     expect(enriched.limitApplied).toBe(25);
+    expect(enriched.offsetApplied).toBe(0);
+  });
+
+  it('passes normalized filters and the offset to the catalog search', async () => {
+    mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1, capped: false });
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
+    const input = blsSearchSeriesTool.input.parse({
+      query: 'nonfarm',
+      survey: ' ce ',
+      area: '  ',
+      offset: 20,
+    });
+    await blsSearchSeriesTool.handler(input, ctx);
+
+    expect(mockSearch).toHaveBeenLastCalledWith({
+      query: 'nonfarm',
+      survey: 'CE',
+      area: undefined,
+      seasonal_adjustment: undefined,
+      limit: 10,
+      offset: 20,
+    });
   });
 
   it('enriches with notice when no series match', async () => {
@@ -140,11 +165,11 @@ describe('blsSearchSeriesTool', () => {
     expect(text).toContain('Seasonally Adjusted');
   });
 
-  it('renders no-results message when series is empty', () => {
+  it('renders an empty page without claiming why — the notice says why', () => {
     const output = { series: [] };
     const blocks = blsSearchSeriesTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('No matching series');
+    expect(text).toBe('No series returned.');
   });
 });
 

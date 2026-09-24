@@ -47,7 +47,7 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 ### `bls_list_surveys` <sub>tool</sub>
 
-- Optional `category` filter narrows results to `prices`, `employment`, `wages`, `productivity`, `injuries`, or `time_use`
+- Optional `category` filter narrows results to `prices`, `employment`, `wages`, `productivity`, `injuries`, or `time_use`; every survey sits in at least one category, and programs BLS lists under several subject areas (CES, QCEW, OEWS, International Labor Comparisons) appear in each
 - Returns survey abbreviation, full name, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`)
 - `hasAnnualAverages` is advisory only — LN, CE, LA, and SM report true yet publish no annual-average rows; read `bls_get_series`'s `annualAverageRows` to see what a call actually returns
 - Backed by the live BLS `/surveys` API with monthly caching — consumes no meaningful API quota
@@ -56,10 +56,13 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Free-text or keyword query, plus optional `survey` (two-letter code), `area` (state/MSA/FIPS), and `seasonal_adjustment` filters; `limit` 1–50 (default 10)
+- Free-text or keyword query, plus optional `survey` (two-letter code, case-insensitive), `area` (state/MSA/FIPS — a substring of the area name, title, or SeriesID), and `seasonal_adjustment` filters; blank filters count as omitted
+- `limit` 1–50 (default 10) and `offset` (default 0) page through the ranked results; `nextOffset` names the next page while `truncated` is true
+- Without `area`, national series rank ahead of state and metro series that match equally well
 - Decodes BLS's opaque positional SeriesIDs (e.g. `LNS14000000`) into survey, area, item, and seasonal-flag components alongside the plain-language title
 - Also accepts a SeriesID directly for exact lookup
-- `capped: true` means the ~1000-candidate FTS pool was exhausted — `totalCount` is then a lower bound, not an exact match count
+- `capped: true` means the ~1000-candidate FTS pool, after the survey/area/seasonal filters, was exhausted — `totalCount` is then a lower bound, not an exact match count, and paging stops at the pool
+- Searches the surveys in its offline index: AP, CE, CU, CW, EC, JT, LA, LN, MP, PC, PR, and WP by default, plus OE when `BLS_CATALOG_INCLUDE_OES=true`. A survey outside the index gets a notice listing the indexed codes; its series are still fetchable by SeriesID with `bls_get_series`
 - Operates entirely offline against the LABSTAT catalog index — consumes no BLS API quota
 
 ---

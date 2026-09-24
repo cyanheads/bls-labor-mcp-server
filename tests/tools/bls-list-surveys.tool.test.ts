@@ -5,7 +5,11 @@
 
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { blsListSurveysTool } from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
+import {
+  blsListSurveysTool,
+  CATEGORY_MAP,
+} from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
+import { SURVEY_CAPABILITIES } from '@/services/bls-api/bls-api-service.js';
 
 const MOCK_SURVEYS = [
   {
@@ -33,7 +37,8 @@ const MOCK_SURVEYS = [
 
 const listSurveysMock = vi.fn();
 
-vi.mock('@/services/bls-api/bls-api-service.js', () => ({
+vi.mock('@/services/bls-api/bls-api-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/bls-api/bls-api-service.js')>()),
   getBlsApiService: () => ({ listSurveys: listSurveysMock }),
 }));
 
@@ -266,5 +271,92 @@ describe('blsListSurveysTool — CATEGORY_MAP correctness (#44)', () => {
     const abbrs = await abbrsFor('productivity');
     expect(abbrs).toEqual(expect.arrayContaining(['PR', 'PI', 'PF']));
     expect(abbrs).not.toContain('DI');
+  });
+});
+
+describe('blsListSurveysTool — category coverage of the full survey inventory (#65)', () => {
+  // SURVEY_CAPABILITIES holds the swept /surveys inventory: its keys are every
+  // survey abbreviation BLS lists. Serving all of them makes the real map the
+  // only thing deciding category membership.
+  const INVENTORY = Object.keys(SURVEY_CAPABILITIES);
+  const CATEGORIES = [
+    'prices',
+    'employment',
+    'wages',
+    'productivity',
+    'injuries',
+    'time_use',
+  ] as const;
+
+  beforeEach(() => {
+    listSurveysMock.mockResolvedValue(
+      INVENTORY.map((abbr) => ({
+        surveyAbbreviation: abbr,
+        surveyName: `Survey ${abbr}`,
+        allowsNetChange: false,
+        allowsPercentChange: false,
+        hasAnnualAverages: false,
+      })),
+    );
+  });
+
+  const abbrsFor = async (category?: (typeof CATEGORIES)[number]) => {
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
+    const input = blsListSurveysTool.input.parse(category ? { category } : {});
+    const result = await blsListSurveysTool.handler(input, ctx);
+    return result.surveys.map((s) => s.abbreviation);
+  };
+
+  it('sweeps the 70-survey inventory', () => {
+    expect(INVENTORY).toHaveLength(70);
+  });
+
+  it('puts every inventory survey in at least one category', async () => {
+    const covered = new Set<string>();
+    for (const category of CATEGORIES) {
+      for (const abbr of await abbrsFor(category)) covered.add(abbr);
+    }
+    expect(INVENTORY.filter((abbr) => !covered.has(abbr))).toEqual([]);
+  });
+
+  it('maps no code outside the inventory (no phantom codes)', () => {
+    const inventory = new Set(INVENTORY);
+    const mapped = Object.values(CATEGORY_MAP).flat();
+    expect(mapped.filter((abbr) => !inventory.has(abbr))).toEqual([]);
+    expect(Object.keys(CATEGORY_MAP).sort()).toEqual([...CATEGORIES].sort());
+  });
+
+  it.each([
+    ['prices', ['CW', 'SU', 'CX', 'LI']],
+    ['employment', ['EN', 'BD', 'OR', 'WS']],
+    ['wages', ['CC', 'CM', 'LE', 'CE']],
+  ] as const)('%s returns %j', async (category, expected) => {
+    expect(await abbrsFor(category)).toEqual(expect.arrayContaining([...expected]));
+  });
+
+  it('lists IN under prices, employment, wages, and productivity, and not injuries', async () => {
+    for (const category of ['prices', 'employment', 'wages', 'productivity'] as const) {
+      expect(await abbrsFor(category)).toContain('IN');
+    }
+    expect(await abbrsFor('injuries')).not.toContain('IN');
+  });
+
+  it('keeps SA out of prices (#10) and OR out of wages', async () => {
+    expect(await abbrsFor('prices')).not.toContain('SA');
+    expect(await abbrsFor('wages')).not.toContain('OR');
+  });
+
+  it('returns every survey, unchanged, when unfiltered', async () => {
+    expect(await abbrsFor()).toEqual([...INVENTORY].sort((a, b) => a.localeCompare(b)));
+  });
+
+  it('says in the category description that a survey can sit under several categories', () => {
+    expect(blsListSurveysTool.input.shape.category.description).toMatch(/more than one category/);
+  });
+
+  it('says in the tool description that search covers only the offline index', () => {
+    expect(blsListSurveysTool.description).toContain(
+      'bls_search_series covers only the surveys in its offline index',
+    );
   });
 });

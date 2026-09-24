@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-09-22 17:44:47
+Generated on: 2026-09-24 02:22:26
 
 ```text
 bls-labor-mcp-server/
@@ -200,6 +200,8 @@ bls-labor-mcp-server/
 │   │   ├── bls-get-latest.tool.test.ts
 │   │   ├── bls-get-series.tool.test.ts
 │   │   ├── bls-list-surveys.tool.test.ts
+│   │   ├── bls-search-series.catalog.test.ts
+│   │   ├── bls-search-series.harvest.test.ts
 │   │   └── bls-search-series.tool.test.ts
 │   └── server-registration.test.ts
 ├── .dockerignore

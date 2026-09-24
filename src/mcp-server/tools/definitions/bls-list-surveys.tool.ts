@@ -11,15 +11,85 @@ import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
 /**
  * Survey category tags used to group BLS programs for filtering. Codes are the
- * two-letter `survey_abbreviation` values from the BLS /surveys list. The
- * injuries family is partitioned by measure and year-vintage (CFOI fatal +
- * IIF/SOII nonfatal, across historical ranges), so it spans many codes.
+ * two-letter `survey_abbreviation` values from the BLS /surveys list, and every
+ * one of them sits in at least one category. Assignment follows the BLS subject
+ * areas that list the program on bls.gov/bls/proghome.htm: Inflation & Prices →
+ * `prices`, Employment and Unemployment → `employment`, Pay & Benefits →
+ * `wages`, Productivity, Workplace Injuries → `injuries`, American Time Use →
+ * `time_use`. A program listed under several areas takes each category (CES,
+ * QCEW, OEWS), International Labor Comparisons (IN) takes one per measure it
+ * publishes, and SIC-era or discontinued vintages inherit their program's
+ * categories. The injuries family is partitioned by measure and year-vintage
+ * (CFOI fatal + IIF/SOII nonfatal, across historical ranges), so it spans many
+ * codes.
  */
-const CATEGORY_MAP: Record<string, string[]> = {
-  prices: ['CU', 'PC', 'WP', 'AP', 'EI'],
-  employment: ['CE', 'LN', 'LA', 'SM', 'SA', 'OE', 'JT'],
-  wages: ['OE', 'EC', 'CI', 'NW'],
-  productivity: ['PR', 'MP', 'IP', 'PI', 'PF'],
+export const CATEGORY_MAP: Record<string, string[]> = {
+  prices: [
+    'AP',
+    'CU',
+    'CW',
+    'CX',
+    'EI',
+    'IN',
+    'LI',
+    'MU',
+    'MW',
+    'ND',
+    'PC',
+    'PD',
+    'SU',
+    'WD',
+    'WP',
+  ],
+  employment: [
+    'BD',
+    'CE',
+    'EE',
+    'EN',
+    'EP',
+    'EW',
+    'FM',
+    'GG',
+    'GP',
+    'IN',
+    'JL',
+    'JT',
+    'KV',
+    'LA',
+    'LF',
+    'LN',
+    'LU',
+    'ML',
+    'OE',
+    'OR',
+    'SA',
+    'SM',
+    'WS',
+  ],
+  wages: [
+    'BG',
+    'BP',
+    'CC',
+    'CE',
+    'CI',
+    'CM',
+    'EB',
+    'EC',
+    'EE',
+    'EN',
+    'EW',
+    'IN',
+    'LE',
+    'LU',
+    'NB',
+    'NC',
+    'NW',
+    'OE',
+    'SA',
+    'SM',
+    'WM',
+  ],
+  productivity: ['IN', 'IP', 'MP', 'PF', 'PI', 'PR'],
   injuries: [
     'CA',
     'CB',
@@ -43,7 +113,7 @@ const CATEGORY_MAP: Record<string, string[]> = {
 export const blsListSurveysTool = tool('bls_list_surveys', {
   title: 'List BLS Surveys',
   description:
-    'List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.',
+    'List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series; bls_search_series covers only the surveys in its offline index, and series in the others are fetched by SeriesID with bls_get_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -78,7 +148,7 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
       .enum(['prices', 'employment', 'wages', 'productivity', 'injuries', 'time_use'])
       .optional()
       .describe(
-        'Optional category filter. One of: prices, employment, wages, productivity, injuries, time_use. Omit to list all surveys.',
+        'Optional category filter. One of: prices, employment, wages, productivity, injuries, time_use. A survey can appear under more than one category (CES under employment and wages). Omit to list all surveys.',
       ),
   }),
 

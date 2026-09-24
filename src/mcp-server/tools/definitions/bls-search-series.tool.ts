@@ -7,12 +7,25 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
+import {
+  getBlsCatalogService,
+  OES_SURVEY_ABBR,
+  SURVEY_ABBRS,
+} from '@/services/bls-catalog/bls-catalog-service.js';
+
+/** The surveys a default deployment indexes, derived from the harvest list. */
+const DEFAULT_SURVEY_CODES = SURVEY_ABBRS.filter((a) => a !== OES_SURVEY_ABBR)
+  .map((a) => a.toUpperCase())
+  .join(', ');
+
+/** A filter value as applied: trimmed, with a blank value meaning no filter. */
+function normalizeFilter(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
 
 export const blsSearchSeriesTool = tool('bls_search_series', {
   title: 'Search BLS Series',
-  description:
-    'Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag) and plain-language names. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline — no API quota consumed. Survey filter accepts two-letter codes (CU, CE, LN, LA, PC, JT, OE, EC, PR). Area filter accepts state names, MSA names, or FIPS area codes.',
+  description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE only when the server sets BLS_CATALOG_INCLUDE_OES=true); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts state names, MSA names, or FIPS area codes.`,
   annotations: { readOnlyHint: true, openWorldHint: true },
 
   errors: [
@@ -37,13 +50,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .string()
       .optional()
       .describe(
-        'Two-letter LABSTAT survey abbreviation to filter results (e.g. CU for CPI, CE for CES, LN for CPS, LA for LAUS, JT for JOLTS, OE for OEWS). Omit to search all loaded surveys.',
+        `Two-letter LABSTAT survey abbreviation to filter results, case-insensitive (e.g. CU for CPI, CE for CES, LN for CPS, LA for LAUS, JT for JOLTS). Indexed surveys: ${DEFAULT_SURVEY_CODES}; OE (OEWS) only when the server sets BLS_CATALOG_INCLUDE_OES=true. Omit to search all indexed surveys.`,
       ),
     area: z
       .string()
       .optional()
       .describe(
-        'State name, MSA name, or FIPS area code to narrow results to a geographic area. Omit for national series.',
+        'State name, MSA name, or FIPS area code to narrow results to a geographic area — a case-insensitive substring of the area name, title, or SeriesID. Omit for national series, which then rank first among equal matches.',
       ),
     seasonal_adjustment: z
       .boolean()
@@ -58,6 +71,14 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .max(50)
       .default(10)
       .describe('Maximum number of results to return (1–50, default 10).'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Number of ranked results to skip, for paging past the first page (default 0). Pass nextOffset from the previous response to get the next page.',
+      ),
   }),
 
   output: z.object({
@@ -87,18 +108,22 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     totalCount: z
       .number()
       .describe(
-        'Total candidates scored before the limit was applied. A lower bound when capped is true — the catalog index may contain more matching series.',
+        'Total ranked results after every filter (area included), before limit and offset. A lower bound when capped is true — the catalog index may contain more matching series.',
       ),
     truncated: z
       .boolean()
       .optional()
-      .describe('True when more candidates matched than the limit returned.'),
+      .describe('True when ranked results remain past this page; nextOffset fetches them.'),
     shown: z.number().optional().describe('Number of series returned in this response.'),
     cap: z.number().optional().describe('The result limit that capped the returned list.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe('Offset of the next page. Present only when truncated is true.'),
     capped: z
       .boolean()
       .describe(
-        'True when the FTS candidate pool reached the internal cap (~1000). totalCount is then a lower bound, not an exact match count. Narrow the query, add survey/area filters, or use a direct SeriesID to get an exact count.',
+        'True when the FTS candidate pool, after the survey/area/seasonal filters, reached the internal cap (~1000). totalCount is then a lower bound and offset paging stops at the pool. Narrow the query, add filters, or use a direct SeriesID to get an exact count.',
       ),
     catalogSize: z
       .number()
@@ -113,21 +138,26 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     surveyFilter: z
       .string()
       .optional()
-      .describe('Survey filter applied, if any. Absent when no survey filter was passed.'),
+      .describe(
+        'Survey filter applied, trimmed and uppercased. Absent when no survey filter was passed or it was blank.',
+      ),
     areaFilter: z
       .string()
       .optional()
-      .describe('Area filter applied, if any. Absent when no area filter was passed.'),
+      .describe(
+        'Area filter applied, trimmed. Absent when no area filter was passed or it was blank.',
+      ),
     seasonalFilter: z
       .boolean()
       .optional()
       .describe('Seasonal-adjustment filter applied, if any. Absent when not passed.'),
     limitApplied: z.number().describe('Result limit in effect (defaults to 10 when omitted).'),
+    offsetApplied: z.number().describe('Offset in effect (defaults to 0 when omitted).'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no results matched — e.g. how to broaden the query or remove filters. Absent when results are returned.',
+        'Guidance on the result: the survey is not in the offline index, the offset is past the last result, nothing matched, which offset fetches the next page, or, on the last page of a capped list, that other series may also match. Absent when this page ends an uncapped list with results.',
       ),
   },
 
@@ -155,38 +185,70 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       );
     }
 
+    const survey = normalizeFilter(input.survey)?.toUpperCase();
+    const area = normalizeFilter(input.area);
+    const { limit, offset } = input;
     const result = await service.search({
       query: input.query,
-      survey: input.survey,
-      area: input.area,
+      survey,
+      area,
       seasonal_adjustment: input.seasonal_adjustment,
-      limit: input.limit,
+      limit,
+      offset,
     });
+    const { total, capped } = result;
+    const shown = result.series.length;
+    const nextOffset = offset + shown < total ? offset + shown : undefined;
 
     ctx.enrich({
-      capped: result.capped,
+      capped,
       catalogSize: service.totalSeries,
-      limitApplied: input.limit,
-      ...(input.survey !== undefined && { surveyFilter: input.survey }),
-      ...(input.area !== undefined && { areaFilter: input.area }),
+      limitApplied: limit,
+      offsetApplied: offset,
+      ...(nextOffset !== undefined && { nextOffset }),
+      ...(survey !== undefined && { surveyFilter: survey }),
+      ...(area !== undefined && { areaFilter: area }),
       ...(input.seasonal_adjustment !== undefined && {
         seasonalFilter: input.seasonal_adjustment,
       }),
     });
-    ctx.enrich.total(result.total);
-    if (result.total > result.series.length) {
-      ctx.enrich.truncated({ shown: result.series.length, cap: input.limit });
-    }
+    ctx.enrich.total(total);
     ctx.enrich.echo(input.query);
-    if (result.series.length === 0) {
+
+    // One notice per response — the framework keeps the last one written. A page
+    // with results after it carries only the next-page guidance; otherwise the
+    // precedence is un-indexed survey, offset past the end, no match, then the
+    // capped-pool note on a last page.
+    const range = `results ${offset + 1}–${offset + shown}`;
+    if (nextOffset !== undefined) {
+      ctx.enrich.truncated({
+        shown,
+        cap: limit,
+        guidance: `Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page.`,
+      });
+    } else if (survey !== undefined && !service.indexedSurveys.includes(survey)) {
+      const oesHint =
+        survey === OES_SURVEY_ABBR.toUpperCase() && !service.includeOes
+          ? ' OE (OEWS) series are indexed only when the server sets BLS_CATALOG_INCLUDE_OES=true.'
+          : '';
+      ctx.enrich.notice(
+        `Survey ${survey} has no series in the offline catalog index (indexed: ${service.indexedSurveys.join(', ')}). Use bls_list_surveys for valid codes; series in other surveys are fetchable by SeriesID via bls_get_series.${oesHint}`,
+      );
+    } else if (total > 0 && offset >= total) {
+      ctx.enrich.notice(
+        `Offset ${offset} is past the last of ${total} results. Pass an offset below ${total} (offset 0 is the first page).`,
+      );
+    } else if (total === 0) {
       const hasFilters =
-        input.survey !== undefined ||
-        input.area !== undefined ||
-        input.seasonal_adjustment !== undefined;
+        survey !== undefined || area !== undefined || input.seasonal_adjustment !== undefined;
       ctx.enrich.notice(
         hasFilters
           ? 'No matching series found. Try removing the survey/area/seasonal filter or broadening the query.'
           : 'No matching series found. Try broadening the query, checking spelling, or using a BLS SeriesID directly.',
+      );
+    } else if (capped) {
+      ctx.enrich.notice(
+        `Showing ${range}, the last of ${total} ranked candidates. The candidate pool is capped, so other series may also match. Narrow the query or add survey/area filters to reach them.`,
       );
     }
 
@@ -203,8 +265,10 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
   },
 
   format: (result) => {
+    // The notice says why the page is empty: no match, an un-indexed survey, or
+    // an offset past the last result.
     if (result.series.length === 0) {
-      return [{ type: 'text', text: 'No matching series found.' }];
+      return [{ type: 'text', text: 'No series returned.' }];
     }
     const lines: string[] = [`**${result.series.length} series returned:**\n`];
     for (const s of result.series) {

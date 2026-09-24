@@ -87,9 +87,10 @@ const INVALID_KEY_PATTERN = /provided by the User is invalid/i;
  * Verified 2026-07-17 against `/surveys/{abbr}`, and cross-checked for 17
  * surveys against a live `POST /timeseries/data` with `calculations: true` —
  * the flags predicted which calculations the API actually returned in every
- * case, including the percent-only and neither-supported surveys.
+ * case, including the percent-only and neither-supported surveys. Exported as
+ * the swept survey inventory, which the `bls_list_surveys` category tests walk.
  */
-const SURVEY_CAPABILITIES: Record<
+export const SURVEY_CAPABILITIES: Record<
   string,
   { allowsNetChange: boolean; allowsPercentChange: boolean; hasAnnualAverages: boolean }
 > = {
@@ -373,9 +374,9 @@ export class BlsApiService {
 
   /**
    * Convert mirror observation rows to SeriesData, hydrating catalog metadata
-   * (title, area, item, seasonal) from the in-memory catalog index.
+   * (title, area, item, seasonal) from the on-disk catalog index.
    * The LABSTAT data files carry only raw observation values — catalog metadata
-   * must be joined from the catalog service's in-memory series index.
+   * must be joined from the catalog service's series index.
    *
    * Series come back in row order and only for IDs the rows cover; the caller
    * lays them out against the request via {@link alignToRequestOrder}.

@@ -1,7 +1,8 @@
 /**
- * @fileoverview BLS LABSTAT flat-file catalog service. Downloads `{survey}.series`
- * files from `download.bls.gov/pub/time.series/{survey}/`, parses them into a
- * searchable series index, and persists that index in an on-disk SQLite store
+ * @fileoverview BLS LABSTAT flat-file catalog service. Downloads each survey's
+ * `{survey}.series` file and code tables from
+ * `download.bls.gov/pub/time.series/{survey}/`, decodes them into a searchable
+ * series index, and persists that index in an on-disk SQLite store
  * (the framework's FTS5-capable `sqliteMirrorStore`). Search runs as an FTS5
  * candidate query rescored by a bespoke relevance function — the index lives on
  * disk, not the JS heap, so large surveys do not inflate memory. No API quota is
@@ -11,63 +12,87 @@
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { internalError } from '@cyanheads/mcp-ts-core/errors';
-import { type MirrorRow, type MirrorStore, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
+import {
+  type MirrorRow,
+  type MirrorStore,
+  type SqlValue,
+  sqliteMirrorStore,
+} from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
   CatalogSearchInput,
   CatalogSearchResult,
   CatalogSeries,
+  CodeDimension,
   SurveyDefinition,
 } from './types.js';
 
+/** A dimension keyed by `key` columns — by default the table's own `{table}_code`. */
+function dim(table: string, ...key: string[]): CodeDimension {
+  return { table, key: key.length > 0 ? key : [`${table}_code`] };
+}
+
 /**
  * Surveys fetched at startup. Chosen to cover >95% of real-world queries.
- * Each entry maps the LABSTAT file abbreviation to a human-readable name.
- * The `codeTables` entries name the companion mapping files that provide
- * human-readable area and item names.
+ * Each entry maps the LABSTAT file abbreviation to its program name and the
+ * `.series` columns decoded through companion code tables: `area` and `item`
+ * for every row, `title` for surveys whose `.series` file ships no
+ * `series_title` (JT, EC, PR). Only the tables these dimensions name are
+ * fetched, and each exists in the survey's LABSTAT directory.
  */
 const SURVEYS: SurveyDefinition[] = [
-  { abbr: 'cu', name: 'CPI - All Urban Consumers', codeTables: ['area', 'item', 'periodicity'] },
-  { abbr: 'ap', name: 'Consumer Price Index - Average Price Data', codeTables: ['area', 'item'] },
+  { abbr: 'cu', name: 'CPI - All Urban Consumers', area: dim('area'), item: dim('item') },
   {
-    abbr: 'ce',
-    name: 'CES - Employment, Hours, and Earnings',
-    codeTables: ['industry', 'datatype', 'state', 'area', 'supersector'],
+    abbr: 'ap',
+    name: 'Consumer Price Index - Average Price Data',
+    area: dim('area'),
+    item: dim('item'),
   },
-  {
-    abbr: 'ln',
-    name: 'CPS - Labor Force Statistics',
-    codeTables: ['tdata', 'periodicity', 'series_catalog'],
-  },
-  {
-    abbr: 'la',
-    name: 'LAUS - Local Area Unemployment Statistics',
-    codeTables: ['area', 'measure'],
-  },
+  { abbr: 'ce', name: 'CES - Employment, Hours, and Earnings', item: dim('industry') },
+  { abbr: 'ln', name: 'CPS - Labor Force Statistics' },
+  /**
+   * No `item`: every LAUS title already opens with its measure ("Unemployment
+   * Rate: Texas (S)"), and repeating it in `item_name` lifts ~8K state and local
+   * rows over the national CPS series for measure queries.
+   */
+  { abbr: 'la', name: 'LAUS - Local Area Unemployment Statistics', area: dim('area') },
   {
     abbr: 'pc',
     name: 'PPI - Industry Data',
-    codeTables: ['industry', 'product', 'group', 'seasonality'],
+    item: dim('product', 'industry_code', 'product_code'),
   },
-  { abbr: 'wp', name: 'PPI - Commodity Data', codeTables: ['commodity', 'group', 'seasonality'] },
+  { abbr: 'wp', name: 'PPI - Commodity Data', item: dim('item', 'group_code', 'item_code') },
+  /**
+   * The acronym alone: the name prefixes every synthesized JT title, and the
+   * spelled-out "Job Openings and Labor Turnover" would put "job openings" into
+   * the quits, hires, and separations rows too. `area_code` is the constant
+   * `00000` on every row; `state_code` carries the geography.
+   */
   {
     abbr: 'jt',
-    name: 'JOLTS - Job Openings and Labor Turnover',
-    codeTables: ['industry', 'dataelement', 'state', 'area', 'seasonadj', 'ratelevel'],
+    name: 'JOLTS',
+    area: dim('state'),
+    title: [dim('dataelement'), dim('industry'), dim('state'), dim('sizeclass'), dim('ratelevel')],
   },
   {
     abbr: 'oe',
     name: 'OES/OEWS - Occupational Employment and Wage Statistics',
-    codeTables: ['area', 'industry', 'occupation', 'datatype'],
+    area: dim('area'),
+    item: dim('occupation'),
   },
+  /** The SIC-basis Employment Cost Index; every series ends in 2005. */
   {
     abbr: 'ec',
-    name: 'ECEC - Employer Costs for Employee Compensation',
-    codeTables: ['ownership', 'occupation', 'subcell', 'datatype', 'industry'],
+    name: 'ECI (SIC basis, ended 2005)',
+    title: [dim('compensation', 'comp_code'), dim('group'), dim('ownership'), dim('periodicity')],
   },
-  { abbr: 'pr', name: 'Productivity - Business', codeTables: ['measure', 'sector'] },
-  { abbr: 'mp', name: 'Productivity - Major Sector', codeTables: ['measure', 'sector'] },
+  {
+    abbr: 'pr',
+    name: 'Major Sector Productivity and Costs',
+    title: [dim('measure'), dim('sector'), dim('duration')],
+  },
+  { abbr: 'mp', name: 'Major Sector Total Factor Productivity', item: dim('sector') },
   /**
    * Appended rather than grouped with the CPI family above: `SURVEY_ABBRS`
    * indices are load-bearing for the observations ingester's resume cursor
@@ -76,7 +101,8 @@ const SURVEYS: SurveyDefinition[] = [
   {
     abbr: 'cw',
     name: 'CPI-W - Urban Wage Earners and Clerical Workers',
-    codeTables: ['area', 'item', 'periodicity'],
+    area: dim('area'),
+    item: dim('item'),
   },
 ];
 
@@ -92,11 +118,11 @@ export const SURVEY_ABBRS: readonly string[] = SURVEYS.map((s) => s.abbr);
 /**
  * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.2 GB, 32× every
  * other survey combined. It is excluded from the catalog unless explicitly opted
- * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~187K
+ * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~160K
  * series), the first harvest fast, and on-disk size modest. OES series remain
  * fetchable by ID via bls_get_series; they are simply not in the search index.
  */
-const OES_SURVEY_ABBR = 'oe';
+export const OES_SURVEY_ABBR = 'oe';
 
 /** Known common series to boost in search rankings. */
 const COMMON_SERIES: Record<string, string> = {
@@ -132,16 +158,6 @@ const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: read
 /** Relevance boost for a candidate whose survey matches a query concept alias. */
 const ALIAS_SURVEY_BOOST = 6;
 
-/** Column indices in a `.series` tab-delimited file. Varies by survey — we try all fallbacks. */
-interface SeriesColumns {
-  areaCode?: number;
-  itemCode?: number;
-  periodicity?: number;
-  seasonal?: number;
-  seriesId: number;
-  title?: number;
-}
-
 /** Max surveys fetched concurrently during a harvest. Keeps the request burst small. */
 const SURVEY_FETCH_CONCURRENCY = 3;
 
@@ -151,65 +167,153 @@ const UPSERT_CHUNK_SIZE = 5_000;
 /** Max FTS candidates pulled before the bespoke rescore. Generous so `total` stays accurate. */
 const CANDIDATE_LIMIT = 1_000;
 
-/** Parse an area code → name mapping from a `.area` file. */
-function parseCodeMap(text: string, keyCol = 0, valCol = 1): Map<string, string> {
-  const map = new Map<string, string>();
-  const [, ...dataLines] = text.split('\n');
-  for (const line of dataLines) {
-    const parts = line?.split('\t');
-    const key = parts?.[keyCol]?.trim();
-    const val = parts?.[valCol]?.trim();
-    if (key && val) map.set(key, val);
-  }
-  return map;
+/** The catalog table; its FTS5 index is `${CATALOG_TABLE}_fts`. */
+const CATALOG_TABLE = 'bls_catalog';
+const CATALOG_FTS = `${CATALOG_TABLE}_fts`;
+
+/** Columns the `area` filter matches as a case-insensitive substring. */
+const AREA_MATCH_COLUMNS = ['area_name', 'title', 'series_id'] as const;
+
+/**
+ * The decoded area labels that mean "the whole country": the CPI/AP
+ * `U.S. city average`, the JOLTS `Total US` state code, and the opt-in OEWS
+ * `National` area. Rows carrying one, and rows with no decoded area (CE, LN,
+ * and the other national surveys), are national for the rescore's tie-break.
+ */
+const NATIONAL_AREAS: ReadonlySet<string> = new Set(['U.S. city average', 'Total US', 'National']);
+
+/**
+ * Escape `text` for a `LIKE … ESCAPE '\'` pattern so `%`, `_`, and `\` match
+ * literally. One linear pass over caller text; the result is always bound as a
+ * parameter, never interpolated into SQL.
+ */
+export function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, '\\$&');
 }
 
-/** Parse a `.series` file into catalog entries using optional code maps. */
+/**
+ * Catalog index version. Bump it whenever the harvest's output changes (titles,
+ * decoded area/item, the survey set) so an index persisted by an earlier
+ * release re-harvests on its first boot after the upgrade. The migration clears
+ * the completion marker — `writeState` cannot, since it COALESCEs
+ * `completed_at` — so `load()` sees a stale index, keeps serving it, and
+ * refreshes it. On a brand-new database the marker is already NULL.
+ * Version 2: header-keyed code tables and synthesized JT/EC/PR titles.
+ */
+const CATALOG_INDEX_VERSION = 2;
+
+/** Code-table key (the key column values joined by a tab, which no field contains) → label. */
+type CodeLabels = Map<string, string>;
+
+/** A dimension resolved against one `.series` header: its key column indices and labels. */
+interface Decoder {
+  cols: number[];
+  labels: CodeLabels;
+}
+
+function warn(message: string): void {
+  process.stderr.write(`[bls-labor-mcp-server] Catalog: ${message}\n`);
+}
+
+/**
+ * Split a LABSTAT line into trimmed fields. Files are tab-delimited, except a
+ * few space-padded code tables (`ec.group`) whose columns are separated by runs
+ * of two or more spaces.
+ */
+function splitFields(line: string, spaced: boolean): string[] {
+  return (spaced ? line.trim().split(/\s{2,}/) : line.split('\t')).map((f) => f.trim());
+}
+
+/**
+ * Parse a code table by its header: the code from the `key` column(s), the
+ * label from the first `_text`/`_name` column. Space-delimited when the header
+ * holds no tab. Returns undefined when the header lacks a key or label column.
+ */
+function parseCodeTable(text: string, key: readonly string[]): CodeLabels | undefined {
+  const [headerLine = '', ...lines] = text.split('\n');
+  const spaced = !headerLine.includes('\t');
+  const header = splitFields(headerLine, spaced).map((h) => h.toLowerCase());
+  const keyCols = key.map((k) => header.indexOf(k));
+  const labelCol = header.findIndex((h) => h.endsWith('_text') || h.endsWith('_name'));
+  if (keyCols.includes(-1) || labelCol < 0) return;
+
+  const labels: CodeLabels = new Map();
+  for (const line of lines) {
+    const parts = splitFields(line, spaced);
+    const code = keyCols.map((i) => parts[i] ?? '');
+    const label = parts[labelCol];
+    if (label && code.every(Boolean)) labels.set(code.join('\t'), label);
+  }
+  return labels;
+}
+
+/** A row's decoded label for a dimension; undefined when its code is not in the table. */
+function decode(decoder: Decoder | undefined, parts: string[]): string | undefined {
+  return decoder?.labels.get(decoder.cols.map((i) => parts[i] ?? '').join('\t'));
+}
+
+/**
+ * Parse a `.series` file into catalog entries, decoding each row's area, item,
+ * and — when the row has no `series_title` — its synthesized title through the
+ * survey's code tables (`tables`: table suffix → file text).
+ */
 function parseSeries(
   text: string,
-  surveyAbbr: string,
-  surveyName: string,
-  areaCodes: Map<string, string>,
-  itemCodes: Map<string, string>,
+  survey: SurveyDefinition,
+  tables: ReadonlyMap<string, string>,
 ): CatalogSeries[] {
   const lines = text.split('\n');
   if (lines.length < 2) return [];
 
-  const header = lines[0]?.split('\t').map((h) => h.trim().toLowerCase()) ?? [];
-  const seriesIdIdx = header.indexOf('series_id');
-  const cols: SeriesColumns = { seriesId: seriesIdIdx >= 0 ? seriesIdIdx : 0 };
-  const titleIdx = header.indexOf('series_title');
-  if (titleIdx >= 0) cols.title = titleIdx;
-  const areaIdx = header.findIndex((h) => h.includes('area_code'));
-  if (areaIdx >= 0) cols.areaCode = areaIdx;
-  const itemIdx = header.findIndex((h) => h.includes('item_code'));
-  if (itemIdx >= 0) cols.itemCode = itemIdx;
-  const seasonIdx = header.findIndex((h) => h.includes('seasonal'));
-  if (seasonIdx >= 0) cols.seasonal = seasonIdx;
+  const header = splitFields(lines[0] ?? '', false).map((h) => h.toLowerCase());
+  const seriesIdCol = Math.max(header.indexOf('series_id'), 0);
+  const titleCol = header.indexOf('series_title');
+  const seasonalCol = header.findIndex((h) => h.includes('seasonal'));
+
+  const parsedTables = new Map<string, CodeLabels | undefined>();
+  const resolve = (dimension: CodeDimension | undefined): Decoder | undefined => {
+    if (!dimension) return;
+    const { table, key } = dimension;
+    const text = tables.get(table);
+    if (text === undefined) return; // fetch failure already reported
+    const cacheKey = `${table}\t${key.join('\t')}`;
+    if (!parsedTables.has(cacheKey)) {
+      const labels = parseCodeTable(text, key);
+      if (!labels) {
+        warn(`${survey.abbr}.${table} header lacks ${key.join(' + ')} or a *_text/*_name label.`);
+      }
+      parsedTables.set(cacheKey, labels);
+    }
+    const labels = parsedTables.get(cacheKey);
+    const cols = key.map((k) => header.indexOf(k));
+    if (!labels || cols.includes(-1)) {
+      if (labels) warn(`${survey.abbr}.series header lacks ${key.join(' + ')}.`);
+      return;
+    }
+    return { cols, labels };
+  };
+
+  const area = resolve(survey.area);
+  const item = resolve(survey.item);
+  const titleDecoders = survey.title ? survey.title.map(resolve) : [item, area];
+  const surveyAbbr = survey.abbr.toUpperCase();
 
   const entries: CatalogSeries[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i]?.trim();
-    if (!line) continue;
-    const parts = line.split('\t');
-    const seriesId = parts[cols.seriesId]?.trim();
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const parts = splitFields(line, false);
+    const seriesId = parts[seriesIdCol];
     if (!seriesId) continue;
 
-    let title = cols.title !== undefined ? parts[cols.title]?.trim() : undefined;
-    const areaCode = cols.areaCode !== undefined ? parts[cols.areaCode]?.trim() : undefined;
-    const itemCode = cols.itemCode !== undefined ? parts[cols.itemCode]?.trim() : undefined;
-    const seasonCode = cols.seasonal !== undefined ? parts[cols.seasonal]?.trim() : undefined;
+    const areaName = decode(area, parts);
+    const itemName = decode(item, parts);
+    const title =
+      (titleCol >= 0 ? parts[titleCol] : undefined) ||
+      [survey.name, ...titleDecoders.map((d) => decode(d, parts))]
+        .filter((p): p is string => Boolean(p))
+        .join(' - ');
 
-    const areaName = areaCode ? areaCodes.get(areaCode) : undefined;
-    const itemName = itemCode ? itemCodes.get(itemCode) : undefined;
-
-    if (!title) {
-      const titleParts: string[] = [surveyName];
-      if (itemName) titleParts.push(itemName);
-      if (areaName) titleParts.push(areaName);
-      title = titleParts.join(' - ');
-    }
-
+    const seasonCode = seasonalCol >= 0 ? parts[seasonalCol] : undefined;
     const seasonal = seasonCode
       ? seasonCode.toUpperCase() === 'S' || seasonCode === 'seasonally adjusted'
       : false;
@@ -259,7 +363,14 @@ function toCatalog(row: MirrorRow): CatalogSeries {
 export function createCatalogStore(dbPath: string): MirrorStore {
   return sqliteMirrorStore({
     path: dbPath || ':memory:',
-    table: 'bls_catalog',
+    version: CATALOG_INDEX_VERSION,
+    migrations: [
+      {
+        version: CATALOG_INDEX_VERSION,
+        up: (db) => db.exec('UPDATE mirror_sync_state SET completed_at = NULL WHERE id = 1'),
+      },
+    ],
+    table: CATALOG_TABLE,
     primaryKey: 'series_id',
     columns: {
       series_id: 'TEXT',
@@ -279,15 +390,36 @@ export class BlsCatalogService {
   private loaded = false;
   private loadError: string | undefined;
   private cachedTotal = 0;
+  private cachedSurveys: readonly string[] = [];
 
   constructor(
     private readonly catalogBaseUrl: string,
     private readonly userAgent: string,
     dbPath = '',
     private readonly cacheTtlHours = 168,
-    private readonly includeOes = false,
+    /** Whether the harvest includes the opt-in OES/OEWS survey (`BLS_CATALOG_INCLUDE_OES`). */
+    readonly includeOes = false,
   ) {
     this.store = createCatalogStore(dbPath);
+  }
+
+  /**
+   * Re-read the row total and the distinct survey codes from the index. Runs
+   * once per load and after each harvest — the index changes only then — so
+   * search never pays for it. The DISTINCT is a covering scan of
+   * `bls_catalog_survey_abbr_idx`. `count()` runs first so the store finishes
+   * opening inside its own call: a `shutdown()` racing a first load then
+   * cannot close the raw handle between `raw()` resolving and the query.
+   */
+  private async readIndexStats(): Promise<void> {
+    this.cachedTotal = await this.store.count();
+    const db = await this.store.raw();
+    this.cachedSurveys = db
+      .prepare<{ survey_abbr: string }>(
+        `SELECT DISTINCT survey_abbr FROM ${CATALOG_TABLE} ORDER BY survey_abbr`,
+      )
+      .all()
+      .map((r) => r.survey_abbr);
   }
 
   /**
@@ -298,10 +430,10 @@ export class BlsCatalogService {
    * final outcome so callers can distinguish "still loading" from "load failed".
    */
   async load(maxAttempts = 3): Promise<void> {
-    const existing = await this.store.count();
+    await this.readIndexStats();
+    const existing = this.cachedTotal;
     if (existing > 0) {
       this.loaded = true;
-      this.cachedTotal = existing;
       this.loadError = undefined;
       const state = await this.store.readState();
       if (this.isFresh(state.completedAt)) return; // warm + fresh — nothing to do
@@ -317,7 +449,7 @@ export class BlsCatalogService {
     }
 
     if (applied > 0) {
-      this.cachedTotal = await this.store.count();
+      await this.readIndexStats();
       this.loaded = true;
       this.loadError = undefined;
       await this.store.writeState({
@@ -372,46 +504,40 @@ export class BlsCatalogService {
     return applied;
   }
 
+  /**
+   * Fetch a survey's `.series` file and the code tables its dimensions name,
+   * then parse. A missing `.series` file yields no rows; a missing code table
+   * leaves that dimension undecoded and is reported on stderr.
+   */
   private async loadSurvey(survey: SurveyDefinition): Promise<CatalogSeries[]> {
-    const baseUrl = this.catalogBaseUrl;
-    const abbr = survey.abbr;
-
+    const { abbr } = survey;
+    const url = (file: string) => `${this.catalogBaseUrl}/${abbr}/${abbr}.${file}`;
     const headers = { 'User-Agent': this.userAgent };
-    const [seriesRes, ...codeResults] = await Promise.allSettled([
-      fetch(`${baseUrl}/${abbr}/${abbr}.series`, { headers, signal: AbortSignal.timeout(30_000) }),
-      ...(survey.codeTables ?? []).map((table) =>
-        fetch(`${baseUrl}/${abbr}/${abbr}.${table}`, {
-          headers,
-          signal: AbortSignal.timeout(15_000),
-        }),
+    const dimensions = [survey.area, survey.item, ...(survey.title ?? [])];
+    const tableNames = [...new Set(dimensions.flatMap((d) => (d ? [d.table] : [])))];
+
+    const [seriesRes, ...tableResults] = await Promise.allSettled([
+      fetch(url('series'), { headers, signal: AbortSignal.timeout(30_000) }),
+      ...tableNames.map((table) =>
+        fetch(url(table), { headers, signal: AbortSignal.timeout(15_000) }),
       ),
     ]);
 
     if (seriesRes.status !== 'fulfilled' || !seriesRes.value.ok) return [];
     const seriesText = await seriesRes.value.text();
 
-    const areaCodes = new Map<string, string>();
-    const itemCodes = new Map<string, string>();
-
-    const tableNames = survey.codeTables ?? [];
-    for (const [i, res] of codeResults.entries()) {
-      if (res?.status !== 'fulfilled' || !res.value.ok) continue;
-      const text = await res.value.text();
-      const tableName = tableNames[i];
-      const parsed = parseCodeMap(text);
-      if (tableName === 'area' || tableName === 'state') {
-        for (const [k, v] of parsed) areaCodes.set(k, v);
-      } else if (
-        tableName === 'item' ||
-        tableName === 'product' ||
-        tableName === 'commodity' ||
-        tableName === 'occupation'
-      ) {
-        for (const [k, v] of parsed) itemCodes.set(k, v);
+    const tables = new Map<string, string>();
+    for (const [i, table] of tableNames.entries()) {
+      const res = tableResults[i];
+      if (res?.status === 'fulfilled' && res.value.ok) {
+        tables.set(table, await res.value.text());
+      } else {
+        const cause = res?.status === 'fulfilled' ? `HTTP ${res.value.status}` : 'request failed';
+        warn(`${abbr}.${table} unavailable (${cause}) — its codes are not decoded.`);
       }
     }
 
-    return parseSeries(seriesText, abbr.toUpperCase(), survey.name, areaCodes, itemCodes);
+    return parseSeries(seriesText, survey, tables);
   }
 
   /**
@@ -463,19 +589,7 @@ export class BlsCatalogService {
     const tokens = query.match(/[a-z0-9]+/gi) ?? [];
     if (tokens.length > 0) {
       const match = tokens.map((t) => `"${t.toLowerCase()}"*`).join(' OR ');
-      const filters = [];
-      if (surveyFilter)
-        filters.push({ column: 'survey_abbr', op: 'eq' as const, value: surveyFilter });
-      if (typeof seasonFilter === 'boolean') {
-        filters.push({ column: 'seasonal', op: 'eq' as const, value: seasonFilter ? 1 : 0 });
-      }
-      const { rows } = await this.store.query({
-        match,
-        filters,
-        sort: 'relevance',
-        limit: CANDIDATE_LIMIT,
-        offset: 0,
-      });
+      const rows = await this.candidateRows(match, surveyFilter, seasonFilter, areaFilter);
       // If the FTS query returned exactly CANDIDATE_LIMIT rows the full index likely
       // has more matches — total will be a lower bound.
       ftsCapped = rows.length >= CANDIDATE_LIMIT;
@@ -535,10 +649,58 @@ export class BlsCatalogService {
       scored.push({ s, score });
     }
 
-    scored.sort((a, b) => b.score - a.score);
+    // Without an area the caller asked for national series (the tool's `area`
+    // contract), so at equal score a national row outranks a state or metro one.
+    // Otherwise ties keep candidate order: exact id, headline, then bm25.
+    const national = (s: CatalogSeries) => Number(!s.areaName || NATIONAL_AREAS.has(s.areaName));
+    scored.sort((a, b) => b.score - a.score || (areaFilter ? 0 : national(b.s) - national(a.s)));
     const total = scored.length;
-    const series = scored.slice(0, input.limit).map((x) => x.s);
+    const offset = input.offset ?? 0;
+    const series = scored.slice(offset, offset + input.limit).map((x) => x.s);
     return { series, total, capped: ftsCapped };
+  }
+
+  /**
+   * The FTS candidate query: up to `CANDIDATE_LIMIT` rows matching `match`, in
+   * bm25 order, with the survey, seasonal, and area filters applied in SQL so
+   * the cap bounds only rows that pass them. The area is a case-insensitive
+   * substring of `area_name`, `title`, or `series_id` — the rescore's area gate,
+   * pushed down as bound `LIKE` parameters. `MirrorStore.query` has no
+   * substring operator, hence the raw handle; the SELECT keeps the store's own
+   * relevance form (FTS JOIN, `MATCH`, `ORDER BY bm25()`).
+   */
+  private async candidateRows(
+    match: string,
+    survey: string | undefined,
+    seasonal: boolean | undefined,
+    area: string | undefined,
+  ): Promise<MirrorRow[]> {
+    const where = [`${CATALOG_FTS} MATCH ?`];
+    const params: SqlValue[] = [match];
+    if (survey) {
+      where.push(`${CATALOG_TABLE}.survey_abbr = ?`);
+      params.push(survey);
+    }
+    if (typeof seasonal === 'boolean') {
+      where.push(`${CATALOG_TABLE}.seasonal = ?`);
+      params.push(seasonal ? 1 : 0);
+    }
+    if (area) {
+      const pattern = `%${escapeLike(area)}%`;
+      where.push(
+        `(${AREA_MATCH_COLUMNS.map((c) => `${CATALOG_TABLE}.${c} LIKE ? ESCAPE '\\'`).join(' OR ')})`,
+      );
+      params.push(...AREA_MATCH_COLUMNS.map(() => pattern));
+    }
+    const db = await this.store.raw();
+    return db
+      .prepare<MirrorRow>(
+        `SELECT ${CATALOG_TABLE}.* FROM ${CATALOG_TABLE}
+         JOIN ${CATALOG_FTS} ON ${CATALOG_TABLE}.rowid = ${CATALOG_FTS}.rowid
+         WHERE ${where.join(' AND ')}
+         ORDER BY bm25(${CATALOG_FTS}) ASC LIMIT ?`,
+      )
+      .all(...params, CANDIDATE_LIMIT);
   }
 
   /**
@@ -567,6 +729,15 @@ export class BlsCatalogService {
 
   get totalSeries(): number {
     return this.cachedTotal;
+  }
+
+  /**
+   * Uppercase survey codes present in the index, sorted — what the index holds,
+   * not what `SURVEYS` asks for: a survey whose download failed is absent, and
+   * an index inside its TTL keeps the survey set of its last harvest.
+   */
+  get indexedSurveys(): readonly string[] {
+    return this.cachedSurveys;
   }
 
   get catalogLoadError(): string | undefined {

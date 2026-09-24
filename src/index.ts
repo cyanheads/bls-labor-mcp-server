@@ -52,7 +52,7 @@ const dropTool = !canvasEnabled
       });
 
 const instructions =
-  'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. ' +
+  'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. bls_search_series covers an offline index of the major surveys; series in other surveys are fetched by SeriesID with bls_get_series. ' +
   (canvasEnabled
     ? 'Large results spill to a DataCanvas dataframe. Call bls_dataframe_describe with dataset.name to inspect column_schema, then use that table name in bls_dataframe_query SQL.'
     : 'DataCanvas is disabled. If a history request exceeds the inline budget, narrow start_year/end_year or enable CANVAS_PROVIDER_TYPE=duckdb and restart.');
