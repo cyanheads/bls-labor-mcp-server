@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.7](changelog/0.5.x/0.5.7.md) — 2026-09-26
+
+Adopts mcp-ts-core 0.13.9 with clearer argument hints, corrected canvas SQL errors, private canvas scratch storage, and refreshed Bun/runtime tooling.
+
 ## [0.5.6](changelog/0.5.x/0.5.6.md) — 2026-09-23
 
 bls_get_series and bls_get_latest keep the series already answered when a live fallback fails or BLS sends its generic rejection, and canvas dataframes carry declared or canvas-reported column types and survive a failed drop.
