@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -47,75 +47,52 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 ### `bls_list_surveys` <sub>tool</sub>
 
-- Optional `category` filter narrows results to `prices`, `employment`, `wages`, `productivity`, `injuries`, or `time_use`; every survey sits in at least one category, and programs BLS lists under several subject areas (CES, QCEW, OEWS, International Labor Comparisons) appear in each
-- Returns survey abbreviation, full name, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`)
-- `hasAnnualAverages` is advisory only — LN, CE, LA, and SM report true yet publish no annual-average rows; read `bls_get_series`'s `annualAverageRows` to see what a call actually returns
-- Backed by the live BLS `/surveys` API with monthly caching — consumes no meaningful API quota
+- Optional `category` filters survey programs by subject; returns codes, names, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`).
+- Backed by the BLS surveys API with monthly caching. Annual-average support is advisory; read `bls_get_series`'s `annualAverageRows` for the rows actually returned.
 
 ---
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Free-text or keyword query, plus optional `survey` (two-letter code, case-insensitive), `area` (state/MSA/FIPS — a substring of the area name, title, or SeriesID), and `seasonal_adjustment` filters; blank filters count as omitted
-- `limit` 1–50 (default 10) and `offset` (default 0) page through the ranked results; `nextOffset` names the next page while `truncated` is true
-- Without `area`, national series rank ahead of state and metro series that match equally well
-- Decodes BLS's opaque positional SeriesIDs (e.g. `LNS14000000`) into survey, area, item, and seasonal-flag components alongside the plain-language title
-- CPI (CU, CW) and CPS (LN) publish one series at several frequencies under the same title; each result carries `frequency` (`Monthly`, `Semi-Annual`, `Quarterly`, `Annual`) to tell the twins apart, and a query naming `monthly`, `quarterly`, or `semiannual` lifts rows of that frequency over their twins
-- Also accepts a SeriesID directly for exact lookup
-- `capped: true` means the ~1000-candidate FTS pool, after the survey/area/seasonal filters, was exhausted — `totalCount` is then a lower bound, not an exact match count, and paging stops at the pool
-- Searches the surveys in its offline index: AP, CE, CI, CM, CU, CW, EC, JT, LA, LN, MP, PC, PR, and WP by default, plus OE when `BLS_CATALOG_INCLUDE_OES=true`. Compensation queries ("compensation", "employer costs", "employment cost index", or ECI/ECEC with a subject, as in "ECI benefits") surface the current ECEC (CM) and Employment Cost Index (CI) ahead of EC, the SIC-basis ECI that ended in 2005; a bare "ECI" still matches only EC, whose titles carry the acronym. A survey outside the index gets a notice listing the indexed codes; its series are still fetchable by SeriesID with `bls_get_series`
-- Operates entirely offline against the LABSTAT catalog index — consumes no BLS API quota
+- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` is 1–50 (default 10), with `offset` pagination; without an area filter, equally matching national series rank first.
+- Returns decoded SeriesIDs, titles, and `frequency`. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
+- Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Unindexed surveys remain fetchable by SeriesID.
 
 ---
 
 ### `bls_get_series` <sub>tool</sub>
 
-- Batch fetch 1–50 SeriesIDs per call; the whole batch counts as one of the 500 daily API queries
-- Optional `start_year`/`end_year` window (BLS caps requests at 20 years) and `calculations: true` for BLS server-side net/percent change — a survey returns whichever it supports and omits the rest (CPI/PPI return percent change only)
-- BLS needs both year bounds or neither: `start_year` alone resolves `end_year` to the current year, capped at `start_year + 19`; `end_year` alone is rejected without spending a query. `enrichment.startYearApplied`/`endYearApplied` report the window actually applied
-- Optional `annual_average: true` adds each year's mean as an extra `M13`/`Q05`/`S03` row; `enrichment.annualAverageRows` reports how many were added
-- BLS's raw `-` missing-value sentinel is preserved in `value` but reflected in `available` and excluded from `availableObservationCount`
-- A mixed batch keeps valid series when another SeriesID is invalid or empty — the unresolved ID stays listed with zero observations and reason-specific guidance
-- With `CANVAS_PROVIDER_TYPE=duckdb`, observation counts over the inline budget spill to a DataCanvas dataframe (`dataset.name`) for `bls_dataframe_describe`/`bls_dataframe_query`; without it configured, an oversized request fails with `canvas_unavailable` — narrow `start_year`/`end_year` instead
+- Fetch 1–50 SeriesIDs per call, with a `start_year`/`end_year` window of up to 20 years, optional `calculations`, and `annual_average`. A start alone resolves the end to the current year capped at start + 19; an end alone is rejected. One batch consumes one API query; calculations depend on survey support (CPI/PPI return percent change only).
+- Returns observations with `available`, preserves the raw `-` missing-value sentinel, and keeps valid series in mixed batches. Enrichment reports the applied year window, calculations, and annual-average rows.
+- Large results spill to `dataset.name` when `CANVAS_PROVIDER_TYPE=duckdb`; otherwise `canvas_unavailable` asks for a narrower window.
 
 ---
 
 ### `bls_get_latest` <sub>tool</sub>
 
-- One GET per SeriesID (no batch-latest endpoint in BLS v2); each call counts as one of the 500 daily API queries — recommended ≤10 series, maximum 50
-- For "current value" across many series, `bls_get_series` with a narrow year window is more quota-efficient (one query regardless of series count)
-- Partial success — failed series appear in a separate `failed[]` array (`seriesId` + `error`) instead of failing the whole call
-- `latestObservation.available` is false when BLS published the `-` missing-value sentinel for that period
+- Fetch the latest observation for up to 50 SeriesIDs (recommended ≤10). Each ID consumes one API query; use `bls_get_series` for a more efficient multi-series batch.
+- Returns successful `results[]` beside per-series `failed[]` entries. `latestObservation.available` distinguishes a published value from BLS's missing-value sentinel.
 
 ---
 
 ### `bls_dataframe_describe` <sub>tool</sub>
 
-- Available only when `CANVAS_PROVIDER_TYPE=duckdb`
-- Optional `name` (a `df_<id>` or `register_as` name) describes a single dataframe; omit it or leave it blank to list every active dataframe for the tenant
-- Each entry carries source tool, query params, row count, TTL (`created_at`/`expires_at`), and `column_schema` — all BLS dataframe columns are nullable
-- Spill tables from `bls_get_series` have a fixed schema: `value_numeric` and every `net_change_*`/`pct_change_*` column are `DOUBLE`, `available` and `is_annual_average` are `BOOLEAN`, the rest `VARCHAR`
-- A `register_as` table reports the types the canvas reads back from it; DuckDB types outside the canvas's set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) show as `VARCHAR`
-- Lazy-sweeps expired entries before responding; an expired entry that cannot be dropped stays listed until a later sweep drops it
+- Optional `name` describes one registered dataframe; omit it to list active dataframes for the tenant. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
+- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) report as `VARCHAR`. Expired entries are removed when their canvas drop succeeds.
 
 ---
 
 ### `bls_dataframe_query` <sub>tool</sub>
 
-- Available only when `CANVAS_PROVIDER_TYPE=duckdb`
-- Single-statement SELECT only — writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected; system catalogs (`information_schema`, `pg_catalog`, `sqlite_master`, `duckdb_*`) are denied
-- Supports JOINs, aggregates, window functions, and CTEs against `df_<id>` tables registered by `bls_get_series`
-- `row_limit` caps materialized rows (default 1000, max 10000); optional `register_as` persists the result as a new dataframe with a fresh TTL for chained analysis without re-querying BLS
-- Zero BLS API quota consumed
+- Run one SELECT against registered tables, with JOINs, aggregates, window functions, or CTEs. `row_limit` defaults to 1000 and caps at 10000; writes, external-file reads, and system catalogs are denied.
+- Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis; requires `CANVAS_PROVIDER_TYPE=duckdb`.
 
 ---
 
 ### `bls_dataframe_drop` <sub>tool</sub>
 
-- Input: single required `name` (`df_XXXXX_XXXXX`, or a `register_as` name) — the canvas table to drop
-- Available only when `CANVAS_PROVIDER_TYPE=duckdb` and explicitly enabled via `BLS_DATAFRAME_DROP_ENABLED=true` — off by default since per-table TTL handles cleanup
-- Idempotent — returns `dropped: false` when the named dataframe doesn't exist
-- A drop the canvas could not complete fails with a retryable `canvas_drop_failed` and leaves the dataframe in place, never reporting `dropped: true`
+- Required `name` identifies the dataframe to drop. Available only with `CANVAS_PROVIDER_TYPE=duckdb` and `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default.
+- Returns `dropped: false` for a missing table. A failed drop returns retryable `canvas_drop_failed` and leaves the dataframe registered.
 
 ## Features
 
@@ -269,6 +246,10 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation. | `false` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base OTLP URL for traces and metrics; signal-specific endpoints override it. | — |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Opt-in OTLP log endpoint. The base URL never enables log export. | — |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log failed-call arguments and results, redacted by key name; secrets in free-form values remain. | `false` |
+| `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` | UTF-8 byte cap per logged failure payload. | `16384` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 

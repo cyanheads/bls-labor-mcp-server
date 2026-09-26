@@ -2,6 +2,7 @@
   "depcheck": {
     "ignores": [
       "@types/*",
+      "@modelcontextprotocol/client",
       "pino-pretty",
       "typescript",
       "tsc-alias",
