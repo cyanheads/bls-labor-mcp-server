@@ -4,7 +4,7 @@ description: >
   MCP definition linter rules reference. Use when `bun run lint:mcp` or `bun run devcheck` reports a lint error or warning (`format-parity`, `schema-is-object`, `name-format`, `server-json-*`, etc.) and you need to understand the rule, its severity, and how to fix it. Every rule ID the linter emits has an entry in this doc.
 metadata:
   author: cyanheads
-  version: "1.20"
+  version: "1.22"
   audience: external
   type: reference
 ---
@@ -53,7 +53,7 @@ Grouped by family. Jump to any rule ID via its anchor.
 | Prompts | `generate-required` | [Prompt rules](#prompt-rules) |
 | Handler body | `prefer-mcp-error-in-handler`, `prefer-error-factory`, `preserve-cause-on-rethrow`, `no-stringify-upstream-error` | [Handler body rules](#handler-body-rules) |
 | Error contract (structural) | `error-contract-type`, `error-contract-empty`, `error-contract-entry-type`, `error-contract-code-type`, `error-contract-code-unknown`, `error-contract-code-unknown-error`, `error-contract-reason-required`, `error-contract-reason-format`, `error-contract-reason-unique`, `error-contract-when-required`, `error-contract-retryable-type`, `error-contract-severity-unknown`, `error-contract-recovery-required`, `error-contract-recovery-empty`, `error-contract-recovery-min-words` | [Error contract rules](#error-contract-rules) |
-| Error contract (conformance) | `error-contract-conformance`, `error-contract-prefer-fail`, `error-contract-unthrown`, `error-contract-recovery-unforwarded` | [Error contract rules](#error-contract-rules) |
+| Error contract (conformance) | `error-contract-conformance`, `error-contract-prefer-fail`, `error-contract-unthrown` | [Error contract rules](#error-contract-rules) |
 | Enrichment | `enrichment-type`, `enrichment-empty`, `enrichment-field-type`, `enrichment-output-collision`, `enrichment-prefer-block`, `enrichment-trailer-render`, `enrichment-trailer-orphan`, `enrichment-trailer-unknown-field`, `capped-list-no-truncation` | [Enrichment rules](#enrichment-rules) |
 | server.json | ~40 rules prefixed `server-json-*` | [server.json rules](#server-json-rules) |
 
@@ -266,8 +266,9 @@ Evaluated on the emitted schema rather than on the Zod schema, because the two d
 
 | What you wrote | What is emitted |
 |:--|:--|
-| `z.enum([1, 2, 3, 4, 5])` — a numeric array handed to a string-only constructor | `{"type": "string", "enum": []}` |
-| `z.enum([])` | `{"type": "string", "enum": []}` |
+| `z.enum([1, 2, 3, 4, 5])` — a numeric array handed to a string-only constructor | `{"not": {}}` |
+| `z.enum([])` | `{"not": {}}` |
+| `.meta({ enum: [] })` / `.meta({ oneOf: [] })` / `.meta({ type: [] })` | the empty set as written |
 | `z.union([])` | `{"anyOf": []}` |
 | `z.never()` | `{"not": {}}` |
 
@@ -448,7 +449,7 @@ Also applies to resources and prompts (same rule ID, different `definitionType`)
 
 **Severity:** error
 
-Every tool must have a `handler` function (or `taskHandlers` object for task tools). Every resource must have a `handler`. Definitions without handlers can't do anything at runtime.
+Every tool must have a `handler` function. Every resource must have a `handler`. Definitions without handlers can't do anything at runtime.
 
 Also applies to resources (same rule ID, different `definitionType`).
 
@@ -662,7 +663,7 @@ Most of these are mechanical — fix the manifest field named in the diagnostic'
 
 ## Landing config rules
 
-Validate the `landing` config passed to `createApp()` (the config object that drives the framework's landing page). Run only when `input.landing` is provided to `validateDefinitions`. All errors — landing config that's structurally broken would render incorrectly on the public page.
+Validate the `landing` config passed to `createApp()` (the config object that drives the framework's landing page). Run only when `input.landing` is provided to `validateDefinitions`. Structural breakage is an error — it would render incorrectly on the public page. Input the page tolerates (extras it drops, an empty override it falls back from, an unconventional env-var name) is a warning.
 
 | Rule | Severity | Catches |
 |:-----|:---------|:--------|
@@ -672,20 +673,20 @@ Validate the `landing` config passed to `createApp()` (the config object that dr
 | `landing-logo-type` | error | `logo` is present but not a string |
 | `landing-logo-size` | error | `logo` is too long for inline rendering |
 | `landing-links-type` | error | `links` is present but not an array |
-| `landing-links-count` | error | `links` exceeds the max count |
+| `landing-links-count` | warning | `links` exceeds the max count — extras are dropped |
 | `landing-link-shape` | error | A `links[]` entry is not a plain object |
 | `landing-link-href` | error | A link entry's `href` is missing or not a non-empty string |
 | `landing-link-label` | error | A link entry's `label` is missing or not a non-empty string |
 | `landing-repo-root-type` | error | `repoRoot` is present but not a string |
 | `landing-repo-root-shape` | error | `repoRoot` is not a recognized GitHub URL shape |
 | `landing-env-example-type` | error | `envExample` is present but not a plain object |
-| `landing-env-example-count` | error | `envExample` has too many entries |
-| `landing-env-example-key` | error | An `envExample` key is empty or invalid |
+| `landing-env-example-count` | warning | `envExample` has too many entries — extras are dropped |
+| `landing-env-example-key` | warning | An `envExample` key is not SCREAMING_SNAKE_CASE |
 | `landing-env-example-value` | error | An `envExample` value is not a string |
 | `landing-connect-snippets-type` | error | `connectSnippets` is present but not a plain object |
-| `landing-connect-snippets-key` | error | A `connectSnippets` key is empty |
+| `landing-connect-snippets-key` | warning | A `connectSnippets` key is not a recognized tab id — it is dropped |
 | `landing-connect-snippets-value` | error | A `connectSnippets` value is not a string |
-| `landing-connect-snippets-empty` | error | A `connectSnippets` value is an empty string |
+| `landing-connect-snippets-empty` | warning | A `connectSnippets` value is an empty string — the derived snippet is used |
 | `landing-theme-type` | error | `theme` is present but not a plain object |
 | `landing-theme-accent` | error | `theme.accent` is present but not a string |
 | `landing-theme-accent-format` | error | `theme.accent` doesn't match the expected color format |
@@ -866,7 +867,7 @@ Fires when an entry's optional `severity` field is present but isn't one of `deb
 
 **Severity:** error
 
-Fires when an entry's `recovery` field is missing or not a string. `recovery` is the agent's next-move guidance when this failure fires — it flows to the wire via `ctx.recoveryFor`.
+Fires when an entry's `recovery` field is missing or not a string. `recovery` is the agent's next-move guidance when this failure fires — the handler factory sends it as `data.recovery.hint` with any failure carrying the entry's reason and no hint of its own.
 
 ### error-contract-recovery-empty
 
@@ -948,37 +949,13 @@ async handler(input, ctx) {
 }
 ```
 
-The field is lint-only metadata: `ctx.fail`, `ctx.recoveryFor`, the `severity` lookup, and the advertised error envelope never read it, so a marked entry is typed, advertised, and thrown exactly as an unmarked one. Prefer it over the workarounds that also silence the rule — moving the literal `ctx.fail` into a module-level helper turns the whole tool off, handler-local reasons included.
+The field is lint-only metadata: `ctx.fail`, `ctx.recoveryFor`, the recovery fill, the `severity` lookup, and the advertised error envelope never read it, so a marked entry is typed, advertised, and thrown exactly as an unmarked one. Prefer it over the workarounds that also silence the rule — moving the literal `ctx.fail` into a module-level helper turns the whole tool off, handler-local reasons included.
 
 **Trigger.** Only when the handler holds at least one literal `ctx.fail(`. A handler with none produces its reasons somewhere the scan cannot reach, so firing there would warn on every service-layer definition. A `ctx.fail(` or `ctx.recoveryFor(` whose first argument is not a string literal — a variable, a template literal, a map lookup — makes the named set unknowable, and the whole definition is skipped rather than guessed at.
 
 **Heuristic limitations:** the scan reads `handler.toString()` and matches call sites in the comment- and string-stripped text, so a `ctx.fail('…')` written inside a comment or nested in another literal does not count as thrown. A reason produced outside the handler closure is invisible to any `toString()` scan, which is why the rule can never prove absence and stays a warning. Still silent without a marker: a `createFail(errors)` resolver built outside the handler, and an aliased `const fail = ctx.fail`.
 
-### error-contract-recovery-unforwarded
-
-**Severity:** warning
-
-Fires per literal `ctx.fail('<reason>', …)` site that does not put the contract's `recovery` on the wire.
-
-`recovery` is required on every `errors[]` entry, but reaching the client with it is opt-in — the throw site forwards `ctx.recoveryFor('<reason>')`, or passes its own `recovery` key. A site that does neither ships `reason` and `retryable` with no hint, and since the framework mirrors `data.recovery.hint` into the error `content[]`, both client surfaces lose it together. Nothing else catches this: the contract is declared, `lint:mcp` passes, and an error-path test asserting `code` and `reason` passes with the hint absent.
-
-**Fix:** forward the resolver at the site named in the diagnostic.
-
-```ts
-// warns
-throw ctx.fail('rate_limited', 'Upstream rate limit exceeded');
-
-// clean — any of
-throw ctx.fail('rate_limited', msg, { ...ctx.recoveryFor('rate_limited') });
-throw ctx.fail('rate_limited', msg, ctx.recoveryFor('rate_limited'));
-throw ctx.fail('rate_limited', msg, { recovery: { hint: `Retry in ${waitSeconds}s.` } });
-```
-
-**Per site, not per reason.** A handler wiring one of six throws is covered at one of them, so each site is judged on its own argument list. Two sites naming one reason, one forwarding and one bare, produce exactly one diagnostic. A site whose only resolver names a *different* reason warns too, naming both — the caller would otherwise get another failure mode's guidance.
-
-**Bails.** A non-literal first argument on either `ctx.fail(` or `ctx.recoveryFor(` skips the whole definition, as it does for `error-contract-unthrown`. A resolver sitting outside every fail span — a hoisted `const hint = ctx.recoveryFor('x')` — skips that reason, since the binding is assembled where the scan cannot follow it. A data argument the scan cannot read skips that one site: an identifier (`ctx.fail('r', msg, data)`), a call other than the resolver, or an object literal spreading another value (`{ ...details }`), any of which may carry `recovery` already. An object literal of plain keys carrying no `recovery` still warns.
-
-**Heuristic limitations:** same `handler.toString()` scan as `error-contract-unthrown`, so a call written inside a comment or nested in another literal is not a site, and a failure thrown below the handler is invisible. The rule speaks only for the sites it sees, which is why it stays a warning.
+No rule checks that a throw site forwards the declared `recovery`: the handler factory fills `data.recovery.hint` from the entry for any failure carrying its reason and no hint of its own, so a bare `ctx.fail('<reason>')` and a service throw both reach the client with it. See `api-errors`.
 
 ---
 
