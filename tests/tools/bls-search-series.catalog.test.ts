@@ -413,7 +413,35 @@ describe('bls_search_series over a seeded catalog', () => {
       expect(text).toContain('candidate pool is capped');
     });
 
-    it.each([-1, 1.5, '10'])('rejects offset %j as invalid params', async (offset) => {
+    it('repairs numeric and boolean strings and omits null optional filters', async () => {
+      const canonical = await call({
+        query: 'unemployment rate',
+        survey: 'LN',
+        limit: 5,
+        offset: 10,
+        seasonal_adjustment: false,
+      });
+      const repaired = await call({
+        query: 'unemployment rate',
+        survey: 'LN',
+        limit: '5',
+        offset: '10',
+        seasonal_adjustment: 'false',
+        area: null,
+      });
+
+      expect(repaired.result.isError).toBeFalsy();
+      expect(repaired.structured).toEqual(canonical.structured);
+      expect(repaired.text).toEqual(canonical.text);
+      expect(repaired.structured).toMatchObject({
+        limitApplied: 5,
+        offsetApplied: 10,
+        seasonalFilter: false,
+      });
+      expect(repaired.structured.series).toHaveLength(5);
+    });
+
+    it.each([-1, 1.5, 'ten'])('rejects offset %j as invalid params', async (offset) => {
       const { result } = await call({ query: 'unemployment rate', offset });
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({
