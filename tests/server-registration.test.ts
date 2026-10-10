@@ -69,6 +69,23 @@ afterEach(async () => {
 describe('server registration', () => {
   const coreTools = ['bls_list_surveys', 'bls_search_series', 'bls_get_latest', 'bls_get_series'];
 
+  it('reports invalid server config through the startup banner before serving', async () => {
+    const result = await execFileAsync('bun', ['run', 'src/index.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        BLS_DATAFRAME_DROP_ENABLED: 'not-a-boolean',
+        MCP_TRANSPORT_TYPE: 'stdio',
+      },
+      timeout: 10_000,
+    }).catch((error: { code: number; stderr: string }) => error);
+
+    expect(result).toMatchObject({ code: 1 });
+    expect(result.stderr).toContain('Configuration error — server failed to start');
+    expect(result.stderr).toContain('BLS_DATAFRAME_DROP_ENABLED');
+    expect(result.stderr).not.toContain('Core services constructed');
+  });
+
   it.each([false, true])(
     'advertises only core tools when canvas is disabled (drop=%s)',
     async (dropEnabled) => {

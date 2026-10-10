@@ -5,8 +5,8 @@
  * @module index
  */
 
-import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
-import { config } from '@cyanheads/mcp-ts-core/config';
+import { createApp, disabledTool, z } from '@cyanheads/mcp-ts-core';
+import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 import { requestContextService, schedulerService, withExtra } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from './config/server-config.js';
 import { blsDataframeDescribeTool } from './mcp-server/tools/definitions/bls-dataframe-describe.tool.js';
@@ -30,8 +30,16 @@ import {
 import { runObservationsSubprocess } from './services/bls-observations/subprocess.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
 
-const cfg = getServerConfig();
-const canvasEnabled = config.canvas.providerType === 'duckdb';
+/** Select tools without parsing config before createApp can report startup errors. */
+const registrationEnv = normalizeEnv({
+  canvasProviderType: process.env.CANVAS_PROVIDER_TYPE,
+  dataframeDropEnabled: process.env.BLS_DATAFRAME_DROP_ENABLED,
+});
+const canvasEnabled = registrationEnv.canvasProviderType === 'duckdb';
+const dataframeDropEnabled = z
+  .stringbool()
+  .default(false)
+  .safeParse(registrationEnv.dataframeDropEnabled);
 
 const canvasDisabled = {
   reason: 'DataCanvas is disabled in this deployment.',
@@ -45,7 +53,7 @@ const queryTool = canvasEnabled
   : disabledTool(blsDataframeQueryTool, canvasDisabled);
 const dropTool = !canvasEnabled
   ? disabledTool(blsDataframeDropTool, canvasDisabled)
-  : cfg.dataframeDropEnabled
+  : dataframeDropEnabled.success && dataframeDropEnabled.data
     ? blsDataframeDropTool
     : disabledTool(blsDataframeDropTool, {
         reason: 'bls_dataframe_drop is disabled by default — TTL handles lifecycle.',
@@ -78,6 +86,7 @@ await createApp({
   prompts: [],
 
   async setup(core) {
+    const cfg = getServerConfig();
     initBlsApiService(core.config, core.storage);
     initBlsCatalogService(core.config, core.storage);
     initBlsObservationsService();
