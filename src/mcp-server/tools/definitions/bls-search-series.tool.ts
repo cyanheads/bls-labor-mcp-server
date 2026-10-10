@@ -179,7 +179,6 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       throw ctx.fail(
         'catalog_unavailable',
         'The BLS series catalog index has not been loaded. Server startup may have failed.',
-        { ...ctx.recoveryFor('catalog_unavailable') },
       );
     }
     if (service.totalSeries === 0) {
@@ -187,7 +186,6 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       throw ctx.fail(
         'catalog_unavailable',
         `The BLS series catalog loaded but is empty — all LABSTAT downloads failed at startup.${detail} Check BLS_CATALOG_BASE_URL and restart the server.`,
-        { ...ctx.recoveryFor('catalog_unavailable') },
       );
     }
 

@@ -8,6 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { blsDataframeDescribeTool } from '@/mcp-server/tools/definitions/bls-dataframe-describe.tool.js';
+import { blsDataframeDropTool } from '@/mcp-server/tools/definitions/bls-dataframe-drop.tool.js';
 import { blsDataframeQueryTool } from '@/mcp-server/tools/definitions/bls-dataframe-query.tool.js';
 import { getCanvasBridge, initCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { createDuckdbCanvas } from '../fixtures/duckdb-canvas.js';
@@ -26,6 +27,26 @@ describe('blsDataframeDescribeTool', () => {
       data: { reason: 'canvas_unavailable' },
     });
   });
+
+  it.each([blsDataframeDescribeTool, blsDataframeQueryTool, blsDataframeDropTool])(
+    'fills the declared recovery on both error surfaces for $name',
+    async (definition) => {
+      const input =
+        definition.name === 'bls_dataframe_query'
+          ? { sql: 'SELECT 1' }
+          : definition.name === 'bls_dataframe_drop'
+            ? { name: 'df_AAAAA_BBBBB' }
+            : {};
+      const result = await runToolContract(definition, input);
+      const hint = definition.errors![0]!.recovery;
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'canvas_unavailable', recovery: { hint } } },
+      });
+      expect((result.content[0] as { text: string }).text).toContain(`Recovery: ${hint}`);
+    },
+  );
 
   it('formats empty dataframe list', () => {
     const output = { dataframes: [] };

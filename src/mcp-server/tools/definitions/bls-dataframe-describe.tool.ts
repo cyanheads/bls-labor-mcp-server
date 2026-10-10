@@ -85,15 +85,12 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
       throw ctx.fail(
         'invalid_dataframe_name',
         'Dataframe names are canvas identifiers: a letter or underscore, then letters, digits, or underscores, at most 63 characters — a df_XXXXX_XXXXX name from bls_get_series or a bls_dataframe_query register_as name.',
-        { ...ctx.recoveryFor('invalid_dataframe_name') },
       );
     }
 
     const bridge = getCanvasBridge();
     if (!bridge) {
-      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.', {
-        ...ctx.recoveryFor('canvas_unavailable'),
-      });
+      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.');
     }
 
     const entries = await bridge.describe(ctx, name);

@@ -64,9 +64,7 @@ export const blsDataframeDropTool = tool('bls_dataframe_drop', {
   async handler(input, ctx) {
     const bridge = getCanvasBridge();
     if (!bridge) {
-      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.', {
-        ...ctx.recoveryFor('canvas_unavailable'),
-      });
+      throw ctx.fail('canvas_unavailable', 'DataCanvas is not configured on this server.');
     }
     const dropped = await bridge.drop(ctx, input.name);
     ctx.log.info('Dataframe drop requested', { name: input.name, dropped });
