@@ -26,6 +26,31 @@ COPY . .
 RUN bun run build
 
 
+# Cross-install dependencies on the build host so Bun and the scanner avoid QEMU.
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
+WORKDIR /usr/src/app
+COPY package.json bun.lock bunfig.toml ./
+COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner ./node_modules/@socketsecurity/bun-security-scanner
+ARG TARGETOS
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) echo x64 ;; \
+      arm64) echo arm64 ;; \
+      *) echo "Unsupported TARGETARCH '$TARGETARCH': expected amd64 or arm64" >&2; exit 1 ;; \
+    esac > .bun-cpu
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --production --omit=peer --frozen-lockfile --ignore-scripts \
+      --os="$TARGETOS" --cpu="$(cat .bun-cpu)"
+COPY scripts/install-otel.ts ./scripts/
+ARG OTEL_ENABLED=true
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    if [ "$OTEL_ENABLED" = "true" ]; then \
+      bun scripts/install-otel.ts --os="$TARGETOS" --cpu="$(cat .bun-cpu)"; \
+    fi
+COPY scripts/prune-musl-packages.ts ./scripts/
+RUN bun scripts/prune-musl-packages.ts
+RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
+
 # ==============================================================================
 # Production Stage
 #
@@ -49,45 +74,8 @@ LABEL org.opencontainers.image.source="https://github.com/cyanheads/bls-labor-mc
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 
-# Preserve the release-age gate and scanner for production installs.
-COPY package.json bun.lock bunfig.toml ./
-
-# The production install omits devDependencies, so seed its scanner first.
-COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner ./node_modules/@socketsecurity/bun-security-scanner
-
-# Install only production dependencies. `--omit=peer` drops the framework's
-# optional peer tiers; any peer this server uses is a direct dependency.
-RUN --mount=type=cache,target=/root/.bun/install/cache \
-    bun install --production --omit=peer --frozen-lockfile --ignore-scripts
-
-# Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
-# Installed by default; omit with --build-arg OTEL_ENABLED=false.
-# Resolve each package within the installed framework's tested peer range.
-ARG OTEL_ENABLED=true
-RUN --mount=type=cache,target=/root/.bun/install/cache \
-    if [ "$OTEL_ENABLED" = "true" ]; then \
-      specs=$(bun -e ' \
-        const { peerDependencies: peers } = await Bun.file("node_modules/@cyanheads/mcp-ts-core/package.json").json(); \
-        const names = process.argv.slice(1); \
-        const missing = names.filter((name) => !peers?.[name]); \
-        if (missing.length > 0) throw new Error(`no peerDependencies range for ${missing.join(", ")}`); \
-        console.log(names.map((name) => `${name}@${peers[name]}`).join(" ")); \
-      ' \
-        @hono/otel \
-        @opentelemetry/api-logs \
-        @opentelemetry/exporter-logs-otlp-http \
-        @opentelemetry/exporter-metrics-otlp-http \
-        @opentelemetry/exporter-trace-otlp-http \
-        @opentelemetry/instrumentation-http \
-        @opentelemetry/instrumentation-pino \
-        @opentelemetry/resources \
-        @opentelemetry/sdk-logs \
-        @opentelemetry/sdk-metrics \
-        @opentelemetry/sdk-node \
-        @opentelemetry/sdk-trace-node \
-        @opentelemetry/semantic-conventions) \
-      && bun add --omit=dev --omit=peer --ignore-scripts $specs; \
-    fi
+COPY package.json ./
+COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
