@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-09-24 06:29:54
+Generated on: 2026-10-10 23:34:59
 
 ```text
 bls-labor-mcp-server/
@@ -131,9 +131,11 @@ bls-labor-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts

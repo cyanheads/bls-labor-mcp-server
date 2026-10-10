@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.8](changelog/0.5.x/0.5.8.md) — 2026-10-10
+
+BLS calls accept common string representations through framework input repairs, with correlated tool failures and startup configuration errors.
+
 ## [0.5.7](changelog/0.5.x/0.5.7.md) — 2026-09-26
 
 Adopts mcp-ts-core 0.13.9 with clearer argument hints, corrected canvas SQL errors, private canvas scratch storage, and refreshed Bun/runtime tooling.
