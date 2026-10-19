@@ -4,7 +4,7 @@
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
 
 WORKDIR /usr/src/app
 
@@ -27,7 +27,7 @@ RUN bun run build
 
 
 # Cross-install dependencies on the build host so Bun and the scanner avoid QEMU.
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
 WORKDIR /usr/src/app
 COPY package.json bun.lock bunfig.toml ./
 COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner ./node_modules/@socketsecurity/bun-security-scanner
@@ -58,7 +58,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # application. It uses a slim base image and only includes production
 # dependencies and build artifacts.
 # ==============================================================================
-FROM oven/bun:1.4.2-slim AS production
+FROM oven/bun:1.4.3-slim AS production
 
 WORKDIR /usr/src/app
 

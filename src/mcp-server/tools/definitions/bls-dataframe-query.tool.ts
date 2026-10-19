@@ -1,8 +1,8 @@
 /**
  * @fileoverview Run a single-statement SELECT against canvas dataframes
  * registered by bls_get_series or an earlier register_as. Layered SQL gate:
- * framework (single-statement →
- * SELECT only → plan-walk allowlist + denied table functions) plus bridge-layer
+ * framework (text scan → single statement → SELECT only → parse-tree check →
+ * plan-walk allowlist + denied functions) plus bridge-layer
  * denial of DuckDB system catalogs. Requires CANVAS_PROVIDER_TYPE=duckdb.
  * @module mcp-server/tools/definitions/bls-dataframe-query
  */
