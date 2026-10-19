@@ -183,6 +183,7 @@ const COMMON_SERIES: Record<string, string> = {
 };
 
 const WORD_CHAR = /\w/;
+const FTS_WORD_CHAR = /^[\p{L}\p{N}\p{M}]/u;
 
 /**
  * Whether `needle` occurs in `text` where a word starts: at the start of `text`
@@ -193,15 +194,25 @@ const WORD_CHAR = /\w/;
  * it. A literal scan rather than a `RegExp` built from caller text, which V8
  * refuses to compile past ~32K characters. Callers pair long text with a short
  * needle (a query against an alias phrase) or a long needle with short text (a
- * query against a title), and both stay linear.
+ * query against a title), and both stay linear. `wholeEnd` also requires the
+ * match to end at an FTS word boundary.
  */
-export function startsWord(text: string, needle: string): boolean {
+export function startsWord(text: string, needle: string, wholeEnd = false): boolean {
   if (!needle) return false;
   const anywhere = !WORD_CHAR.test(needle[0] ?? '');
   for (let i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1)) {
-    if (anywhere || i === 0 || !WORD_CHAR.test(text[i - 1] ?? '')) return true;
+    if (
+      (anywhere || i === 0 || !WORD_CHAR.test(text[i - 1] ?? '')) &&
+      (!wholeEnd || !FTS_WORD_CHAR.test(text.slice(i + needle.length, i + needle.length + 2)))
+    )
+      return true;
   }
   return false;
+}
+
+/** Whole single-character terms, using the FTS tokenizer's punctuation boundaries. */
+function wholeTerms(text: string): Set<string> {
+  return new Set(text.match(/(?<![\p{L}\p{N}\p{M}])[a-z0-9](?![\p{L}\p{N}\p{M}])/gu));
 }
 
 /**
@@ -287,14 +298,13 @@ const CANDIDATE_LIMIT = 1_000;
 /**
  * Distinct query tokens the FTS match and the token rescore use; later ones
  * are ignored there (the full-query, alias, and frequency checks still read the
- * whole query, in linear time). Each token is an FTS prefix term run
- * synchronously against SQLite, so search cost grows with this count, not with
- * query length. On the 2026-09-23 index the costliest 32 distinct tokens
- * (single-letter prefixes) search in ~0.7–0.8 s, and each token past that would
- * add ~5 ms. No title in that index holds more than 28 distinct tokens, so a
- * pasted title is never cut.
+ * whole query, in linear time). Candidate count and prefix expansion are
+ * independently bounded; SQLite still executes the candidate query synchronously.
  */
 const MAX_QUERY_TOKENS = 32;
+
+/** Maximum one-character prefix expansions in one candidate query. */
+const MAX_SHORT_PREFIXES = 2;
 
 /**
  * An `area` longer than this is longer than any indexed title, area name, or
@@ -325,6 +335,39 @@ const NATIONAL_AREAS: ReadonlySet<string> = new Set([
   'National',
 ]);
 
+/** Geographic boilerplate and modifiers do not identify a place on their own. */
+const GEOGRAPHIC_STOP_WORDS = new Set([
+  'all',
+  'area',
+  'areas',
+  'city',
+  'county',
+  'division',
+  'metropolitan',
+  'micropolitan',
+  'combined',
+  'nonmetropolitan',
+  'region',
+  'state',
+  'statistical',
+  'town',
+  'township',
+  'parish',
+  'borough',
+  'municipality',
+  'new',
+  'north',
+  'south',
+  'east',
+  'west',
+  'united',
+  'states',
+  'national',
+  'total',
+  'average',
+]);
+const GEOGRAPHIC_WORDS = 'bls_geographic_words';
+
 /**
  * Escape `text` for a `LIKE … ESCAPE '\'` pattern so `%`, `_`, and `\` match
  * literally. One linear pass over caller text; the result is always bound as a
@@ -345,8 +388,9 @@ export function escapeLike(text: string): string {
  * brand-new database the marker is already NULL.
  * Version 2: header-keyed code tables and synthesized JT/EC/PR titles.
  * Version 3: the `frequency` column (CU, CW, LN) and the CM/CI surveys.
+ * Version 4: independently optional coverage columns and complete survey decoding.
  */
-const CATALOG_INDEX_VERSION = 3;
+const CATALOG_INDEX_VERSION = 4;
 
 /** Code-table key (the key column values joined by a tab, which no field contains) → label. */
 type CodeLabels = Map<string, string>;
@@ -410,7 +454,14 @@ function parseCodeTable(text: string, key: readonly string[]): CodeLabels | unde
     const label = parts[labelCol];
     if (label && code.every(Boolean)) labels.set(code.join('\t'), label);
   }
-  return labels;
+  return labels.size > 0 ? labels : undefined;
+}
+
+/** A four-digit catalog year, absent when blank, malformed, or zero. */
+function coverageYear(value: string | undefined): number | undefined {
+  if (value?.length !== 4) return;
+  const year = Number(value);
+  return Number.isInteger(year) && year > 0 && String(year) === value ? year : undefined;
 }
 
 /** A row's decoded label for a dimension; undefined when its code is not in the table. */
@@ -427,7 +478,8 @@ function decode(decoder: Decoder | undefined, parts: string[]): string | undefin
  * one that ends mid-line. Every LABSTAT file ends in a line break; a
  * close-delimited response cut short resolves with a partial body instead of
  * rejecting, and parsing it would delete the missing tail and index the
- * fragment of its last line.
+ * fragment of its last line. Missing or structurally unusable declared code
+ * tables also keep the survey's prior rows rather than replacing decoded data.
  */
 function parseSeries(
   text: string,
@@ -449,24 +501,38 @@ function parseSeries(
   }
   const titleCol = header.indexOf('series_title');
   const seasonalCol = header.findIndex((h) => h.includes('seasonal'));
+  const startYearCol = header.indexOf('begin_year');
+  const endYearCol = header.indexOf('end_year');
+  const endPeriodCol = header.indexOf('end_period');
+  const ecUnlabeledFootnote =
+    survey.abbr === 'ec' &&
+    header.join('\t') ===
+      'series_id\tcomp_code\tgroup_code\townership_code\tperiodicity_code\tseasonal\tbegin_year\tbegin_period\tend_year\tend_period';
 
   const parsedTables = new Map<string, CodeLabels | undefined>();
+  let incomplete = false;
   const resolve = (dimension: CodeDimension | undefined): Decoder | undefined => {
     if (!dimension) return;
     const { table, key } = dimension;
     const text = tables.get(table);
-    if (text === undefined) return; // fetch failure already reported
+    if (text === undefined) {
+      incomplete = true;
+      return;
+    }
     const cacheKey = `${table}\t${key.join('\t')}`;
     if (!parsedTables.has(cacheKey)) {
       const labels = parseCodeTable(text, key);
       if (!labels) {
-        warn(`${survey.abbr}.${table} header lacks ${key.join(' + ')} or a *_text/*_name label.`);
+        warn(
+          `${survey.abbr}.${table} header lacks ${key.join(' + ')} or a *_text/*_name label, or has no usable rows.`,
+        );
       }
       parsedTables.set(cacheKey, labels);
     }
     const labels = parsedTables.get(cacheKey);
     const cols = key.map((k) => header.indexOf(k));
     if (!labels || cols.includes(-1)) {
+      incomplete = true;
       if (labels) warn(`${survey.abbr}.series header lacks ${key.join(' + ')}.`);
       return;
     }
@@ -477,12 +543,19 @@ function parseSeries(
   const item = resolve(survey.item);
   const frequencyDecoder = resolve(survey.frequency);
   const titleDecoders = survey.title ? survey.title.map(resolve) : [item, area];
+  if (incomplete) return [];
   const surveyAbbr = survey.abbr.toUpperCase();
 
   const entries: CatalogSeries[] = [];
   for (const line of lines.slice(1)) {
     if (!line.trim()) continue;
     const parts = splitFields(line, false);
+    const coverageOffset = ecUnlabeledFootnote && parts.length === header.length + 1 ? 1 : 0;
+    const startYear = coverageYear(
+      startYearCol < 0 ? undefined : parts[startYearCol + coverageOffset],
+    );
+    const endYear = coverageYear(endYearCol < 0 ? undefined : parts[endYearCol + coverageOffset]);
+    const endPeriod = endPeriodCol < 0 ? undefined : parts[endPeriodCol + coverageOffset];
     const seriesId = parts[seriesIdCol];
     if (!seriesId) continue;
 
@@ -507,6 +580,9 @@ function parseSeries(
       ...(areaName && { areaName }),
       ...(itemName && { itemName }),
       ...(frequency && { frequency }),
+      ...(startYear !== undefined && { startYear }),
+      ...(endYear !== undefined && { endYear }),
+      ...(endPeriod && { endPeriod }),
       seasonal,
     });
   }
@@ -523,6 +599,9 @@ function toRow(s: CatalogSeries): MirrorRow {
     item_name: s.itemName ?? null,
     seasonal: s.seasonal ? 1 : 0,
     frequency: s.frequency ?? null,
+    start_year: s.startYear ?? null,
+    end_year: s.endYear ?? null,
+    end_period: s.endPeriod ?? null,
   };
 }
 
@@ -535,6 +614,9 @@ function toCatalog(row: MirrorRow): CatalogSeries {
     ...(row.area_name != null ? { areaName: row.area_name as string } : {}),
     ...(row.item_name != null ? { itemName: row.item_name as string } : {}),
     ...(row.frequency != null ? { frequency: row.frequency as string } : {}),
+    ...(row.start_year != null ? { startYear: row.start_year as number } : {}),
+    ...(row.end_year != null ? { endYear: row.end_year as number } : {}),
+    ...(row.end_period != null ? { endPeriod: row.end_period as string } : {}),
     seasonal: row.seasonal === 1,
   };
 }
@@ -542,14 +624,21 @@ function toCatalog(row: MirrorRow): CatalogSeries {
 /**
  * The index-version migration. It runs after the declarative
  * `CREATE TABLE IF NOT EXISTS`, which never alters an existing table: an index
- * from an earlier release gains the `frequency` column here, while a brand-new
- * database already has it. Then it clears the completion marker so the next
- * `load()` re-harvests.
+ * from an earlier release gains every missing frequency/coverage column, while
+ * a brand-new database already has them. Then it clears the completion marker
+ * so the next `load()` re-harvests.
  */
 function migrateCatalogIndex(db: SqliteHandle): void {
   const columns = db.prepare<{ name: string }>(`PRAGMA table_info(${CATALOG_TABLE})`).all();
-  if (!columns.some((c) => c.name === 'frequency')) {
-    db.exec(`ALTER TABLE ${CATALOG_TABLE} ADD COLUMN frequency TEXT`);
+  for (const [name, type] of Object.entries({
+    frequency: 'TEXT',
+    start_year: 'INTEGER',
+    end_year: 'INTEGER',
+    end_period: 'TEXT',
+  })) {
+    if (!columns.some((c) => c.name === name)) {
+      db.exec(`ALTER TABLE ${CATALOG_TABLE} ADD COLUMN ${name} ${type}`);
+    }
   }
   db.exec('UPDATE mirror_sync_state SET completed_at = NULL WHERE id = 1');
 }
@@ -576,6 +665,9 @@ export function createCatalogStore(dbPath: string): MirrorStore {
       item_name: 'TEXT',
       seasonal: 'INTEGER',
       frequency: 'TEXT',
+      start_year: 'INTEGER',
+      end_year: 'INTEGER',
+      end_period: 'TEXT',
     },
     fts: ['series_id', 'title', 'area_name', 'item_name'],
     indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
@@ -588,6 +680,7 @@ export class BlsCatalogService {
   private loadError: string | undefined;
   private cachedTotal = 0;
   private cachedSurveys: readonly string[] = [];
+  private geographicVocabulary: ReadonlySet<string> = new Set();
   /** The surveys this deployment harvests, and their list as the sync state persists it. */
   private readonly surveys: readonly SurveyDefinition[];
   private readonly surveyList: string;
@@ -610,7 +703,7 @@ export class BlsCatalogService {
   }
 
   /**
-   * Re-read the row total and the distinct survey codes from the index. Runs
+   * Re-read totals and survey codes and rebuild the geographic vocabulary. Runs
    * on the first load and after each harvest — the index changes only then —
    * so search never pays for it. `count()` runs first so the store finishes
    * opening inside its own call, before `raw()` hands out the handle.
@@ -618,13 +711,39 @@ export class BlsCatalogService {
   private async readIndexStats(): Promise<void> {
     this.cachedTotal = await this.store.count();
     this.cachedSurveys = distinctSurveys(await this.store.raw());
+    const db = await this.store.raw();
+    const vocabulary = new Set<string>();
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${GEOGRAPHIC_WORDS}
+      (word TEXT NOT NULL, area TEXT NOT NULL, PRIMARY KEY (word, area)) WITHOUT ROWID`);
+    const insert = db.prepare(`INSERT OR IGNORE INTO ${GEOGRAPHIC_WORDS} VALUES (?, ?)`);
+    const areas = db
+      .prepare<{ area_name: string }>(
+        `SELECT DISTINCT area_name FROM ${CATALOG_TABLE} WHERE area_name IS NOT NULL`,
+      )
+      .all();
+    db.exec('BEGIN');
+    try {
+      db.exec(`DELETE FROM ${GEOGRAPHIC_WORDS}`);
+      for (const { area_name: area } of areas) {
+        for (const word of area.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? []) {
+          if (word.length < 3 || GEOGRAPHIC_STOP_WORDS.has(word)) continue;
+          vocabulary.add(word);
+          insert.run(word, area);
+        }
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+    this.geographicVocabulary = vocabulary;
   }
 
   /**
    * Ensure the on-disk index is present and fresh. Serves an existing index
    * immediately (queryable during any refresh); harvests when the store is
-   * empty, its last completion is older than the TTL, or that completion
-   * harvested a different survey list than this deployment configures.
+   * empty, the last refresh was incomplete, its completion is older than the
+   * TTL, or it harvested a different survey list than configured.
    * Retries a fully-empty harvest up to `maxAttempts` times with linear
    * backoff. Sets `loaded = true` after the final outcome so callers can
    * distinguish "still loading" from "load failed".
@@ -652,8 +771,9 @@ export class BlsCatalogService {
     }
 
     let applied = 0;
+    let complete = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      applied = await this.harvest(signal);
+      ({ applied, complete } = await this.harvest(signal));
       if (applied > 0) break;
       if (attempt < maxAttempts) await pause(signal, attempt * 5_000);
     }
@@ -664,8 +784,8 @@ export class BlsCatalogService {
       this.loadError = undefined;
       signal.throwIfAborted();
       await this.store.writeState({
-        status: 'complete',
-        completedAt: new Date().toISOString(),
+        status: complete ? 'complete' : 'error',
+        ...(complete && { completedAt: new Date().toISOString() }),
         total: this.cachedTotal,
         checkpoint: this.surveyList,
       });
@@ -688,12 +808,12 @@ export class BlsCatalogService {
   }
 
   /**
-   * True when the last completion is within the TTL window and harvested the
-   * survey list this deployment configures (persisted in `checkpoint`). A
+   * True when the last refresh completed every survey within the TTL window
+   * and harvested the configured survey list (persisted in `checkpoint`). A
    * missing list — an index from an earlier release — counts as stale.
    */
-  private isFresh({ completedAt, checkpoint }: SyncState): boolean {
-    if (!completedAt || checkpoint !== this.surveyList) return false;
+  private isFresh({ status, completedAt, checkpoint }: SyncState): boolean {
+    if (status !== 'complete' || !completedAt || checkpoint !== this.surveyList) return false;
     const age = Date.now() - Date.parse(completedAt);
     return Number.isFinite(age) && age <= this.cacheTtlHours * 3_600_000;
   }
@@ -704,12 +824,14 @@ export class BlsCatalogService {
    * rows absent from the new `.series` file are deleted; once every survey is
    * done, so are the rows of surveys no longer configured (OES after its
    * opt-in turns off). A survey that yields no rows — its `.series` request
-   * failed, returned non-200, carried no `series_id` header, or ended mid-line
-   * — keeps its rows, and a harvest that applies no rows deletes nothing. Returns the
-   * number of rows applied.
+   * failed, returned non-200, carried no `series_id` header, ended mid-line, or
+   * lacked a usable declared decoder — keeps its rows, and a harvest that
+   * applies no rows deletes nothing. Returns the number applied and whether
+   * every configured survey succeeded.
    */
-  private async harvest(signal: AbortSignal): Promise<number> {
+  private async harvest(signal: AbortSignal): Promise<{ applied: number; complete: boolean }> {
     let applied = 0;
+    let complete = true;
     for (let i = 0; i < this.surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
       const batch = this.surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
       const results = await Promise.allSettled(
@@ -717,7 +839,10 @@ export class BlsCatalogService {
       );
       for (const r of results) {
         signal.throwIfAborted();
-        if (r.status !== 'fulfilled' || r.value.length === 0) continue;
+        if (r.status !== 'fulfilled' || r.value.length === 0) {
+          complete = false;
+          continue;
+        }
         for (let j = 0; j < r.value.length; j += HARVEST_CHUNK_SIZE) {
           const chunk = r.value.slice(j, j + HARVEST_CHUNK_SIZE);
           signal.throwIfAborted();
@@ -738,7 +863,7 @@ export class BlsCatalogService {
         if (!configured.has(survey)) await this.deleteRows(survey, undefined, signal);
       }
     }
-    return applied;
+    return { applied, complete };
   }
 
   /**
@@ -772,8 +897,8 @@ export class BlsCatalogService {
 
   /**
    * Fetch a survey's `.series` file and the code tables its dimensions name,
-   * then parse. A missing `.series` file yields no rows; a missing code table
-   * leaves that dimension undecoded and is reported on stderr. Every request
+   * then parse. A missing `.series` file or declared code table yields no rows,
+   * preserving the survey's previous snapshot. Every request
    * also aborts on `signal`.
    */
   private async loadSurvey(
@@ -806,7 +931,7 @@ export class BlsCatalogService {
         tables.set(table, await res.value.text());
       } else {
         const cause = res?.status === 'fulfilled' ? `HTTP ${res.value.status}` : 'request failed';
-        warn(`${abbr}.${table} unavailable (${cause}) — its codes are not decoded.`);
+        warn(`${abbr}.${table} unavailable (${cause}) — its indexed rows are kept.`);
       }
     }
 
@@ -859,14 +984,37 @@ export class BlsCatalogService {
     // Each distinct token once, up to MAX_QUERY_TOKENS: a repeat adds nothing
     // to the match, and the FTS query and the rescore both cost per token.
     const tokens = [...new Set(query.match(/[a-z0-9]+/g))].slice(0, MAX_QUERY_TOKENS);
+    const wholeShortTerms = tokens.filter((t) => t.length === 1).length > MAX_SHORT_PREFIXES;
+    const eligibleWords = new Set(
+      areaFilter ? [] : tokens.filter((t) => this.geographicVocabulary.has(t)),
+    );
+    const geographicWords = new Set<string>();
+    if (eligibleWords.size > 0) {
+      for (const [word] of query.matchAll(/[\p{L}\p{N}\p{M}]+/gu)) {
+        if (eligibleWords.has(word)) geographicWords.add(word);
+      }
+    }
+    const geographicIds = new Set<string>();
+    const wholeQueryEnd =
+      wholeShortTerms &&
+      tokens.some(
+        (t) => t.length === 1 && query.endsWith(t) && !/[a-z0-9]/.test(query.at(-2) ?? ''),
+      );
     const areaMatchable = !areaFilter || areaFilter.length <= MAX_AREA_LENGTH;
     if (tokens.length > 0 && areaMatchable) {
-      const match = tokens.map((t) => `"${t}"*`).join(' OR ');
-      const rows = await this.candidateRows(match, surveyFilter, seasonFilter, areaFilter);
+      const match = tokens
+        .map((t) => `"${t}"${wholeShortTerms && t.length === 1 ? '' : '*'}`)
+        .join(' OR ');
+      const rows = await this.candidateRows(match, surveyFilter, seasonFilter, areaFilter, [
+        ...geographicWords,
+      ]);
       // If the FTS query returned exactly CANDIDATE_LIMIT rows the full index likely
       // has more matches — total will be a lower bound.
       ftsCapped = rows.length >= CANDIDATE_LIMIT;
-      for (const row of rows) candidates.set(row.series_id as string, toCatalog(row));
+      for (const row of rows) {
+        candidates.set(row.series_id as string, toCatalog(row));
+        if (row.geographic_match) geographicIds.add(row.series_id as string);
+      }
     }
 
     // Score each candidate. Exact series ID match = highest priority.
@@ -904,23 +1052,39 @@ export class BlsCatalogService {
       // scores inside "seasonally". SeriesIDs are not words — their item and
       // area codes sit mid-ID (`SEHA` in CUSR0000SEHA) — so a token still scores
       // anywhere in one.
-      if (startsWord(titleLower, query)) score += 10;
-      if (commonText !== undefined && startsWord(commonText, query)) score += 15;
+      if (startsWord(titleLower, query, wholeQueryEnd)) score += 10;
+      if (commonText !== undefined && startsWord(commonText, query, wholeQueryEnd)) score += 15;
 
       // Token-level match. `matched` counts the tokens the row matches anywhere,
       // its headline description included, for the headline gate below.
       const idLower = s.seriesId.toLowerCase();
+      const shortTerms = wholeShortTerms
+        ? {
+            title: wholeTerms(titleLower),
+            area: wholeTerms(areaLower),
+            item: wholeTerms(itemLower),
+            id: wholeTerms(idLower),
+            common: commonText ? wholeTerms(commonText) : undefined,
+          }
+        : undefined;
       let matched = 0;
       for (const t of tokens) {
-        const inTitle = startsWord(titleLower, t);
-        const inArea = startsWord(areaLower, t);
-        const inItem = startsWord(itemLower, t);
-        const inId = idLower.includes(t);
+        const whole = t.length === 1 ? shortTerms : undefined;
+        const inTitle = whole ? whole.title.has(t) : startsWord(titleLower, t);
+        const inArea = whole ? whole.area.has(t) : startsWord(areaLower, t);
+        const inItem = whole ? whole.item.has(t) : startsWord(itemLower, t);
+        const inId = whole ? whole.id.has(t) : idLower.includes(t);
         if (inTitle) score += 2;
         if (inArea) score += 1;
         if (inItem) score += 1;
         if (inId) score += 3;
-        if (inTitle || inArea || inItem || inId || (commonText && startsWord(commonText, t))) {
+        if (
+          inTitle ||
+          inArea ||
+          inItem ||
+          inId ||
+          (whole ? whole.common?.has(t) : commonText && startsWord(commonText, t))
+        ) {
           matched++;
         }
       }
@@ -940,11 +1104,18 @@ export class BlsCatalogService {
       scored.push({ s, score });
     }
 
-    // Without an area the caller asked for national series (the tool's `area`
-    // contract), so at equal score a national row outranks a state or metro one.
-    // Otherwise ties keep candidate order: exact id, headline, then bm25.
+    // Exact IDs lead, followed by decoded places named in the query. National
+    // rows win equal-score ties within either group unless area is explicit.
     const national = (s: CatalogSeries) => Number(!s.areaName || NATIONAL_AREAS.has(s.areaName));
-    scored.sort((a, b) => b.score - a.score || (areaFilter ? 0 : national(b.s) - national(a.s)));
+    scored.sort(
+      (a, b) =>
+        (geographicIds.size > 0 &&
+          (Number(b.s.seriesId.toUpperCase() === queryUpper) -
+            Number(a.s.seriesId.toUpperCase() === queryUpper) ||
+            Number(geographicIds.has(b.s.seriesId)) - Number(geographicIds.has(a.s.seriesId)))) ||
+        b.score - a.score ||
+        (areaFilter ? 0 : national(b.s) - national(a.s)),
+    );
     const total = scored.length;
     const offset = input.offset ?? 0;
     const series = scored.slice(offset, offset + input.limit).map((x) => x.s);
@@ -953,7 +1124,7 @@ export class BlsCatalogService {
 
   /**
    * The FTS candidate query: up to `CANDIDATE_LIMIT` rows matching `match`, in
-   * bm25 order, with the survey, seasonal, and area filters applied in SQL so
+   * geographic-preference then bm25 order, with structured filters applied so
    * the cap bounds only rows that pass them. The area is a case-insensitive
    * substring of `area_name`, `title`, or `series_id` — the rescore's area gate,
    * pushed down as bound `LIKE` parameters. `MirrorStore.query` has no
@@ -965,6 +1136,7 @@ export class BlsCatalogService {
     survey: string | undefined,
     seasonal: boolean | undefined,
     area: string | undefined,
+    geographicWords: readonly string[],
   ): Promise<MirrorRow[]> {
     const where = [`${CATALOG_FTS} MATCH ?`];
     const params: SqlValue[] = [match];
@@ -984,14 +1156,19 @@ export class BlsCatalogService {
       params.push(...AREA_MATCH_COLUMNS.map(() => pattern));
     }
     const db = await this.store.raw();
+    const geographic =
+      geographicWords.length > 0
+        ? `, ${CATALOG_TABLE}.area_name IN (SELECT area FROM ${GEOGRAPHIC_WORDS}
+          WHERE word IN (${geographicWords.map(() => '?').join(',')})) AS geographic_match`
+        : '';
     return db
       .prepare<MirrorRow>(
-        `SELECT ${CATALOG_TABLE}.* FROM ${CATALOG_TABLE}
+        `SELECT ${CATALOG_TABLE}.*${geographic} FROM ${CATALOG_TABLE}
          JOIN ${CATALOG_FTS} ON ${CATALOG_TABLE}.rowid = ${CATALOG_FTS}.rowid
          WHERE ${where.join(' AND ')}
-         ORDER BY bm25(${CATALOG_FTS}) ASC LIMIT ?`,
+         ORDER BY ${geographic ? 'geographic_match DESC, ' : ''}bm25(${CATALOG_FTS}) ASC LIMIT ?`,
       )
-      .all(...params, CANDIDATE_LIMIT);
+      .all(...geographicWords, ...params, CANDIDATE_LIMIT);
   }
 
   /**
@@ -1068,8 +1245,9 @@ let refreshScheduled = false;
 /**
  * Register and start the hourly catalog refresh on the framework scheduler,
  * on every transport. Each tick calls `load()`, which re-harvests only once
- * the index's TTL has lapsed or its survey list no longer matches, and
- * otherwise returns after one sync-state read. An hourly check rather than a
+ * the index's TTL has lapsed, its survey list no longer matches, or its last
+ * refresh was incomplete; a complete, fresh index with the same survey list
+ * returns after one sync-state read. An hourly check rather than a
  * `setTimeout(ttl)`: timers clamp delays above 2^31−1 ms (~596 h), and
  * `BLS_CATALOG_CACHE_TTL_HOURS` has no upper bound. The scheduler skips a tick
  * while the previous one runs, and `load()` shares its in-flight run with the

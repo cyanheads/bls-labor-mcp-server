@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTAT flat-file catalog. Resolve opaque SeriesIDs from natural language, fetch historical time-series or the latest observation, and query large multi-series results with SQL through an optional DataCanvas. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wages, and inflation. Find series in plain language instead of decoding SeriesIDs, pull full history or the latest value, and run SQL over large multi-series results.
 
 ### Tools
 
@@ -54,8 +54,8 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` is 1–50 (default 10), with `offset` pagination; without an area filter, equally matching national series rank first.
-- Returns decoded SeriesIDs, titles, and `frequency`. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
+- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` is 1–50 (default 10), with `offset` pagination. Without an area filter, place names prefer matching decoded areas; national series win equal-score ties within each preference group. Exact SeriesIDs rank first.
+- Returns decoded SeriesIDs, titles, `frequency`, and independently optional `startYear`, `endYear`, and `endPeriod` coverage (for example, `1982–2005 Q04`). Coverage describes the catalog snapshot, not continuous observations. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
 - Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Unindexed surveys remain fetchable by SeriesID.
 
 ---
@@ -85,6 +85,7 @@ US labor statistics from the Bureau of Labor Statistics public API v2 and LABSTA
 ### `bls_dataframe_query` <sub>tool</sub>
 
 - Run one SELECT against registered tables, with JOINs, aggregates, window functions, or CTEs. `row_limit` defaults to 1000 and caps at 10000; writes, external-file reads, and system catalogs are denied.
+- Engine settings (`current_setting`, `current_schema`, `current_schemas`, `in_search_path`) and `query_table` are denied. `query()` accepts one plain SQL string literal, checked recursively up to four levels; computed SQL strings are rejected. Reference staged tables directly for analysis.
 - Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis; requires `CANVAS_PROVIDER_TYPE=duckdb`.
 
 ---

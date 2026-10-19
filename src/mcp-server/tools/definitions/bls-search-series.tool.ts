@@ -56,7 +56,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .string()
       .optional()
       .describe(
-        'State name, MSA name, or FIPS area code to narrow results to a geographic area — a case-insensitive substring of the area name, title, or SeriesID. Omit for national series, which then rank first among equal matches.',
+        'State name, MSA name, or FIPS area code to narrow results to a geographic area — a case-insensitive substring of the area name, title, or SeriesID. Without this filter, specific whole place names in query are relevance preferences; otherwise national series rank first among equal matches.',
       ),
     seasonal_adjustment: z
       .boolean()
@@ -93,6 +93,24 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
             survey: z.string().describe('Survey abbreviation (e.g. CU, CE, LN).'),
             area: z.string().optional().describe('Geographic area name, when decoded.'),
             item: z.string().optional().describe('Item or subject name, when decoded.'),
+            startYear: z
+              .number()
+              .int()
+              .optional()
+              .describe(
+                'First observation year in the catalog snapshot, when available; does not imply continuous coverage.',
+              ),
+            endYear: z
+              .number()
+              .int()
+              .optional()
+              .describe('Last observation year in the catalog snapshot, when available.'),
+            endPeriod: z
+              .string()
+              .optional()
+              .describe(
+                'Last observation period code in the catalog snapshot, when available (e.g. M08 or Q04).',
+              ),
             seasonal: z
               .string()
               .describe(
@@ -265,6 +283,9 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
         ...(s.itemName ? { item: s.itemName } : {}),
         seasonal: s.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted',
         ...(s.frequency ? { frequency: s.frequency } : {}),
+        ...(s.startYear !== undefined ? { startYear: s.startYear } : {}),
+        ...(s.endYear !== undefined ? { endYear: s.endYear } : {}),
+        ...(s.endPeriod ? { endPeriod: s.endPeriod } : {}),
       })),
     };
   },
@@ -282,6 +303,16 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       if (s.area) parts.push(`· ${s.area}`);
       if (s.seasonal) parts.push(`(${[s.seasonal, s.frequency].filter(Boolean).join(', ')})`);
       parts.push(`[${s.survey}]`);
+      const coverage =
+        s.startYear !== undefined && s.endYear !== undefined
+          ? `${s.startYear}–${s.endYear}`
+          : s.startYear !== undefined
+            ? `from ${s.startYear}`
+            : s.endYear !== undefined
+              ? `through ${s.endYear}`
+              : '';
+      if (coverage || s.endPeriod)
+        parts.push(`· Coverage: ${[coverage, s.endPeriod].filter(Boolean).join(' ')}`);
       lines.push(parts.join(' '));
       if (s.item) lines.push(`  _${s.item}_`);
     }

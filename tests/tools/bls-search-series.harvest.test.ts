@@ -147,6 +147,9 @@ describe('bls_search_series over a harvested JOLTS catalog', () => {
       survey: 'JT',
       area: 'California',
       seasonal: 'Seasonally Adjusted',
+      startYear: 2000,
+      endYear: 2026,
+      endPeriod: 'M07',
     });
 
     expect(text(result)).toContain(
@@ -156,6 +159,7 @@ describe('bls_search_series over a harvested JOLTS catalog', () => {
       '**JTU000000060000000JOR** — JOLTS - Job openings - Total nonfarm - California - All size classes - Rate · California (Not Seasonally Adjusted) [JT]',
     );
     expect(text(result)).not.toContain('All areas');
+    expect(text(result)).toContain('Coverage: 2000–2026 M07');
   });
 
   it('discloses the cap when more JOLTS rows match than the limit returns', async () => {

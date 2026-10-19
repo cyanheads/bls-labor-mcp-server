@@ -44,9 +44,11 @@ const OLD_ROWS = [
 ] as const;
 
 const JT_SERIES =
-  'series_id\tseasonal\tseries_title\r\n' +
-  'JTS000000000000000JOL\tS\tJob openings total nonfarm\r\n' +
-  'JTS000000000000000QUR\tS\tQuits rate total nonfarm\r\n';
+  'series_id\tseasonal\tseries_title\tstate_code\tdataelement_code\tindustry_code\tsizeclass_code\tratelevel_code\r\n' +
+  'JTS000000000000000JOL\tS\tJob openings total nonfarm\tx\tx\tx\tx\tx\r\n' +
+  'JTS000000000000000QUR\tS\tQuits rate total nonfarm\tx\tx\tx\tx\tx\r\n';
+const JT_TABLE =
+  'state_code\tdataelement_code\tindustry_code\tsizeclass_code\tratelevel_code\tlabel_text\nx\tx\tx\tx\tx\tDecoded label\n';
 
 async function seed(path: string, completedAt: Date): Promise<void> {
   const store = createCatalogStore(path);
@@ -80,6 +82,8 @@ function serveJt(gate: Promise<void>): string[] {
     const u = String(url);
     const file = u.slice(u.lastIndexOf('/') + 1);
     requested.push(file);
+    if (file.startsWith('jt.') && file !== 'jt.series')
+      return Promise.resolve(new Response(JT_TABLE));
     if (file !== 'jt.series') return Promise.resolve(new Response('', { status: 404 }));
     return new Promise<Response>((resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
@@ -181,10 +185,10 @@ describe('hourly catalog refresh (#84)', () => {
     expect(after.structured.series.map((s) => s.seriesId)).toContain('JTS000000000000000JOL');
     expect(after.text).toContain('JTS000000000000000JOL');
 
-    // 14:00 — the refreshed index is fresh again.
+    // 14:00 — JT updated, but the other configured surveys failed: retry next hour.
     requested.length = 0;
     await vi.advanceTimersByTimeAsync(HOUR);
-    expect(requested).toEqual([]);
+    expect(requested).toContain('jt.series');
   });
 
   it('starts no second harvest when a tick lands during the boot harvest', async () => {
@@ -205,7 +209,6 @@ describe('hourly catalog refresh (#84)', () => {
     expect(load.mock.results[1]?.value).toBe(boot);
     gate.release();
     await boot;
-    await svc.load();
 
     expect(count(requested, 'jt.series')).toBe(1);
     expect(count(requested, 'cu.series')).toBe(1);

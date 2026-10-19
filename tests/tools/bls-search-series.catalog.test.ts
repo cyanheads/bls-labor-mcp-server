@@ -45,6 +45,9 @@ interface SearchStructured {
     seriesId: string;
     area?: string;
     frequency?: string;
+    startYear?: number;
+    endYear?: number;
+    endPeriod?: string;
     item?: string;
     seasonal: string;
     survey: string;
@@ -154,6 +157,9 @@ async function seedCatalog(dbPath: string, rows: CatalogSeries[]): Promise<void>
       item_name: s.itemName ?? null,
       seasonal: s.seasonal ? 1 : 0,
       frequency: s.frequency ?? null,
+      start_year: s.startYear ?? null,
+      end_year: s.endYear ?? null,
+      end_period: s.endPeriod ?? null,
     })),
     [],
   );
@@ -592,6 +598,142 @@ const FREQUENCY_ROWS: CatalogSeries[] = [
     itemName: 'Total compensation',
   },
 ];
+
+describe('bls_search_series — geographic preference (#98)', () => {
+  beforeAll(() => startService());
+  afterAll(() => stopService());
+
+  it('renders the preferred place on both surfaces without inventing an area filter', async () => {
+    const { result, structured, text } = await call({
+      query: 'Seattle unemployment rate',
+      limit: 5,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(structured.series[0]?.area).toContain('Seattle');
+    expect(text).toContain(structured.series[0]?.seriesId ?? 'missing');
+    expect(text).toContain(structured.series[0]?.area ?? 'missing');
+    expect(structured.areaFilter).toBeUndefined();
+    const next = await call({ query: 'Seattle unemployment rate', limit: 1, offset: 1 });
+    expect(ids(next.structured)).toEqual(ids(structured).slice(1, 2));
+    const last = await call({
+      query: 'Seattle unemployment rate',
+      limit: 1,
+      offset: structured.totalCount - 1,
+    });
+    expect(last.structured.series).toHaveLength(1);
+    expect(last.text).toContain(last.structured.series[0]?.seriesId ?? 'missing');
+    const past = await call({ query: 'Seattle unemployment rate', offset: structured.totalCount });
+    expect(past.structured.series).toEqual([]);
+    expect(past.text).toContain(`Offset ${structured.totalCount} is past the last`);
+  });
+});
+
+describe('bls_search_series — token modes (#95)', () => {
+  const rows: CatalogSeries[] = [
+    { seriesId: 'ZZ001', title: 'a b c manufacturing', surveyAbbr: 'CE', seasonal: true },
+    {
+      seriesId: 'ABC001',
+      title: 'Manufacturing alpha beta gamma',
+      surveyAbbr: 'CE',
+      seasonal: true,
+    },
+    { seriesId: 'ZZ002', title: 'a b c manufacturing', surveyAbbr: 'CE', seasonal: true },
+  ];
+  beforeAll(() => startService({}, rows));
+  afterAll(() => stopService());
+
+  it('carries the whole-term ordering and paging on both response surfaces', async () => {
+    const first = await call({ query: 'a b c manufactur', limit: 1 });
+    expect(ids(first.structured)).toEqual(['ZZ001']);
+    expect(first.structured.totalCount).toBe(3);
+    expect(first.structured.nextOffset).toBe(1);
+    expect(first.text).toContain('**ZZ001**');
+    expect(first.text).toContain('Pass offset: 1 for the next page.');
+    const second = await call({ query: 'a b c manufactur', limit: 1, offset: 1 });
+    expect(ids(second.structured)).toEqual(['ZZ002']);
+    expect(second.text).toContain('**ZZ002**');
+    const last = await call({ query: 'a b c manufactur', limit: 1, offset: 2 });
+    expect(ids(last.structured)).toEqual(['ABC001']);
+    expect(last.text).toContain('**ABC001**');
+    expect(last.structured.nextOffset).toBeUndefined();
+    const past = await call({ query: 'a b c manufactur', offset: 3 });
+    expect(past.structured.series).toEqual([]);
+    expect(past.structured.totalCount).toBe(3);
+    expect(past.text).toContain('Offset 3 is past the last of 3 results.');
+    const empty = await call({ query: 'x y z' });
+    expect(empty.structured.series).toEqual([]);
+    expect(empty.text).toContain('No series returned.');
+    expect(empty.text).toContain('No matching series found.');
+  });
+});
+
+describe('bls_search_series — catalog coverage (#90)', () => {
+  const rows: CatalogSeries[] = [
+    {
+      seriesId: 'COVERAGE_FULL',
+      title: 'Coverage example',
+      surveyAbbr: 'EC',
+      seasonal: true,
+      startYear: 1982,
+      endYear: 2005,
+      endPeriod: 'Q04',
+    },
+    {
+      seriesId: 'COVERAGE_START',
+      title: 'Coverage example',
+      surveyAbbr: 'EC',
+      seasonal: false,
+      startYear: 1982,
+    },
+    {
+      seriesId: 'COVERAGE_END',
+      title: 'Coverage example',
+      surveyAbbr: 'EC',
+      seasonal: false,
+      endYear: 2005,
+    },
+    {
+      seriesId: 'COVERAGE_PERIOD',
+      title: 'Coverage example',
+      surveyAbbr: 'EC',
+      seasonal: false,
+      endPeriod: 'Q04',
+    },
+    { seriesId: 'COVERAGE_NONE', title: 'Coverage example', surveyAbbr: 'EC', seasonal: false },
+  ];
+  beforeAll(() => startService({}, rows));
+  afterAll(() => stopService());
+
+  it.each([
+    ['COVERAGE_FULL', { startYear: 1982, endYear: 2005, endPeriod: 'Q04' }, '1982–2005 Q04'],
+    ['COVERAGE_START', { startYear: 1982 }, 'from 1982'],
+    ['COVERAGE_END', { endYear: 2005 }, 'through 2005'],
+    ['COVERAGE_PERIOD', { endPeriod: 'Q04' }, 'Q04'],
+  ] as const)(
+    'preserves %s coverage on both response surfaces',
+    async (query, expected, rendered) => {
+      const { structured, text } = await call({ query });
+      expect(structured.series[0]).toMatchObject(expected);
+      for (const field of ['startYear', 'endYear', 'endPeriod']) {
+        if (!(field in expected)) expect(structured.series[0]).not.toHaveProperty(field);
+      }
+      expect(text).toContain(`Coverage: ${rendered}`);
+    },
+  );
+
+  it('omits unknown coverage and preserves empty/past-end behavior', async () => {
+    const unknown = await call({ query: 'COVERAGE_NONE', limit: 1 });
+    expect(unknown.text).not.toContain('Coverage:');
+    for (const field of ['startYear', 'endYear', 'endPeriod'])
+      expect(unknown.structured.series[0]).not.toHaveProperty(field);
+    const past = await call({ query: 'Coverage example', offset: 5 });
+    expect(past.structured.series).toEqual([]);
+    expect(past.text).toContain('No series returned.');
+    const empty = await call({ query: 'absent' });
+    expect(empty.structured.series).toEqual([]);
+    expect(empty.text).toContain('No series returned.');
+  });
+});
 
 describe('bls_search_series — frequency field and CM/CI rows (#85, #86)', () => {
   beforeAll(() => startService({}, FREQUENCY_ROWS));

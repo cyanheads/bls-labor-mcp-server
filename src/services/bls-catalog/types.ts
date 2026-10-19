@@ -6,6 +6,8 @@
 /** One entry in the loaded series index. */
 export interface CatalogSeries {
   areaName?: string;
+  endPeriod?: string;
+  endYear?: number;
   /**
    * Publication frequency label from the survey's periodicity table (`Monthly`,
    * `Semi-Annual`, `Quarterly`, `Annual`) — set for surveys that publish one
@@ -15,6 +17,8 @@ export interface CatalogSeries {
   itemName?: string;
   seasonal: boolean;
   seriesId: string;
+  /** Observation coverage reported by the harvested catalog snapshot. */
+  startYear?: number;
   surveyAbbr: string;
   title: string;
 }

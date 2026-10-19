@@ -48,9 +48,22 @@ function row(seriesId: string, survey: string): MirrorRow {
   };
 }
 
+const DIMENSION_KEYS = [
+  'area_code',
+  'item_code',
+  'group_code',
+  'state_code',
+  'dataelement_code',
+  'industry_code',
+  'sizeclass_code',
+  'ratelevel_code',
+  'occupation_code',
+  'periodicity_code',
+];
+const CODE_TABLE = `${DIMENSION_KEYS.join('\t')}\tlabel_text\n${DIMENSION_KEYS.map(() => 'x').join('\t')}\tDecoded label\n`;
 /** A `.series` file listing `ids`, with the upstream `series_title` column. */
 function seriesFile(ids: readonly string[]): string {
-  return `series_id\tseasonal\tseries_title\r\n${ids.map((id) => `${id}\tU\tSeries ${id}\r\n`).join('')}`;
+  return `series_id\tseasonal\tseries_title\t${DIMENSION_KEYS.join('\t')}\r\n${ids.map((id) => `${id}\tU\tSeries ${id}\t${DIMENSION_KEYS.map(() => 'x').join('\t')}\r\n`).join('')}`;
 }
 
 /**
@@ -84,7 +97,10 @@ function serve(files: Record<string, Served>): string[] {
     const u = String(url);
     const file = u.slice(u.lastIndexOf('/') + 1);
     requested.push(file);
-    const body = files[file];
+    const abbr = file.split('.')[0];
+    const body =
+      files[file] ??
+      (!file.endsWith('.series') && files[`${abbr}.series`] ? CODE_TABLE : undefined);
     if (typeof body === 'function') return body(init);
     return Promise.resolve(
       body === undefined ? new Response('', { status: 404 }) : new Response(body, { status: 200 }),
@@ -187,7 +203,7 @@ describe('configuration changes inside the TTL (#84)', () => {
     await svc.shutdown();
   });
 
-  it('re-harvests with OES when the opt-in turns on, then serves the result without fetching', async () => {
+  it('re-harvests with OES when the opt-in turns on and retries the incomplete configured set', async () => {
     const path = dbPath();
     await seed(path, [row('JTS1', 'JT')]);
     const requested = serve({
@@ -204,7 +220,7 @@ describe('configuration changes inside the TTL (#84)', () => {
     requested.length = 0;
     const next = new BlsCatalogService(BASE, 'ua/1.0', path, 168, true);
     await next.load(1);
-    expect(requested).toEqual([]);
+    expect(requested).toContain('oe.series');
     expect(next.indexedSurveys).toEqual(['JT', 'OE']);
     await next.shutdown();
   });

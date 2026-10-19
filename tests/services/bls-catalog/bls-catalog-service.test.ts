@@ -48,6 +48,9 @@ function toMirrorRow(s: CatalogSeries): MirrorRow {
     item_name: s.itemName ?? null,
     seasonal: s.seasonal ? 1 : 0,
     frequency: s.frequency ?? null,
+    start_year: s.startYear ?? null,
+    end_year: s.endYear ?? null,
+    end_period: s.endPeriod ?? null,
   };
 }
 
@@ -465,10 +468,31 @@ describe('BlsCatalogService state', () => {
 
 describe('BlsCatalogService.load (cold harvest)', () => {
   const BASE_URL = 'https://download.bls.gov/pub/time.series';
-  const SERIES_TEXT = 'series_id\tseries_title\tseasonal\nLNS14000000\tUnemployment Rate\tS\n';
+  const keys = [
+    'area_code',
+    'item_code',
+    'industry_code',
+    'periodicity_code',
+    'product_code',
+    'group_code',
+    'state_code',
+    'dataelement_code',
+    'sizeclass_code',
+    'ratelevel_code',
+    'occupation_code',
+    'comp_code',
+    'ownership_code',
+    'measure_code',
+    'sector_code',
+    'duration_code',
+    'estimate_code',
+  ];
+  const SERIES_TEXT = `series_id\tseries_title\tseasonal\t${keys.join('\t')}\nLNS14000000\tUnemployment Rate\tS\t${keys.map(() => 'x').join('\t')}\n`;
+  const TABLE_TEXT = `${keys.join('\t')}\tlabel_text\n${keys.map(() => 'x').join('\t')}\tDecoded label\n`;
+  const fixtureBody = (url: unknown) =>
+    String(url).endsWith('.series') ? SERIES_TEXT : TABLE_TEXT;
 
-  // These fixtures serve one body for every URL, so each code table's header
-  // mismatch is reported; keep that expected noise out of the test output.
+  // Complete declared tables keep these tests focused on transport and persistence.
   beforeEach(() => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
@@ -476,9 +500,9 @@ describe('BlsCatalogService.load (cold harvest)', () => {
   it('sends the configured User-Agent and builds the index from a live harvest', async () => {
     const ua = 'test-bls-mcp/1.0 (casey@caseyjhand.com)';
     const captured: Headers[] = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
       if (init?.headers) captured.push(new Headers(init.headers));
-      return Promise.resolve(new Response(SERIES_TEXT, { status: 200 }));
+      return Promise.resolve(new Response(fixtureBody(url), { status: 200 }));
     });
 
     const dbPath = join(tmpDir, 'cold.db');
@@ -496,7 +520,9 @@ describe('BlsCatalogService.load (cold harvest)', () => {
   it('serves the persisted index on the next boot without re-fetching', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
-      .mockImplementation(() => Promise.resolve(new Response(SERIES_TEXT, { status: 200 })));
+      .mockImplementation((url) =>
+        Promise.resolve(new Response(fixtureBody(url), { status: 200 })),
+      );
 
     const dbPath = join(tmpDir, 'warm.db');
     const first = new BlsCatalogService(BASE_URL, 'ua/1.0', dbPath, 168, false);
@@ -581,6 +607,8 @@ describe('BlsCatalogService.load (cold harvest)', () => {
         return Promise.resolve(new Response(CW_SERIES, { status: 200 }));
       if (u.includes('/cw/cw.area')) return Promise.resolve(new Response(CW_AREA, { status: 200 }));
       if (u.includes('/cw/cw.item')) return Promise.resolve(new Response(CW_ITEM, { status: 200 }));
+      if (u.includes('/cw/cw.periodicity'))
+        return Promise.resolve(new Response('periodicity_code\tperiodicity_name\nR\tMonthly\n'));
       // Every other survey contributes nothing, isolating the cw harvest.
       return Promise.resolve(new Response('', { status: 404 }));
     });
@@ -892,6 +920,7 @@ describe('BlsCatalogService.load — LABSTAT decoding (characterization)', () =>
         ['item_code', 'item_name', 'display_level', 'selectable', 'sort_sequence'],
         ['SA0', 'All items', '0', 'T', '1'],
       ),
+      'cu.periodicity': tsv(['periodicity_code', 'periodicity_name'], ['R', 'Monthly']),
     });
 
     const row = (await svc.lookupByIds(['CUSR0000SA0'])).get('CUSR0000SA0');
@@ -902,6 +931,10 @@ describe('BlsCatalogService.load — LABSTAT decoding (characterization)', () =>
       areaName: 'U.S. city average',
       itemName: 'All items',
       seasonal: true,
+      frequency: 'Monthly',
+      startYear: 1947,
+      endYear: 2026,
+      endPeriod: 'M08',
     });
   });
 
@@ -935,11 +968,134 @@ describe('BlsCatalogService.load — LABSTAT decoding (characterization)', () =>
           'M08',
         ],
       ),
+      'ce.industry': tsv(['industry_code', 'industry_name'], ['20000000', 'Construction']),
     });
     const row = (await svc.lookupByIds(['CES2000000001'])).get('CES2000000001');
     expect(row?.title).toBe('All employees, thousands, construction, seasonally adjusted');
     expect(row?.seasonal).toBe(true);
   });
+});
+
+describe('BlsCatalogService.load — coverage (#90)', () => {
+  it('keeps header-keyed and historical EC omitted-footnote-header coverage aligned', async () => {
+    const normal = await harvestFrom(EC_FILES);
+    const normalRow = (await normal.svc.lookupByIds(['ECS10001I'])).get('ECS10001I');
+    expect(normalRow).toMatchObject({ startYear: 1982, endYear: 2005, endPeriod: 'Q04' });
+    await normal.svc.shutdown();
+    const { svc } = await harvestFrom({
+      ...JT_FILES,
+      ...EC_FILES,
+      'ec.series': EC_FILES['ec.series']!.replace('footnote_codes\t', ''),
+    });
+    const rows = await svc.lookupByIds(['ECS10001I', 'JTS000000000000000QUR']);
+    expect(rows.get('ECS10001I')).toMatchObject({
+      startYear: 1982,
+      endYear: 2005,
+      endPeriod: 'Q04',
+    });
+    expect(rows.get('ECS10001I')).toEqual(normalRow);
+    expect(rows.get('JTS000000000000000QUR')).toMatchObject({
+      startYear: 2000,
+      endYear: 2026,
+      endPeriod: 'M07',
+    });
+    await svc.shutdown();
+  });
+
+  it('omits each invalid or missing coverage value independently', async () => {
+    const { svc } = await harvestFrom({
+      'ln.series': tsv(
+        ['series_id', 'series_title', 'periodicity_code', 'end_period', 'end_year', 'begin_year'],
+        ['SPARSE1', 'Sparse coverage', 'M', 'M08', '2026', ''],
+        ['SPARSE2', 'Sparse coverage', 'M', '', '20x6', '1948'],
+        ['SPARSE3', 'Sparse coverage', 'M', 'Q02', '2026.0', '0000'],
+      ),
+      'ln.periodicity': tsv(['periodicity_code', 'periodicity_text'], ['M', 'Monthly']),
+    });
+    const rows = await svc.lookupByIds(['SPARSE1', 'SPARSE2', 'SPARSE3']);
+    expect(rows.get('SPARSE1')).toMatchObject({ endYear: 2026, endPeriod: 'M08' });
+    expect(rows.get('SPARSE1')).not.toHaveProperty('startYear');
+    expect(rows.get('SPARSE2')).toMatchObject({ startYear: 1948 });
+    expect(rows.get('SPARSE2')).not.toHaveProperty('endYear');
+    expect(rows.get('SPARSE2')).not.toHaveProperty('endPeriod');
+    expect(rows.get('SPARSE3')).not.toHaveProperty('startYear');
+    expect(rows.get('SPARSE3')).not.toHaveProperty('endYear');
+    expect(rows.get('SPARSE3')).toHaveProperty('endPeriod', 'Q02');
+    await svc.shutdown();
+  });
+});
+
+describe('BlsCatalogService.load — declared table failures (#94)', () => {
+  it.each(['missing', 'invalid', 'empty', 'rejected', 'body-read'])(
+    'preserves the complete prior survey on %s table failure, retries, then recovers',
+    async (failure) => {
+      const dbPath = join(tmpDir, `table-${failure}.db`);
+      const old = createCatalogStore(dbPath);
+      const prior = {
+        seriesId: 'JTS000000000000000QUR',
+        title: 'Old quits',
+        surveyAbbr: 'JT',
+        seasonal: true,
+        areaName: 'Old area',
+        itemName: 'Old item',
+        frequency: 'Quarterly',
+        startYear: 1982,
+        endYear: 2005,
+        endPeriod: 'Q04',
+      };
+      await old.applyBatch(
+        [toMirrorRow(prior), toMirrorRow({ ...prior, seriesId: 'KEEP_DELETED' })],
+        [],
+      );
+      await old.writeState({
+        status: 'complete',
+        completedAt: new Date().toISOString(),
+        checkpoint: catalogSurveyList(true),
+      });
+      await old.close();
+      const files = { ...JT_FILES, ...EC_FILES };
+      if (failure === 'missing') delete files['jt.dataelement'];
+      if (failure === 'invalid') files['jt.dataelement'] = 'wrong\theader\nJO\tJob openings\n';
+      if (failure === 'empty') files['jt.dataelement'] = 'dataelement_code\tdataelement_text\n';
+      const { requested } = serveLabstat(files);
+      const normalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+      if (failure === 'rejected' || failure === 'body-read') {
+        vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+          if (String(url).endsWith('/jt.dataelement')) {
+            requested.push('jt.dataelement');
+            if (failure === 'rejected') return Promise.reject(new Error('network failure'));
+            const response = new Response('');
+            vi.spyOn(response, 'text').mockRejectedValue(new Error('body failure'));
+            return Promise.resolve(response);
+          }
+          return normalFetch(url, init);
+        });
+      }
+      const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+      await svc.load(1);
+      expect((await svc.lookupByIds([prior.seriesId])).get(prior.seriesId)).toEqual(prior);
+      expect((await svc.lookupByIds(['KEEP_DELETED'])).has('KEEP_DELETED')).toBe(true);
+      expect((await svc.lookupByIds(['ECS10001I'])).has('ECS10001I')).toBe(true);
+      const attempts = requested.length;
+      const stateStore = createCatalogStore(dbPath);
+      const state = await stateStore.readState();
+      expect(state.status).toBe('error');
+      expect(state.completedAt).toBeDefined();
+      expect(state.checkpoint).toBe(catalogSurveyList(false));
+      await stateStore.close();
+      await svc.load(1);
+      expect(requested.length).toBeGreaterThan(attempts);
+      await svc.shutdown();
+      serveLabstat({ ...JT_FILES, ...EC_FILES });
+      const recovered = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+      await recovered.load(1);
+      expect((await recovered.lookupByIds([prior.seriesId])).get(prior.seriesId)?.title).toContain(
+        'Quits - Total nonfarm',
+      );
+      expect((await recovered.lookupByIds(['KEEP_DELETED'])).has('KEEP_DELETED')).toBe(false);
+      await recovered.shutdown();
+    },
+  );
 });
 
 describe('BlsCatalogService.load — title synthesis for title-less surveys (#63)', () => {
@@ -1377,15 +1533,14 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
     expect(requested.filter((f) => !listed.has(f))).toEqual([]);
   });
 
-  it('still indexes a survey whose code table 404s, reporting the table on stderr', async () => {
+  it('omits a cold survey whose declared code table 404s, reporting the table on stderr', async () => {
     const { 'jt.state': _dropped, ...withoutState } = JT_FILES;
     const { svc, warnings } = await harvestFrom(withoutState);
 
     const row = (await svc.lookupByIds(['JTS000000060000000JOR'])).get('JTS000000060000000JOR');
-    expect(row?.title).toBe('JOLTS - Job openings - Total nonfarm - All size classes - Rate');
-    expect(row?.areaName).toBeUndefined();
+    expect(row).toBeUndefined();
     expect(warnings.filter((w) => w.includes('jt.state'))).toEqual([
-      '[bls-labor-mcp-server] Catalog: jt.state unavailable (HTTP 404) — its codes are not decoded.\n',
+      '[bls-labor-mcp-server] Catalog: jt.state unavailable (HTTP 404) — its indexed rows are kept.\n',
     ]);
   });
 
@@ -1396,7 +1551,7 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
     });
 
     const row = (await svc.lookupByIds(['JTS000000000000000QUR'])).get('JTS000000000000000QUR');
-    expect(row?.title).toBe('JOLTS - Quits - Total nonfarm - Total US - Rate');
+    expect(row).toBeUndefined();
     expect(warnings.some((w) => w.includes('jt.sizeclass header lacks sizeclass_code'))).toBe(true);
   });
 });
@@ -1451,7 +1606,7 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
     await legacy.close();
   }
 
-  it('re-harvests a fresh index from an earlier release once, serving it meanwhile', async () => {
+  it('re-harvests a fresh legacy index, serves it meanwhile, and retries its incomplete refresh', async () => {
     const dbPath = join(tmpDir, 'upgrade.db');
     await seedLegacy(dbPath);
 
@@ -1482,11 +1637,11 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
     expect(after?.areaName).toBe('Total US');
     await svc.shutdown();
 
-    // Once: the upgraded index is fresh on the next boot.
+    // JT succeeded, but other surveys failed: the upgraded schema persists and the harvest retries.
     fetchSpy.mockClear();
     const next = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
     await next.load(1);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalled();
     await next.shutdown();
   });
 
@@ -1883,7 +2038,7 @@ describe('queryFrequencies (#85)', () => {
   });
 });
 
-describe('BlsCatalogService.load — index version 3 adds the frequency column (#85)', () => {
+describe('BlsCatalogService.load — index version 4 adds frequency and coverage columns (#85, #90)', () => {
   /** The catalog store as 0.5.x persisted it: index version 2, no frequency column. */
   function v2Store(path: string) {
     return sqliteMirrorStore({
@@ -1973,12 +2128,14 @@ describe('BlsCatalogService.load — index version 3 adds the frequency column (
 
     const { columns, version } = await columnsOf(dbPath);
     expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
-    expect(version).toBe(3);
+    for (const name of ['start_year', 'end_year', 'end_period'])
+      expect(columns.filter((c) => c === name)).toHaveLength(1);
+    expect(version).toBe(4);
 
     fetchSpy.mockClear();
     const next = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
     await next.load(1);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalled();
     await next.shutdown();
   });
 
@@ -1986,7 +2143,9 @@ describe('BlsCatalogService.load — index version 3 adds the frequency column (
     const dbPath = join(tmpDir, 'fresh-v3.db');
     const { columns, version } = await columnsOf(dbPath);
     expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
-    expect(version).toBe(3);
+    for (const name of ['start_year', 'end_year', 'end_period'])
+      expect(columns.filter((c) => c === name)).toHaveLength(1);
+    expect(version).toBe(4);
 
     const store = createCatalogStore(dbPath);
     const completedAt = new Date().toISOString();
@@ -1995,6 +2154,42 @@ describe('BlsCatalogService.load — index version 3 adds the frequency column (
     const reopened = createCatalogStore(dbPath);
     expect((await reopened.readState()).completedAt).toBe(completedAt);
     await reopened.close();
+  });
+
+  it('upgrades a v3 database with only some coverage columns without duplicating them', async () => {
+    const dbPath = join(tmpDir, 'partial-columns.db');
+    const legacy = sqliteMirrorStore({
+      path: dbPath,
+      version: 3,
+      table: 'bls_catalog',
+      primaryKey: 'series_id',
+      columns: {
+        series_id: 'TEXT',
+        title: 'TEXT',
+        survey_abbr: 'TEXT',
+        area_name: 'TEXT',
+        item_name: 'TEXT',
+        seasonal: 'INTEGER',
+        frequency: 'TEXT',
+        start_year: 'INTEGER',
+      },
+      fts: ['series_id', 'title', 'area_name', 'item_name'],
+    });
+    await legacy.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      checkpoint: catalogSurveyList(false),
+    });
+    await legacy.close();
+    const upgraded = createCatalogStore(dbPath);
+    expect((await upgraded.readState()).completedAt).toBeUndefined();
+    await upgraded.close();
+    for (let open = 0; open < 2; open++) {
+      const { columns, version } = await columnsOf(dbPath);
+      for (const name of ['frequency', 'start_year', 'end_year', 'end_period'])
+        expect(columns.filter((c) => c === name)).toHaveLength(1);
+      expect(version).toBe(4);
+    }
   });
 });
 
@@ -2242,6 +2437,207 @@ function expectLinearTime(
   expect(t80k, label).toBeLessThan(50);
 }
 
+describe('BlsCatalogService.search — geographic preference (#98)', () => {
+  const national: CatalogSeries = {
+    seriesId: 'LNS14000000',
+    title: 'Unemployment Rate',
+    surveyAbbr: 'LN',
+    seasonal: true,
+  };
+  const place = (name: string, i = 0): CatalogSeries => ({
+    seriesId: `LA_PLACE_${i}`,
+    title: `Unemployment Rate: ${name} (U)`,
+    areaName: name,
+    surveyAbbr: 'LA',
+    seasonal: false,
+  });
+  const names = [
+    'Seattle',
+    'Baltimore',
+    'Chicago',
+    'Philadelphia',
+    'Denver',
+    'Texas',
+    'California',
+    'Honolulu',
+  ];
+
+  it('keeps the bare headline and exact IDs ahead (characterization)', async () => {
+    const svc = await seedAndLoad([national, ...names.map(place)]);
+    expect((await svc.search(search('unemployment rate'))).series[0]?.seriesId).toBe('LNS14000000');
+    expect((await svc.search(search('LNS14000000'))).series[0]?.seriesId).toBe('LNS14000000');
+  });
+
+  it.each(names)('prefers decoded %s without filtering national matches', async (name) => {
+    const svc = await seedAndLoad([national, ...names.map(place)]);
+    const result = await svc.search(search(`${name} unemployment rate`, { limit: 50 }));
+    expect(result.series.slice(0, 5).some((s) => s.areaName === name)).toBe(true);
+    expect(result.series[0]?.areaName).toBe(name);
+    expect(result.series.some((s) => s.seriesId === national.seriesId)).toBe(true);
+    const again = await svc.search(search(`${name} unemployment rate`, { limit: 1, offset: 1 }));
+    expect(again.series).toEqual(result.series.slice(1, 2));
+    const first = result.series[0];
+    expect(first).toBeDefined();
+    if (first) first.areaName = 'caller mutation';
+    expect((await svc.search(search(`${name} unemployment rate`))).series[0]?.areaName).toBe(name);
+  });
+
+  it('admits a decoded place before the candidate cap', async () => {
+    const decoys = Array.from({ length: 1001 }, (_, i) => ({
+      ...national,
+      seriesId: `LN_GEO_${i}`,
+      title: 'Seattle unemployment rate',
+    }));
+    const target = {
+      ...place('Seattle city, WA'),
+      title: `Unemployment Rate: Seattle city, WA ${'details '.repeat(30)}`,
+    };
+    const svc = await seedAndLoad([...decoys, national, target]);
+    const result = await svc.search(search('seattle unemployment rate'));
+    expect(result.capped).toBe(true);
+    expect(result.series[0]?.seriesId).toBe(target.seriesId);
+  });
+
+  it.each([
+    'all',
+    'area',
+    'city',
+    'county',
+    'division',
+    'metropolitan',
+    'micropolitan',
+    'combined',
+    'nonmetropolitan',
+    'region',
+    'state',
+    'statistical',
+    'town',
+    'township',
+    'parish',
+    'borough',
+    'municipality',
+    'new',
+    'north',
+    'south',
+    'east',
+    'west',
+    'seatt',
+    'WA',
+    'united',
+    'national',
+    'average',
+  ])('does not infer geography from %s', async (word) => {
+    const svc = await seedAndLoad([
+      national,
+      place('Allentown Dallas Seattle city, WA'),
+      ...(word === 'seatt' ? [] : [place(`${word} county`, 1)]),
+      place('United States (National)', 2),
+    ]);
+    expect((await svc.search(search(`${word} unemployment rate`))).series[0]?.seriesId).toBe(
+      national.seriesId,
+    );
+  });
+
+  it('recognizes New York while retaining whole geographic boundaries', async () => {
+    const svc = await seedAndLoad([national, place('New York'), place('Yorkshire', 1)]);
+    expect((await svc.search(search('new york unemployment rate'))).series[0]?.areaName).toBe(
+      'New York',
+    );
+  });
+
+  it('keeps exact IDs and structured filters ahead of geographic preference', async () => {
+    const exact = { ...national, seriesId: 'Seattle', title: 'Employment level' };
+    const svc = await seedAndLoad([national, exact, place('Seattle')]);
+    expect((await svc.search(search('Seattle'))).series[0]?.seriesId).toBe('Seattle');
+    const input = search('Seattle unemployment rate', { survey: 'LN' });
+    expect((await svc.search(input)).series.map((s) => s.seriesId)).toEqual([
+      national.seriesId,
+      exact.seriesId,
+    ]);
+    expect(
+      (await svc.search({ ...input, survey: undefined, seasonal_adjustment: true })).series.map(
+        (s) => s.seriesId,
+      ),
+    ).toEqual([national.seriesId, exact.seriesId]);
+    const terms = [
+      'unemployment',
+      'rate',
+      ...Array.from({ length: 30 }, (_, i) => `zz${i}`),
+      'Seattle',
+    ];
+    expect((await svc.search(search(terms.join(' ')))).series[0]?.seriesId).toBe('LNS14000000');
+  });
+
+  it.each(['seattleé', 'éSeattle', 'seattle𐐀', '𐐀Seattle'])(
+    'requires whole query words: %s',
+    async (word) => {
+      const svc = await seedAndLoad([national, place('Seattle')]);
+      expect((await svc.search(search(`${word} unemployment rate`))).series[0]?.seriesId).toBe(
+        national.seriesId,
+      );
+    },
+  );
+
+  it('keeps the geographic scanner bounded across long and multiline queries', async () => {
+    const svc = await seedAndLoad([national, place('Seattle')]);
+    for (const shape of [
+      (n: number) => `seattle ${'9'.repeat(n)}`,
+      (n: number) => `seattle ${'§1 x'.repeat(n)}\ny`,
+      (n: number) => `seattle ${'  \r\n'.repeat(n)}`,
+    ]) {
+      let first = 0;
+      for (const n of [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000]) {
+        const query = shape(n);
+        const start = process.threadCpuUsage();
+        await svc.search(search(query));
+        const cpu = process.threadCpuUsage(start);
+        const elapsed = Math.max((cpu.user + cpu.system) / 1000, 1);
+        first ||= elapsed;
+        expect(elapsed).toBeLessThan(500);
+        if (n === 320_000) expect(elapsed / first).toBeLessThan(256);
+      }
+    }
+  });
+
+  it('rebuilds vocabulary when refreshed decoded areas change', async () => {
+    const files: Record<string, string> = {
+      'la.series': tsv(
+        ['series_id', 'area_code', 'seasonal', 'series_title'],
+        ['LA_PLACE', '01', 'U', 'Unemployment Rate'],
+      ),
+      'la.area': tsv(['area_code', 'area_text'], ['01', 'Seattle']),
+      'ln.series': tsv(
+        ['series_id', 'periodicity_code', 'seasonal', 'series_title'],
+        ['LNS14000000', 'M', 'S', 'Unemployment Rate'],
+      ),
+      'ln.periodicity': tsv(['periodicity_code', 'periodicity_text'], ['M', 'Monthly']),
+    };
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      const file = String(url).split('/').at(-1) ?? '';
+      return new Response(files[file] ?? '', { status: files[file] ? 200 : 404 });
+    });
+    const svc = new BlsCatalogService(
+      'https://fixture',
+      'test',
+      join(tmpDir, 'geo-refresh.db'),
+      -1,
+    );
+    await svc.load(1);
+    expect((await svc.search(search('seattle unemployment rate'))).series[0]?.seriesId).toBe(
+      'LA_PLACE',
+    );
+    files['la.area'] = tsv(['area_code', 'area_text'], ['01', 'Honolulu']);
+    await svc.load(1);
+    expect((await svc.search(search('seattle unemployment rate'))).series[0]?.seriesId).toBe(
+      'LNS14000000',
+    );
+    expect((await svc.search(search('honolulu unemployment rate'))).series[0]?.seriesId).toBe(
+      'LA_PLACE',
+    );
+    await svc.shutdown();
+  });
+});
+
 describe('escapeLike (#69)', () => {
   it('escapes the LIKE wildcards and the escape character, leaving other text alone', () => {
     expect(escapeLike('100%_a\\b')).toBe('100\\%\\_a\\\\b');
@@ -2327,6 +2723,8 @@ describe('BlsCatalogService.indexedSurveys (#64)', () => {
       ...JT_FILES,
       'pr.series': PR_FILES['pr.series']!,
       'pr.measure': PR_FILES['pr.measure']!,
+      'pr.sector': PR_FILES['pr.sector']!,
+      'pr.duration': PR_FILES['pr.duration']!,
     });
     expect(svc.indexedSurveys).toEqual(['JT', 'PR']);
   });
@@ -3120,6 +3518,121 @@ describe('startsWord (#91)', () => {
 // ---------------------------------------------------------------------------
 // Long and repetitive queries stay bounded (#92)
 // ---------------------------------------------------------------------------
+
+describe('BlsCatalogService.search — token modes (#95)', () => {
+  it.each(['ats', 'á', '𐐀'])(
+    'keeps a whole final term whole before %j in the full-query score',
+    async (suffix) => {
+      const svc = await seedAndLoad([
+        { seriesId: 'ZZ001', title: `a b c${suffix}`, surveyAbbr: 'AP', seasonal: false },
+        { seriesId: 'ZZ002', title: 'a-b-c', areaName: 'a b c', surveyAbbr: 'AP', seasonal: false },
+      ]);
+      expect((await svc.search(search('a b c'))).series.map((s) => s.seriesId)).toEqual([
+        'ZZ002',
+        'ZZ001',
+      ]);
+    },
+  );
+
+  it.each([
+    { seriesId: 'ZZ001', title: 'Alpha beta gamma' },
+    { seriesId: 'ZZ002', title: 'Index', areaName: 'Alpha beta gamma' },
+    { seriesId: 'ZZ003', title: 'Index', itemName: 'Alpha beta gamma' },
+    { seriesId: 'ABC001', title: 'Index' },
+    { seriesId: 'CES0000000001', title: 'Index' },
+  ])('uses whole terms across candidate and rescore fields: $seriesId', async (row) => {
+    const svc = await seedAndLoad([{ ...row, surveyAbbr: 'AP', seasonal: false }]);
+    expect(await svc.search(search('a b c'))).toEqual({ series: [], total: 0, capped: false });
+  });
+
+  it('counts whole tokens separated by punctuation or line breaks and retains longer stems', async () => {
+    const svc = await seedAndLoad([
+      { seriesId: 'ZZ001', title: 'a-b\nc\r\nManufacturing', surveyAbbr: 'AP', seasonal: false },
+      { seriesId: 'ZZ002', title: 'Alpha beta gamma', surveyAbbr: 'AP', seasonal: false },
+    ]);
+    const result = await svc.search(search('a b c manufactur'));
+    expect(result.series.map((s) => s.seriesId)).toEqual(['ZZ001']);
+    expect(result.total).toBe(1);
+    expect(await svc.search(search('a b c manufactur', { offset: 1 }))).toEqual({
+      series: [],
+      total: 1,
+      capped: false,
+    });
+  });
+
+  it('does not restore whole-term prefix scores on a row admitted by another token', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'ABC001',
+        title: 'Manufacturing alpha beta gamma',
+        surveyAbbr: 'AP',
+        seasonal: false,
+      },
+      { seriesId: 'ZZ001', title: 'Manufacturing a b c', surveyAbbr: 'AP', seasonal: false },
+    ]);
+    const result = await svc.search(search('a b c manufactur'));
+    expect(result.series.map((s) => s.seriesId)).toEqual(['ZZ001', 'ABC001']);
+  });
+
+  it('selects modes after distinct-token capping and keeps exact-ID priority', async () => {
+    const svc = await seedAndLoad([
+      { seriesId: 'A_B_C', title: 'Manufacturing', surveyAbbr: 'AP', seasonal: false },
+    ]);
+    expect((await svc.search(search('A_B_C'))).series[0]?.seriesId).toBe('A_B_C');
+    const terms = ['m', ...Array.from({ length: 31 }, (_, i) => `zz${i}`)];
+    expect((await svc.search(search(`${terms.join(' ')} a b c`))).series[0]?.seriesId).toBe(
+      'A_B_C',
+    );
+    expect(await svc.search(search('m m m m'))).toEqual(await svc.search(search('m m')));
+  });
+
+  it.each(['m', 'm m', 'u.s. city', 'manufactur', 'seha rent'])(
+    'retains prefix and ID-fragment recall for %j (characterization)',
+    async (query) => {
+      const svc = await seedAndLoad([
+        {
+          seriesId: 'CUSR0000SEHA',
+          title: 'Manufacturing rent in U.S. city average',
+          surveyAbbr: 'CU',
+          seasonal: true,
+        },
+      ]);
+      expect((await svc.search(search(query))).series.map((s) => s.seriesId)).toEqual([
+        'CUSR0000SEHA',
+      ]);
+    },
+  );
+
+  it('keeps token-mode scans linear in thread CPU time', async () => {
+    const shapes = [
+      { text: (n: number) => `${'za'.repeat(Math.ceil(n / 2))}\ny`, first: 1_250, last: 80_000 },
+      { text: (n: number) => ' a\r\n'.repeat(Math.ceil(n / 4)), first: 1_250, last: 80_000 },
+      { text: (n: number) => '1'.repeat(n), first: 5_000, last: 320_000 },
+    ];
+    for (const { text, first, last } of shapes) {
+      let baseline = 0;
+      let largest = 0;
+      for (let n = first; n <= last; n *= 2) {
+        const svc = await seedAndLoad([
+          { seriesId: 'CES0000000001', title: text(n), surveyAbbr: 'AP', seasonal: false },
+        ]);
+        await svc.search(search('a b c'));
+        const times: number[] = [];
+        for (let round = 0; round < 3; round++) {
+          const start = process.threadCpuUsage();
+          await svc.search(search('a b c'));
+          const elapsed = process.threadCpuUsage(start);
+          times.push((elapsed.user + elapsed.system) / 1_000);
+        }
+        largest = times.sort((a, b) => a - b)[1]!;
+        expect(largest).toBeLessThan(250);
+        if (n === first) baseline = Math.max(largest, 0.05);
+        await svc.shutdown();
+      }
+      expect(largest / baseline).toBeLessThan(256);
+    }
+  });
+});
 
 describe('BlsCatalogService.search — long and repetitive queries (#92)', () => {
   /** An items-only row that scores 3, a row matching only "all" (2), and the CES headline. */
