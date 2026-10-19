@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-10-10 23:34:59
+Generated on: 2026-10-19 01:58:57
 
 ```text
 bls-labor-mcp-server/
@@ -29,6 +29,7 @@ bls-labor-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

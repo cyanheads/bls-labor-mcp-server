@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-18 · ⚠️ Breaking · 🛡️ Security
+
+Series coverage and geographic relevance with complete-survey refreshes and bounded search expansion.
+
 ## [0.5.8](changelog/0.5.x/0.5.8.md) — 2026-10-10
 
 BLS calls accept common string representations through framework input repairs, with correlated tool failures and startup configuration errors.
