@@ -1,6 +1,6 @@
 /**
  * @fileoverview List BLS survey programs with their codes, descriptions, and
- * calculation-support metadata. Backed by the BLS /surveys API with monthly
+ * calculation-support metadata. Backed by the BLS /surveys API with 30-day process-local
  * caching; does not consume meaningful API quota.
  * @module mcp-server/tools/definitions/bls-list-surveys
  */
@@ -114,7 +114,7 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
   title: 'List BLS Surveys',
   description:
     'List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series; bls_search_series covers only the surveys in its offline index, and series in the others are fetched by SeriesID with bls_get_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.',
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
     {
@@ -131,15 +131,23 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'BLS /surveys API is unreachable or returns a non-200 response.',
       thrownBy: 'service',
-      recovery: 'Retry after a short delay. If persistent, check BLS API status at api.bls.gov.',
+      recovery: 'Check BLS API availability and network access before retrying.',
     },
     {
       reason: 'serialization_failure',
-      code: JsonRpcErrorCode.InternalError,
-      when: 'BLS /surveys response cannot be parsed (malformed JSON or unexpected schema).',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'BLS /surveys response cannot be parsed as JSON.',
+      retryable: false,
       thrownBy: 'service',
-      recovery:
-        'This is a BLS API inconsistency — retry or use a known survey code directly with bls_search_series.',
+      recovery: 'BLS returned an invalid response. Retry later; report persistent failures.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'The live BLS request exceeds its shared 45-second operation budget.',
+      retryable: true,
+      thrownBy: 'service',
+      recovery: 'BLS did not respond within the operation budget. Retry after a short delay.',
     },
   ],
 

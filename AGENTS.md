@@ -2,10 +2,12 @@
 
 **Server:** bls-labor-mcp-server
 **Version:** 0.6.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **Zod:** ^4.6.7
+
+**Dependency hold:** `@duckdb/node-api` stays on `^1.5.6-r.2`. DuckDB 2 produces `PRAGMA_SHOW` for `SHOW <table>`, which the framework SQL gate refuses (mcp-ts-core #800); the 1.5 line preserves the working schema query.
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -38,8 +40,8 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 **API constraints to keep in mind:**
 - 500 queries/day per `BLS_API_KEY`. `bls_get_series` (batch POST) counts as one query regardless of series count. `bls_get_latest` issues one GET per SeriesID — each counts as one query.
-- 50 series per `bls_get_series` request; 20-year history window per request.
-- `calculations: true` requests BLS-server-side net change and percent change; a survey returns whichever it supports (CPI/PPI return percent change only). A survey supporting neither returns its observations without calculation fields, never an error — `bls_list_surveys` predicts which come back. Mirror-served series carry no calculations; `bls_get_series` then reports `calculationsApplied: false`.
+- 25 series without an API key or 50 with one per `bls_get_series` request; 20-year requested history window per request (BLS can reduce the applied window).
+- `calculations: true` requests BLS-server-side net change and percent change; a survey returns whichever it supports (CPI/PPI return percent change only). A “does not produce calculations” advisory preserves observations without calculation fields; an explicit “does not support calculations” rejection raises `calculations_not_supported` — `bls_list_surveys` predicts which come back. Mirror-served series carry no calculations; `bls_get_series` then reports `calculationsApplied: false`.
 - With catalog metadata requested, BLS intermittently answers a request holding a nonexistent SeriesID with a generic `REQUEST_FAILED` naming no series. The service re-issues such a request once without catalog metadata (one extra query, on that answer only) and fills the metadata from the catalog index.
 
 **Catalog search is offline.** `bls_search_series` queries an on-disk SQLite index of the LABSTAT flat files, harvested at startup when the index is missing or stale and re-checked by an hourly `bls-catalog-refresh` job — no API quota consumed. A harvest removes rows its survey's `.series` file no longer lists and rows of surveys no longer configured. Bump `CATALOG_INDEX_VERSION` in `bls-catalog-service.ts` whenever the harvest's output changes, so persisted indexes re-harvest after an upgrade; a change to the configured survey set needs no bump, since the persisted survey list marks the index stale on its own. The BLS FAQ confirms there is no API catalog endpoint.
@@ -110,7 +112,7 @@ export function getServerConfig() {
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
-Validate domain config at the start of `createApp().setup()`, before initializing services. Select the tool surface before startup with normalized env values and nonthrowing `safeParse`; do not call `getServerConfig()` at module scope. This lets the framework report invalid BLS variables through its startup configuration banner. Framework-owned settings such as `CANVAS_PROVIDER_TYPE` stay in framework config.
+Validate domain config at the start of `createApp().setup()`, before initializing services. Select the tool surface before startup with normalized env values and nonthrowing `safeParse`; do not call `getServerConfig()` at module scope. This lets the framework report invalid BLS variables through its startup configuration banner. Framework-owned settings such as `CANVAS_PROVIDER_TYPE` stay in framework config; `src/index.ts` only defaults that one to `duckdb` (the framework's default is `none`), after native `loadEnvFile()` loads `./.env` without replacing exported values; `normalizeEnv` treats blank values and unsubstituted placeholders as unset before tool selection, and framework config validation stays inside `createApp`.
 
 ### Server identity and instructions
 
@@ -251,7 +253,7 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Development skills live in `framework-skills/`; root `skills/` holds deliberately authored skills for agents that install the server. Published skills ship in npm, Docker, and MCPB and are served over MCP through `createApp({ skills: 'skills' })`; `lint:packaging` validates the tree. Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -265,6 +267,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a root `skills/` skill for agents that use this server — structure, validation, delivery |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -315,7 +318,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run lint:mcp` | Validate MCP definitions against spec |
-| `bun run lint:packaging` | Validate env var alignment between `manifest.json` and `server.json` stdio block |
+| `bun run lint:packaging` | Check environment parity, bundle exclusions, plugin manifests, and published skills |
 | `bun run bundle` | Build and pack as `.mcpb` for one-click Claude Desktop install |
 | `bun run list-skills` | Print available local skills with paths (for sub-agents) |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
@@ -331,7 +334,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. This server uses DataCanvas, so the bundle ships without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP deployments are unaffected.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips package-root agent docs, platform-specific native bindings, node-gyp build output that exposes the packing host's paths, and build-only framework and better-sqlite3 source files under `node_modules/`. Compiled `*.node` addons stay. Every excluded root path has a root-anchored `.mcpbignore` line; root `skills/` ships. The bundle therefore ships without the DuckDB native, and a bundle running DataCanvas would start normally and then fail on its first staging call, so `manifest.json` pins `CANVAS_PROVIDER_TYPE` to `none`: the bundle runs inline-only, with the dataframe tools unlisted and complete `bls_get_series` results returned inline. MCPB is stdio-only — HTTP deployments are unaffected.
 
 **README install badges** and config-generation commands are ship-time concerns — follow `framework-skills/polish-docs-meta/references/readme.md`.
 
@@ -398,7 +401,7 @@ import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service
 - [ ] BLS wrapping: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] BLS wrapping: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Error contracts declared for quota_exceeded, series_not_found, series_locked, no_data_for_period, calculations_not_supported, catalog_unavailable (see design.md)
-- [ ] `calculations: true` preserves observations when a survey supports neither calculation; mirror-served rows report `calculationsApplied: false`
+- [ ] A “does not produce calculations” advisory preserves observations; an explicit “does not support calculations” rejection retains `calculations_not_supported`; mirror-served rows report `calculationsApplied: false`
 - [ ] `bls_get_latest` issues N concurrent GETs (one per SeriesID, fanned out via `Promise.allSettled`) — keep recommended limit ≤10 in docs
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`

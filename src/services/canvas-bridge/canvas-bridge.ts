@@ -172,13 +172,30 @@ export class CanvasBridge {
     const instance = await this.acquireSharedCanvas(ctx);
 
     const registerAs = options.registerAs;
-    const result = await instance.query(sql, {
-      ...(options.preview !== undefined && { preview: options.preview }),
-      ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
-      ...(registerAs !== undefined && { registerAs }),
-      denySystemCatalogs: true,
-      signal: ctx.signal,
-    });
+    let result: QueryResult;
+    try {
+      result = await instance.query(sql, {
+        ...(options.preview !== undefined && { preview: options.preview }),
+        ...(options.rowLimit !== undefined && { rowLimit: options.rowLimit }),
+        ...(registerAs !== undefined && { registerAs }),
+        denySystemCatalogs: true,
+        signal: ctx.signal,
+      });
+    } catch (error) {
+      if (
+        ctx.signal.aborted ||
+        !(error instanceof McpError) ||
+        error.data?.reason !== 'register_as_clash'
+      ) {
+        throw error;
+      }
+      throw new McpError(
+        error.code,
+        `Canvas table "${registerAs}" already exists. Choose a different register_as name.`,
+        error.data,
+        { cause: error },
+      );
+    }
 
     let meta: DataframeMeta | undefined;
     if (registerAs && result.tableName) {

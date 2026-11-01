@@ -42,7 +42,13 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
 // Bypass withRetry — tests focus on routing, not retry logic
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   const original = await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>();
-  return { ...original, withRetry: (fn: () => Promise<unknown>) => fn() };
+  return {
+    ...original,
+    withRetry: (
+      fn: (attempt: { signal: AbortSignal; remainingMs: number }) => Promise<unknown>,
+      options: { signal: AbortSignal },
+    ) => fn({ signal: options.signal, remainingMs: 45_000 }),
+  };
 });
 
 // ---------------------------------------------------------------------------
@@ -596,7 +602,7 @@ describe('fetchSeries — failed live fallback (#80)', () => {
     },
   );
 
-  it('keeps the mirrored series when the fallback cannot reach BLS, naming the message', async () => {
+  it('keeps the mirrored series when the fallback cannot reach BLS, naming the typed failure', async () => {
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(
       new TypeError('Unable to connect. Is the computer able to access the url?'),
     );
@@ -608,7 +614,8 @@ describe('fetchSeries — failed live fallback (#80)', () => {
     );
 
     expect(result[0]!.liveFailure).toEqual({
-      message: 'Unable to connect. Is the computer able to access the url?',
+      reason: 'service_unavailable',
+      message: 'BLS API could not complete the upstream request.',
     });
     expect(result[1]!.observations).toHaveLength(1);
   });
@@ -681,7 +688,7 @@ describe('fetchSeries — failed live fallback (#80)', () => {
     });
   });
 
-  it('propagates a network error unchanged when the mirror served no requested series', async () => {
+  it('classifies a network error and retains its cause when the mirror served no requested series', async () => {
     getMirror().queryBySeries.mockResolvedValue({
       observations: [],
       complete: false,
@@ -693,7 +700,11 @@ describe('fetchSeries — failed live fallback (#80)', () => {
     const svc = new BlsApiService(apiKey, baseUrl, userAgent);
     await expect(
       svc.fetchSeries({ seriesIds: ['CES0000000001'] }, createMockContext()),
-    ).rejects.toBe(networkError);
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'service_unavailable', retryable: true },
+      cause: networkError,
+    });
   });
 
   it('fails a cancelled request rather than returning a partial result', async () => {

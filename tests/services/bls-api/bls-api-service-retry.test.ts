@@ -9,7 +9,7 @@
  */
 
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BlsApiService } from '@/services/bls-api/bls-api-service.js';
 import {
   GENERIC_REJECTION,
@@ -52,12 +52,259 @@ const INVALID_KEY_RESPONSE = {
   Results: {},
 };
 
+beforeEach(() => {
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Unexpected unmocked BLS request'));
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
+/** A body which has already delivered bytes but never finishes until aborted. */
+function stalledBody(signal: AbortSignal): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"status":'));
+        signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+      },
+    }),
+  );
+}
+
+const operations = {
+  series: (svc: BlsApiService, ctx: ReturnType<typeof createMockContext>) =>
+    svc.fetchSeries({ seriesIds: ['LNS14000000'] }, ctx),
+  latest: (svc: BlsApiService, ctx: ReturnType<typeof createMockContext>) =>
+    svc.fetchLatest('LNS14000000', ctx),
+  surveys: (svc: BlsApiService, ctx: ReturnType<typeof createMockContext>) => svc.listSurveys(ctx),
+};
+
+describe('BLS live transport classification and operation budget', () => {
+  it('does not start a retry whose backoff outlasts the remaining operation budget', async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve(new Response('unavailable', { status: 500 }));
+        }),
+    );
+    const pending = operations
+      .series(new BlsApiService(apiKey, baseUrl, userAgent), createMockContext())
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(44_000);
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await pending).toMatchObject({ data: { reason: 'upstream_timeout', status: 500 } });
+    await vi.runAllTimersAsync();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['headers', 'body', 'backoff', 'reissue'])(
+    'preserves caller cancellation identity during %s',
+    async (phase) => {
+      vi.useFakeTimers();
+      const caller = new AbortController();
+      const reason = new Error('caller explicitly cancelled BLS');
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+        const signal = init!.signal!;
+        if (phase === 'backoff') return Promise.resolve(new Response('', { status: 500 }));
+        if (phase === 'body' || phase === 'reissue') return Promise.resolve(stalledBody(signal));
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+        );
+      });
+      if (phase === 'reissue') spy.mockResolvedValueOnce(okJson(GENERIC_REJECTION));
+      const pending = operations
+        .series(
+          new BlsApiService(apiKey, baseUrl, userAgent),
+          createMockContext({ signal: caller.signal }),
+        )
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      const count = phase === 'reissue' ? 2 : 1;
+      expect(spy).toHaveBeenCalledTimes(count);
+      caller.abort(reason);
+      expect(await pending).toBe(reason);
+      await vi.runAllTimersAsync();
+      expect(spy).toHaveBeenCalledTimes(count);
+    },
+  );
+
+  it.each([408, 429, 500, 502, 503, 504])(
+    'retries HTTP %i before interpreting a successful envelope',
+    async (status) => {
+      vi.useFakeTimers();
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ status: 'REQUEST_SUCCEEDED', Results: { series: [] } }), {
+            status,
+          }),
+        ),
+      );
+      const pending = operations
+        .series(new BlsApiService(apiKey, baseUrl, userAgent), createMockContext())
+        .catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await pending).toMatchObject({
+        data: { reason: 'service_unavailable', status, retryable: true },
+      });
+      expect(spy).toHaveBeenCalledTimes(4);
+    },
+  );
+
+  it.each([400, 401, 403, 404, 501])(
+    'does not retry nontransient HTTP %i or interpret its body',
+    async (status) => {
+      vi.useFakeTimers();
+      const spy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(() =>
+          Promise.resolve(new Response('<html>key: test-key</html>', { status })),
+        );
+      const pending = operations
+        .series(new BlsApiService(apiKey, baseUrl, userAgent), createMockContext())
+        .catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      const error = await pending;
+      expect(error).toMatchObject({
+        data: { reason: 'service_unavailable', status, retryable: false },
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(error)).not.toContain('test-key');
+    },
+  );
+
+  it('normalizes transport errors without leaking their URL, key, or raw message', async () => {
+    vi.useFakeTimers();
+    const spy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new TypeError('socket reset https://host/?registrationkey=test-key'));
+    const pending = operations
+      .series(new BlsApiService(apiKey, baseUrl, userAgent), createMockContext())
+      .catch((error: unknown) => error);
+    await vi.runAllTimersAsync();
+    const error = await pending;
+    expect(error).toMatchObject({ data: { reason: 'service_unavailable', retryable: true } });
+    expect(spy).toHaveBeenCalledTimes(4);
+    expect(JSON.stringify(error)).not.toMatch(/registrationkey|test-key|socket reset/);
+  });
+
+  it.each(Object.entries(operations))(
+    '%s classifies complete malformed JSON without retrying',
+    async (_name, invoke) => {
+      vi.useFakeTimers();
+      const spy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(() => Promise.resolve(new Response('{broken')));
+      const pending = invoke(
+        new BlsApiService(apiKey, baseUrl, userAgent),
+        createMockContext(),
+      ).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(await pending).toMatchObject({
+        data: { reason: 'serialization_failure', retryable: false },
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(
+    Object.entries(operations).flatMap(([name, invoke]) =>
+      ['headers', 'body'].map((phase) => ({ name, invoke, phase })),
+    ),
+  )('$name bounds stalled $phase to the total 45s budget', async ({ invoke, phase }) => {
+    vi.useFakeTimers();
+    const caller = new AbortController();
+    let completed = false;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      const signal = init!.signal!;
+      if (phase === 'body') return Promise.resolve(stalledBody(signal));
+      return new Promise((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+    });
+    const pending = invoke(
+      new BlsApiService(apiKey, baseUrl, userAgent),
+      createMockContext({ signal: caller.signal }),
+    )
+      .catch((error: unknown) => error)
+      .then((value) => {
+        completed = true;
+        return value;
+      });
+    try {
+      await vi.advanceTimersByTimeAsync(44_999);
+      expect(completed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(completed).toBe(true);
+      expect(await pending).toMatchObject({ data: { reason: 'upstream_timeout' } });
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      caller.abort();
+      await pending;
+    }
+  });
+
+  it('shares the original deadline with the catalog-less reissue', async () => {
+    vi.useFakeTimers();
+    const caller = new AbortController();
+    let completeFirst!: () => void;
+    let completed = false;
+    const spy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            completeFirst = () => resolve(okJson(GENERIC_REJECTION));
+          }),
+      )
+      .mockImplementation((_url, init) => Promise.resolve(stalledBody(init!.signal!)));
+    const pending = operations
+      .series(
+        new BlsApiService(apiKey, baseUrl, userAgent),
+        createMockContext({ signal: caller.signal }),
+      )
+      .catch((error: unknown) => error)
+      .then((value) => {
+        completed = true;
+        return value;
+      });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      completeFirst();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spy).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(completed).toBe(true);
+      expect(await pending).toMatchObject({ data: { reason: 'upstream_timeout' } });
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      caller.abort();
+      await pending;
+    }
+  });
+});
+
 describe('BlsApiService — retry behavior (real withRetry)', () => {
+  it('keeps an empty successful batch distinct from a rejected request', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        message: [],
+        Results: { series: [] },
+      }),
+    );
+    await expect(
+      new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+        { seriesIds: ['LNS14000000'] },
+        createMockContext(),
+      ),
+    ).resolves.toEqual([]);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
   it('fails fast on quota_exceeded — exactly one request, no retries (#47)', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')

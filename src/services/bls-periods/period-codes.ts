@@ -1,14 +1,15 @@
 /**
  * @fileoverview BLS period-code semantics, shared by the live API and the
  * observations mirror. BLS publishes an annual-average row alongside a series'
- * real periods; it is the mean of that year's observations rather than an
+ * real periods; it is a BLS-computed annual summary rather than an
  * additional period, so summing or averaging a series' observations
  * double-counts every year unless those rows are excluded.
  * @module services/bls-periods/period-codes
  */
 
 /**
- * Period codes that denote a year's mean instead of a real observation.
+ * Period codes that denote BLS-computed annual summaries, not additional periods.
+ * Their values are not universally the arithmetic mean of the year's periods.
  *
  * Verified against the LABSTAT `{survey}.period` tables, which label exactly
  * these three "Annual Average" — `M13` for monthly cadences (`ap`, `ce`, `cu`,
@@ -30,8 +31,7 @@
 export const ANNUAL_AVERAGE_PERIODS: ReadonlySet<string> = new Set(['M13', 'Q05', 'S03']);
 
 /**
- * True when `period` marks an annual-average row — the mean of that year's real
- * periods, not a period of its own.
+ * True when `period` marks a BLS-computed annual-summary row, not an additional period.
  */
 export function isAnnualAveragePeriod(period: string): boolean {
   return ANNUAL_AVERAGE_PERIODS.has(period);

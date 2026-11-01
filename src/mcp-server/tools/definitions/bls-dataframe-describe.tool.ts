@@ -1,19 +1,20 @@
 /**
  * @fileoverview List the canvas dataframes materialized by bls_get_series or
  * bls_dataframe_query register_as, with provenance, TTL, row count, and column
- * schema. Requires CANVAS_PROVIDER_TYPE=duckdb.
+ * schema. Unavailable when CANVAS_PROVIDER_TYPE=none.
  * @module mcp-server/tools/definitions/bls-dataframe-describe
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CANVAS_IDENTIFIER_REGEX } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 
 export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
   title: 'Describe BLS Dataframes',
   description:
-    'List canvas dataframes materialized by bls_get_series or by bls_dataframe_query register_as, with provenance (source tool, query parameters), TTL, row count, and column schema. Use before writing SQL to confirm column names and types. Lazy-sweeps expired tables before responding. Requires CANVAS_PROVIDER_TYPE=duckdb.',
+    'List canvas dataframes materialized by bls_get_series or by bls_dataframe_query register_as, with provenance (source tool, query parameters), TTL, row count, and column schema. Use before writing SQL to confirm column names and types. Lazy-sweeps expired tables before responding.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -55,7 +56,9 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
               .record(z.string(), z.unknown())
               .describe('Input parameters the source tool was called with.'),
             created_at: z.string().describe('ISO 8601 creation timestamp.'),
-            expires_at: z.string().describe('ISO 8601 expiry timestamp (sliding TTL).'),
+            expires_at: z
+              .string()
+              .describe('ISO 8601 table expiry fixed at creation; reads do not extend it.'),
             row_count: z.number().describe('Rows materialized in the dataframe.'),
             column_schema: z
               .array(
@@ -117,18 +120,18 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
     }
     const lines: string[] = [`**${result.dataframes.length} active dataframe(s):**\n`];
     for (const df of result.dataframes) {
-      lines.push(`### ${df.name}`);
+      lines.push(`### ${escapeMarkdownInline(df.name)}`);
       lines.push(`- Source: ${df.source_tool}`);
       lines.push(`- Rows: ${df.row_count}`);
       lines.push(`- Created: ${df.created_at} — Expires: ${df.expires_at}`);
       const params = Object.entries(df.query_params)
         .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
         .join(', ');
-      if (params) lines.push(`- Params: ${params}`);
+      if (params) lines.push(`- Params: ${escapeMarkdownInline(params)}`);
       const cols = df.column_schema
         .map((c) => `${c.name}:${c.type}${c.nullable ? ' (nullable)' : ''}`)
         .join(', ');
-      lines.push(`- Columns: ${cols}`);
+      lines.push(`- Columns: ${escapeMarkdownInline(cols)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n').trimEnd() }];

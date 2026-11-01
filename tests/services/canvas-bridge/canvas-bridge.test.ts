@@ -276,6 +276,23 @@ describe('CanvasBridge against the DuckDB canvas', () => {
     return (await instance.describe({ tableName })).length === 1;
   };
 
+  it('keeps a clashing registration intact and accepts a different name (#115)', async () => {
+    await bridge.query(ctx, 'SELECT 1 AS value', { registerAs: 'unemp' });
+
+    const clash = bridge.query(ctx, 'SELECT 2 AS value', { registerAs: 'unemp' });
+    await expect(clash).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'register_as_clash', tableName: 'unemp' },
+    });
+    await expect(clash).rejects.toThrow('Choose a different register_as name.');
+    expect((await bridge.query(ctx, 'SELECT value FROM unemp')).result.rows).toEqual([
+      { value: 1 },
+    ]);
+    expect(
+      (await bridge.query(ctx, 'SELECT 2 AS value', { registerAs: 'unemp2' })).result.rows,
+    ).toEqual([{ value: 2 }]);
+  });
+
   describe('drop and the TTL sweep, provider healthy', () => {
     it('drops an existing dataframe: table and metadata both go', async () => {
       const { tableName } = await register();

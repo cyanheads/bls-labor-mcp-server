@@ -10,6 +10,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import type { ColumnSchema, ColumnType } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { getServerConfig } from '@/config/server-config.js';
 import { type BatchFetchOptions, getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
 import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
@@ -23,7 +25,7 @@ const ObservationSchema = z.object({
   period: z
     .string()
     .describe(
-      'BLS period code: M01–M12 are months, Q01–Q04 quarters, S01–S02 semiannual halves. M13, Q05 and S03 are not further periods — each is the mean of that year\'s real observations, named "Annual", and appears only when annual_average is true. Exclude them from any sum or average over observations.',
+      'BLS period code: M01–M12 are months, Q01–Q04 quarters, S01–S02 semiannual halves. M13, Q05 and S03 are BLS-computed annual summaries, named "Annual", and appear only when annual_average is true. They are not additional periods or universally arithmetic means. Exclude them from sums or averages over periods.',
     ),
   periodName: z.string().optional().describe('Human-readable period name.'),
   value: z
@@ -79,10 +81,33 @@ const CALC_COLUMNS = [
 export const blsGetSeriesTool = tool('bls_get_series', {
   title: 'Get BLS Time-Series Data',
   description:
-    "Fetch time-series data for 1–50 BLS series by SeriesID in a single API request (one query against the 500/day limit). Supports optional year range (up to 20 years per request) and BLS-computed period-over-period calculations (net change and percent change; a survey returns whichever it supports and silently omits the rest — CPI and PPI return percent change only, the inflation rate). BLS can publish a '-' missing-value sentinel; check observation.available before arithmetic. Set annual_average to add each year's annual-average row, which is that year's mean rather than an additional period. When the total observation count would exceed the inline context budget, results spill to a canvas dataframe and the response includes a dataset.name handle. Call bls_dataframe_describe with that name to inspect the dataframe schema, then use the name in bls_dataframe_query SQL. Use bls_search_series first if you need to resolve a concept to a SeriesID.",
-  annotations: { readOnlyHint: true, openWorldHint: true },
+    "Fetch BLS time-series data in a single API request (one query). SeriesIDs are trimmed, uppercased, and deduplicated in first-occurrence order. Processes up to 25 unique IDs without a key or 50 with one; unprocessedSeriesIds names the exact remainder for a separate request. Supports optional year range (up to 20 years; BLS may reduce it) and BLS-computed net/percent changes when available. BLS can publish a '-' missing-value sentinel; check observation.available before arithmetic. Set annual_average to add BLS-computed annual summary rows, which are not additional periods or universally arithmetic means. Large results spill to a dataframe when canvas is configured; otherwise all observations return inline. Use dataset.name in bls_dataframe_describe, then bls_dataframe_query SQL. Use bls_search_series to resolve concepts to SeriesIDs.",
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
+    {
+      reason: 'service_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'BLS is unreachable or returns an unsuccessful HTTP response and no mirrored observations can answer the request.',
+      thrownBy: 'service',
+      recovery: 'Check BLS API availability and network access before retrying.',
+    },
+    {
+      reason: 'serialization_failure',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'BLS returns malformed JSON and no mirrored observations can answer the request.',
+      retryable: false,
+      thrownBy: 'service',
+      recovery: 'BLS returned an invalid response. Retry later; report persistent failures.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'The live BLS request exceeds its shared 45-second operation budget and no mirrored observations can answer the request.',
+      retryable: true,
+      thrownBy: 'service',
+      recovery: 'BLS did not respond within the operation budget. Retry after a short delay.',
+    },
     {
       reason: 'invalid_api_key',
       code: JsonRpcErrorCode.ConfigurationError,
@@ -108,7 +133,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       retryable: false,
       thrownBy: 'service',
       recovery:
-        'BLS rejected the request as a whole, not a named series. Retry once; if it recurs, omit calculations or annual_average, or change start_year/end_year.',
+        'BLS rejected the request after its automatic catalog-free reissue. Omit calculations or annual_average, or change start_year/end_year before trying again.',
     },
     {
       reason: 'series_not_found',
@@ -139,13 +164,6 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         'Remove the calculations flag or use bls_list_surveys to verify calculation support before requesting it.',
     },
     {
-      reason: 'canvas_unavailable',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The result set exceeds the inline budget and canvas (DuckDB) is not configured.',
-      recovery:
-        'Narrow start_year/end_year to reduce the result set, or enable canvas by setting CANVAS_PROVIDER_TYPE=duckdb.',
-    },
-    {
       reason: 'canvas_registration_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The result set exceeds the inline budget and canvas is configured, but registering the dataframe failed.',
@@ -157,11 +175,10 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
   input: z.object({
     series_ids: z
-      .array(z.string().min(1))
+      .array(z.string().trim().min(1))
       .min(1)
-      .max(50)
       .describe(
-        'One or more BLS SeriesIDs (1–50). The entire batch counts as one API query. Use bls_search_series to resolve concepts to SeriesIDs.',
+        'BLS SeriesIDs, trimmed, uppercased, and deduplicated in first-occurrence order. Process up to 25 unique IDs without a key or 50 with one; the exact remainder is returned as unprocessedSeriesIds. The batch costs one API query.',
       ),
     start_year: z
       .number()
@@ -170,7 +187,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .max(2100)
       .optional()
       .describe(
-        'Start year for the data range (inclusive). The BLS API allows up to 20 years per request and requires both bounds or neither: supplying start_year alone resolves end_year to the current year, capped at start_year + 19 so the window stays inside the 20-year limit. Omit both for the API default (typically 3–20 years depending on survey).',
+        'Start year for the data range (inclusive). BLS allows up to 20 years per request and requires both bounds or neither: supplying start_year alone resolves end_year to the current year, capped at start_year + 19. BLS may reduce this window for unregistered access. Omit both for the BLS three-calendar-year default, subject to series coverage.',
       ),
     end_year: z
       .number()
@@ -185,13 +202,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'When true, request BLS-computed period-over-period calculations. The flag is a single boolean (you cannot select an individual calculation type), but the API returns whichever the survey supports and omits the rest — CPI and PPI return percent change only (the inflation rate), and a survey that supports neither simply returns its observations without calculation fields. Requesting calculations never fails, so it is always safe to set; consult bls_list_surveys (allowsNetChange / allowsPercentChange) only to predict which fields will come back. Monthly-cadence series return each supported change type over 1, 3, 6, and 12-month intervals; other cadences return a subset. A series served from the local observation mirror, when the server runs one, carries no calculation fields; enrichment.calculationsApplied is then false and notice names it.',
+        'When true, request BLS-computed period-over-period net/percent changes. BLS returns supported types and intervals; some surveys omit calculations while preserving observations, while an explicit unsupported-calculations rejection raises calculations_not_supported. Consult bls_list_surveys for support. Monthly series may return 1, 3, 6, and 12-month intervals. Mirror rows carry no calculations. calculationsApplied is false when any data-bearing series returns no calculation values; notice names affected series and available calculations remain intact.',
       ),
     annual_average: z
       .boolean()
       .default(false)
       .describe(
-        'When true, add each year\'s annual-average row to the observations. An annual average is the mean of that year\'s real periods, returned as an extra row named "Annual" with period M13 (monthly series), Q05 (quarterly) or S03 (semiannual) — not an additional month or quarter, so it must be excluded from any sum or average over observations. Defaults to false, which returns real periods only; check available before aggregating. Independent of start_year/end_year. Surveys that publish no annual averages return the same rows either way; enrichment.annualAverageRows reports how many rows were actually added.',
+        'When true, include BLS-computed annual summary rows named "Annual": M13 for monthly series, Q05 for quarterly, S03 for semiannual. These are not universally arithmetic means or additional periods; exclude them from sums or averages over periods. Defaults to false. Independent of year bounds. Surveys without annual summaries return the same rows either way; annualAverageRows reports the count.',
       ),
   }),
 
@@ -204,6 +221,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
             title: z.string().optional().describe('Series name when returned by the API.'),
             area: z.string().optional().describe('Geographic area when returned by the API.'),
             item: z.string().optional().describe('Item/subject when returned by the API.'),
+            measure: z.string().optional().describe('Measurement type and units supplied by BLS.'),
             seasonal: z
               .string()
               .optional()
@@ -233,7 +251,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
             'Canvas table name (df_XXXXX_XXXXX). Pass to bls_dataframe_describe first to inspect column_schema, then use it in bls_dataframe_query SQL.',
           ),
         row_count: z.number().describe('Total rows in the canvas table.'),
-        expires_at: z.string().describe('ISO 8601 expiry timestamp (sliding 24h window).'),
+        expires_at: z
+          .string()
+          .describe(
+            'ISO 8601 per-table expiry, fixed at creation; the enclosing canvas has a separate sliding lifetime.',
+          ),
       })
       .optional()
       .describe(
@@ -245,6 +267,12 @@ export const blsGetSeriesTool = tool('bls_get_series', {
   }),
 
   enrichment: {
+    unprocessedSeriesIds: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Canonical unique SeriesIDs beyond the request cap, in original order. Request these separately.',
+      ),
     totalObservations: z.number().describe('Total observation rows across all requested series.'),
     availableObservations: z.number().describe('Rows with a published numeric value.'),
     unavailableObservations: z
@@ -271,7 +299,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .boolean()
       .optional()
       .describe(
-        'Whether BLS net/percent-change calculations were applied. True when calculations=true reached BLS for every returned series; false when calculations=false, or when the local observation mirror served a series, whose rows carry no calculations — notice then names those series. Absent when calculations was omitted.',
+        'True when calculations were requested and every data-bearing series returned calculation values. False when disabled, no observations returned, or any data-bearing series lacks calculations; notice names affected series. Absent when calculations was omitted.',
       ),
     annualAverageApplied: z
       .boolean()
@@ -290,6 +318,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .describe(
         "Guidance for agents — names any SeriesID that returned zero observations with its reason (including a failed live fallback's reason and recovery for a SeriesID the local observation mirror does not hold), names mirror-served series that lack requested calculations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.",
       ),
+  },
+
+  enrichmentTrailer: {
+    unprocessedSeriesIds: { render: (ids) => ids?.map(escapeMarkdownInline).join(', ') ?? '' },
+    notice: { render: escapeMarkdownInline },
   },
 
   async handler(input, ctx) {
@@ -354,27 +387,45 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     }
 
     const service = getBlsApiService();
+    const canonicalIds = [...new Set(input.series_ids.map((id) => id.trim().toUpperCase()))];
+    const seriesLimit = getServerConfig().apiKey ? 50 : 25;
+    const seriesIds = canonicalIds.slice(0, seriesLimit);
+    const unprocessedSeriesIds = canonicalIds.slice(seriesLimit);
+    if (unprocessedSeriesIds.length > 0) {
+      ctx.enrich({ unprocessedSeriesIds });
+      notices.push(
+        `Requested ${canonicalIds.length} unique series; applied limit ${seriesLimit}. Request the remaining SeriesIDs separately: ${unprocessedSeriesIds.join(', ')}.`,
+      );
+    }
     const fetchOptions: BatchFetchOptions = {
-      seriesIds: input.series_ids,
+      seriesIds,
       annualAverage: input.annual_average,
     };
     if (startYear !== undefined) fetchOptions.startYear = startYear;
     if (endYear !== undefined) fetchOptions.endYear = endYear;
     if (input.calculations !== undefined) fetchOptions.calculations = input.calculations;
-    const allSeries = await service.fetchSeries(fetchOptions, ctx);
+    const fetchedSeries = await service.fetchSeries(fetchOptions, ctx);
+    const allSeries = [...new Map(fetchedSeries.map((s) => [s.seriesId, s])).values()];
+    const liveRequests = allSeries.flatMap((s) => (s.request ? [s.request] : []));
+    for (const advisory of new Set(liveRequests.flatMap((request) => request.advisories)))
+      notices.push(advisory);
+    const appliedEnds = liveRequests.flatMap((request) =>
+      request.endYearApplied === undefined ? [] : [request.endYearApplied],
+    );
+    if (appliedEnds.length > 0)
+      endYear = Math.max(
+        ...appliedEnds,
+        ...(allSeries.some((s) => s.source === 'mirror') && endYear !== undefined ? [endYear] : []),
+      );
 
-    /**
-     * A SeriesID repeated in series_ids keeps one `series[]` entry per requested
-     * position, but it is still one series: counting it per position would
-     * double its observations in every total and write each of its rows to the
-     * canvas table twice.
-     */
+    /** One series contributes its observations once to totals and the dataframe. */
     const uniqueSeries = [...new Map(allSeries.map((s) => [s.seriesId, s])).values()];
 
     // Flatten to rows for canvas registration
     const allRows = flattenToRows(uniqueSeries);
-    const inlineJson = JSON.stringify(allRows);
-    const shouldSpill = inlineJson.length > INLINE_BUDGET_CHARS;
+    const bridge = getCanvasBridge();
+    const shouldSpill =
+      bridge !== undefined && JSON.stringify(allRows).length > INLINE_BUDGET_CHARS;
 
     const totalObservations = allRows.length;
     const unavailableObservations = allRows.filter((row) => row.available === false).length;
@@ -383,16 +434,26 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     const mirrorServedIds = uniqueSeries
       .filter((s) => s.source === 'mirror')
       .map((s) => s.seriesId);
+    const calculationsMissingIds = uniqueSeries
+      .filter(
+        (s) =>
+          s.observations.length > 0 &&
+          !s.observations.some((obs) =>
+            CALC_COLUMNS.some((column) => obs[column.key] !== undefined),
+          ),
+      )
+      .map((s) => s.seriesId);
     ctx.enrich({
       totalObservations,
       availableObservations,
       unavailableObservations,
-      seriesRequested: input.series_ids.length,
+      seriesRequested: seriesIds.length,
       annualAverageApplied: input.annual_average,
       ...(startYear !== undefined && { startYearApplied: startYear }),
       ...(endYear !== undefined && { endYearApplied: endYear }),
       ...(input.calculations !== undefined && {
-        calculationsApplied: input.calculations && mirrorServedIds.length === 0,
+        calculationsApplied:
+          input.calculations && calculationsMissingIds.length === 0 && totalObservations > 0,
       }),
       ...(input.annual_average && { annualAverageRows }),
     });
@@ -405,9 +466,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
      * composed into one string below.
      */
     const byId = new Map(allSeries.map((s) => [s.seriesId, s]));
-    const emptySeriesIds = [...new Set(input.series_ids)].filter(
-      (id) => (byId.get(id)?.observations.length ?? 0) === 0,
-    );
+    const emptySeriesIds = seriesIds.filter((id) => (byId.get(id)?.observations.length ?? 0) === 0);
     if (emptySeriesIds.length > 0) {
       const ranged = startYear !== undefined || endYear !== undefined;
       /**
@@ -429,9 +488,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         notices.push(
           failure?.reason === 'series_not_found'
             ? `BLS reports ${id} is invalid or does not exist. Use bls_search_series to find a valid SeriesID.`
-            : failure?.reason === 'no_data_for_period'
-              ? `BLS returned no data for ${id} over the requested period. Adjust start_year/end_year.`
-              : `No observations returned for ${id}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
+            : failure?.reason === 'series_omitted'
+              ? `BLS omitted ${id} after applying its request limit. Request it separately.`
+              : failure?.reason === 'no_data_for_period'
+                ? `BLS returned no data for ${id} over the requested period. Adjust start_year/end_year.`
+                : `No observations returned for ${id}. Confirm the SeriesID with bls_search_series${ranged ? ', or widen start_year/end_year — the series may not publish over the requested range' : ''}.`,
         );
       }
       if (liveFailure) {
@@ -445,6 +506,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         `calculations=true was not applied to ${mirrorServedIds.join(', ')}: the local observation mirror served ${mirrorServedIds.length === 1 ? 'it' : 'them'}, and mirror rows carry no BLS net or percent changes. Derive period-over-period changes from the observation values.`,
       );
     }
+    const liveMissingCalculations = calculationsMissingIds.filter(
+      (id) => !mirrorServedIds.includes(id),
+    );
+    if (input.calculations && liveMissingCalculations.length > 0)
+      notices.push(
+        `calculations=true returned no calculation values for ${liveMissingCalculations.join(', ')}. Available calculations for other series are preserved.`,
+      );
     if (unavailableObservations > 0) {
       notices.push(
         `${unavailableObservations} of ${totalObservations} rows are unavailable BLS observations. Check available before arithmetic, use value_numeric in DataCanvas SQL, and read each row's footnotes for the reason.`,
@@ -452,13 +520,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     }
     if (input.annual_average && annualAverageRows > 0) {
       notices.push(
-        `${annualAverageRows} of ${totalObservations} observations are annual-average rows (period M13/Q05/S03, named "Annual"): each is the mean of that year's real periods, not an additional one. Exclude them from any sum or average over observations, or via is_annual_average when querying the canvas table.`,
+        `${annualAverageRows} of ${totalObservations} observations are BLS-computed annual summary rows (period M13/Q05/S03, named "Annual"), not additional periods or universally arithmetic means. Exclude them from sums or averages over periods, or via is_annual_average when querying the canvas table.`,
       );
     }
 
-    if (shouldSpill) {
-      const bridge = getCanvasBridge();
-
+    if (shouldSpill && bridge) {
       /**
        * Both spill failures tell the caller to narrow the year range, so both
        * name the range in force — including an `end_year` this handler resolved
@@ -470,20 +536,6 @@ export const blsGetSeriesTool = tool('bls_get_series', {
           ? `${startYear}–${endYear}${input.end_year === undefined ? ', end_year resolved from start_year' : ''}`
           : 'the BLS default window, since neither start_year nor end_year was supplied';
 
-      if (!bridge) {
-        // Data would be silently truncated — surface this as an error so agents
-        // know to narrow the year range rather than treating partial data as complete.
-        throw ctx.fail(
-          'canvas_unavailable',
-          `Result set exceeded the inline budget (${allRows.length} rows across ${uniqueSeries.length} series) over ${appliedWindow}. Canvas is not configured — full data cannot be returned.`,
-          {
-            recovery: {
-              hint: `The applied window was ${appliedWindow}. Narrow start_year/end_year to reduce the result set, or enable canvas by setting CANVAS_PROVIDER_TYPE=duckdb.`,
-            },
-          },
-        );
-      }
-
       // Registration throws if it fails, so a spilled result always has a handle.
       const registered = await bridge.registerDataframe(ctx, {
         rows: allRows,
@@ -491,7 +543,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         sourceTool: 'bls_get_series',
         appliedScope: `The applied window was ${appliedWindow}.`,
         queryParams: {
-          series_ids: input.series_ids,
+          series_ids: seriesIds,
           start_year: startYear,
           end_year: endYear,
           calculations: input.calculations,
@@ -511,6 +563,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         ...(s.title && { title: s.title }),
         ...(s.area && { area: s.area }),
         ...(s.item && { item: s.item }),
+        ...(s.measure && { measure: s.measure }),
         ...(s.seasonal && { seasonal: s.seasonal }),
         observationCount: s.observations.length,
         availableObservationCount: s.observations.filter(observationAvailable).length,
@@ -531,6 +584,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         ...(s.title && { title: s.title }),
         ...(s.area && { area: s.area }),
         ...(s.item && { item: s.item }),
+        ...(s.measure && { measure: s.measure }),
         ...(s.seasonal && { seasonal: s.seasonal }),
         observationCount: s.observations.length,
         availableObservationCount: s.observations.filter(observationAvailable).length,
@@ -553,10 +607,13 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     }
 
     for (const s of result.series) {
-      lines.push(`### ${s.seriesId}${s.title ? ` — ${s.title}` : ''}`);
-      if (s.area) lines.push(`Area: ${s.area}`);
-      if (s.item) lines.push(`Item: ${s.item}`);
-      if (s.seasonal) lines.push(`Seasonality: ${s.seasonal}`);
+      lines.push(
+        `### ${escapeMarkdownInline(s.seriesId)}${s.title ? ` — ${escapeMarkdownInline(s.title)}` : ''}`,
+      );
+      if (s.area) lines.push(`Area: ${escapeMarkdownInline(s.area)}`);
+      if (s.item) lines.push(`Item: ${escapeMarkdownInline(s.item)}`);
+      if (s.measure) lines.push(`Measure: ${escapeMarkdownInline(s.measure)}`);
+      if (s.seasonal) lines.push(`Seasonality: ${escapeMarkdownInline(s.seasonal)}`);
       const availableObservationCount =
         s.availableObservationCount ??
         s.observations.filter((obs) => obs.available ?? obs.value !== '-').length;
@@ -580,7 +637,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
             ...calcs.map((c) => obs[c.key] ?? ''),
             obs.footnotes?.join('; ') ?? '',
           ];
-          lines.push(`| ${cells.join(' | ')} |`);
+          lines.push(`| ${cells.map(escapeMarkdownInline).join(' | ')} |`);
         }
       } else {
         // The notice names every empty SeriesID with its own reason and next step —
@@ -613,6 +670,7 @@ const SPILL_SCHEMA: ColumnSchema[] = [
   spillColumn('series_title', 'VARCHAR'),
   spillColumn('area', 'VARCHAR'),
   spillColumn('item', 'VARCHAR'),
+  spillColumn('measure', 'VARCHAR'),
   spillColumn('seasonal', 'VARCHAR'),
   spillColumn('year', 'VARCHAR'),
   spillColumn('period', 'VARCHAR'),
@@ -649,6 +707,7 @@ function flattenToRows(series: SeriesData[]): Record<string, unknown>[] {
         series_title: s.title ?? null,
         area: s.area ?? null,
         item: s.item ?? null,
+        measure: s.measure ?? null,
         seasonal: s.seasonal ?? null,
         year: obs.year,
         period: obs.period,

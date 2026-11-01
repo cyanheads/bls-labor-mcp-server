@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/bls-labor-mcp-server</h1>
   <p><b>Fetch US Bureau of Labor Statistics data — CPI, unemployment, wages, JOLTS, and more via MCP. STDIO or Streamable HTTP.</b>
-  <div>4 Tools by default · 6 with DataCanvas · 7 with opt-in drop</div>
+  <div>6 Tools by default · 7 with opt-in drop</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.6.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.6.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/bls-labor-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/bls-labor-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/bls-labor-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -39,22 +39,22 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 | `bls_search_series` | Search the BLS series catalog by natural language, survey, area, or keywords to resolve cryptic SeriesIDs. |
 | `bls_get_series` | Fetch time-series data for 1–50 BLS series by SeriesID, with optional year range and period-over-period calculations. |
 | `bls_get_latest` | Return the single most recent observation for one or more BLS series. |
-| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` or `bls_dataframe_query` — provenance, TTL, row count, column schema. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
-| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series` or an earlier `register_as`. Supports JOINs, aggregates, window functions, CTEs. Available when `CANVAS_PROVIDER_TYPE=duckdb`. |
-| `bls_dataframe_drop` | Drop a canvas dataframe by name. Available when `CANVAS_PROVIDER_TYPE=duckdb` and `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default. |
+| `bls_dataframe_describe` | List canvas dataframes registered by `bls_get_series` or `bls_dataframe_query` — provenance, TTL, row count, column schema. Unavailable when `CANVAS_PROVIDER_TYPE=none`. |
+| `bls_dataframe_query` | Run a SELECT against canvas dataframes registered by `bls_get_series` or an earlier `register_as`. Supports JOINs, aggregates, window functions, CTEs. Unavailable when `CANVAS_PROVIDER_TYPE=none`. |
+| `bls_dataframe_drop` | Drop a canvas dataframe by name. Available when `BLS_DATAFRAME_DROP_ENABLED=true`, unless `CANVAS_PROVIDER_TYPE=none`; TTL handles cleanup by default. |
 
 ## Capability reference
 
 ### `bls_list_surveys` <sub>tool</sub>
 
 - Optional `category` filters survey programs by subject; returns codes, names, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`).
-- Backed by the BLS surveys API with monthly caching. Annual-average support is advisory; read `bls_get_series`'s `annualAverageRows` for the rows actually returned.
+- Backed by the BLS surveys API with 30-day process-local caching. Annual-average support is advisory; read `bls_get_series`'s `annualAverageRows` for the rows actually returned.
 
 ---
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` is 1–50 (default 10), with `offset` pagination. Without an area filter, place names prefer matching decoded areas; national series win equal-score ties within each preference group. Exact SeriesIDs rank first.
+- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` defaults to 10 and requests above 50 clamp to 50 with notice, with `offset` pagination. Without an area filter, place names prefer matching decoded areas; national series win equal-score ties within each preference group. Exact SeriesIDs rank first.
 - Returns decoded SeriesIDs, titles, `frequency`, and independently optional `startYear`, `endYear`, and `endPeriod` coverage (for example, `1982–2005 Q04`). Coverage describes the catalog snapshot, not continuous observations. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
 - Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Unindexed surveys remain fetchable by SeriesID.
 
@@ -62,37 +62,38 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 
 ### `bls_get_series` <sub>tool</sub>
 
-- Fetch 1–50 SeriesIDs per call, with a `start_year`/`end_year` window of up to 20 years, optional `calculations`, and `annual_average`. A start alone resolves the end to the current year capped at start + 19; an end alone is rejected. One batch consumes one API query; calculations depend on survey support (CPI/PPI return percent change only).
-- Returns observations with `available`, preserves the raw `-` missing-value sentinel, and keeps valid series in mixed batches. Enrichment reports the applied year window, calculations, and annual-average rows.
-- Large results spill to `dataset.name` when `CANVAS_PROVIDER_TYPE=duckdb`; otherwise `canvas_unavailable` asks for a narrower window.
+- Fetch up to 25 SeriesIDs without an API key or 50 with one per call, with a `start_year`/`end_year` window of up to 20 years, optional `calculations`, and `annual_average`. A start alone resolves the end to the current year capped at start + 19; an end alone is rejected. One batch consumes one API query; calculations depend on survey support (CPI/PPI return percent change only).
+- Returns local-catalog titles when available and optional BLS `measure` metadata, and observations with `available`; preserves the raw `-` missing-value sentinel, and keeps valid series in mixed batches. Enrichment reports the applied year window, calculations actually returned, annual-summary rows, and any upstream reductions or advisories.
+- SeriesIDs are trimmed, uppercased, and deduplicated before the cap; `unprocessedSeriesIds` lists the exact ordered remainder without automatic extra batches. Omitted year bounds use BLS's three-calendar-year default, subject to coverage.
+- Large results spill to `dataset.name`. With `CANVAS_PROVIDER_TYPE=none`, all fetched observations return inline.
 
 ---
 
 ### `bls_get_latest` <sub>tool</sub>
 
-- Fetch the latest observation for up to 50 SeriesIDs (recommended ≤10). Each ID consumes one API query; use `bls_get_series` for a more efficient multi-series batch.
+- Fetch the latest observation for up to 50 SeriesIDs (recommended ≤10). IDs are trimmed, uppercased, and deduplicated before the cap; `unprocessedSeriesIds` lists the exact ordered remainder. Each processed ID consumes one API query; use `bls_get_series` for a more efficient multi-series batch.
 - Returns successful `results[]` beside per-series `failed[]` entries. `latestObservation.available` distinguishes a published value from BLS's missing-value sentinel.
 
 ---
 
 ### `bls_dataframe_describe` <sub>tool</sub>
 
-- Optional `name` describes one registered dataframe; omit it to list active dataframes for the tenant. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
-- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) report as `VARCHAR`. Expired entries are removed when their canvas drop succeeds.
+- Optional `name` describes one registered dataframe; omit it to list active dataframes for the tenant. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
+- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`, fixed at table creation), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) report as `VARCHAR`. Expired entries are removed when their canvas drop succeeds.
 
 ---
 
 ### `bls_dataframe_query` <sub>tool</sub>
 
-- Run one SELECT against registered tables, with JOINs, aggregates, window functions, or CTEs. `row_limit` defaults to 1000 and caps at 10000; writes, external-file reads, and system catalogs are denied.
-- Engine settings (`current_setting`, `current_schema`, `current_schemas`, `in_search_path`) and `query_table` are denied. `query()` accepts one plain SQL string literal, checked recursively up to four levels; computed SQL strings are rejected. Reference staged tables directly for analysis.
-- Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis; requires `CANVAS_PROVIDER_TYPE=duckdb`.
+- Run one SELECT against registered tables, with JOINs, aggregates, window functions, or CTEs. `row_limit` defaults to 1000; larger values clamp to 10000, and `preview` clamps to the applied row limit with requested/applied notices. Zero preview remains valid; writes, external-file reads, and system catalogs are denied.
+- Engine-setting functions (`current_setting`, `current_schema`, `current_schemas`, `in_search_path`) and `query_table` are denied. Unqualified `current_schema` keyword or column references are also denied; qualify a real column with its table alias (for example, `t.current_schema`). `query()` accepts one plain SQL string literal, checked recursively up to four levels; computed SQL strings are rejected. Reference staged tables directly for analysis.
+- Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
 
 ---
 
 ### `bls_dataframe_drop` <sub>tool</sub>
 
-- Required `name` identifies the dataframe to drop. Available only with `CANVAS_PROVIDER_TYPE=duckdb` and `BLS_DATAFRAME_DROP_ENABLED=true`; TTL handles cleanup by default.
+- Required `name` identifies the dataframe to drop. Available only with `BLS_DATAFRAME_DROP_ENABLED=true`, and never with `CANVAS_PROVIDER_TYPE=none`; TTL handles cleanup by default.
 - Returns `dropped: false` for a missing table. A failed drop returns retryable `canvas_drop_failed` and leaves the dataframe registered.
 
 ## Features
@@ -105,7 +106,7 @@ BLS-specific:
 - Offline series catalog search against LABSTAT flat files, indexed as an on-disk SQLite/FTS5 store — zero API quota for discovery; the OES/OEWS wage survey (~6M series) is opt-in via `BLS_CATALOG_INCLUDE_OES`
 - Typed error contracts for BLS-specific failure modes — quota exhaustion, locked database, calculations not supported
 - Period-over-period net/percent-change calculations via BLS's own server-side flag, consistent with BLS's published numbers
-- Optional DataCanvas spillover (DuckDB) for large multi-series result sets — schema discovery and SQL access without re-querying the API
+- DataCanvas spillover (DuckDB, on by default) for large multi-series result sets — schema discovery and SQL access without re-querying the API
 
 Agent-friendly output:
 
@@ -239,7 +240,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `BLS_OBSERVATIONS_MIRROR_ENABLED` | Serve observations from a local SQLite mirror instead of the live API (requires a one-time bootstrap — see below). | `false` |
 | `BLS_DATASET_TTL_SECONDS` | Per-dataframe TTL for canvas-registered tables, in seconds. | `86400` (24 h) |
 | `BLS_DATAFRAME_DROP_ENABLED` | Expose `bls_dataframe_drop`. TTL handles cleanup by default. | `false` |
-| `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas tabular spillover for large result sets. | `none` |
+| `CANVAS_PROVIDER_TYPE` | DataCanvas provider for tabular spillover of large result sets and the dataframe tools. Set to `none` to disable them. The Claude Desktop bundle ships without DuckDB and pins `none`. | `duckdb` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_SESSION_MODE` | Session mode. This server uses `stateless`; valid schema values are `auto`, `stateful`, and `stateless`. Schema-default `auto` resolves to `stateful`. | `stateless` |
@@ -256,18 +257,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Observation mirror (optional)
 
-For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls_get_latest` from an embedded SQLite store instead of the BLS API — eliminating the 500/day quota cap. It is off by default. To enable:
-
-1. Set `BLS_OBSERVATIONS_MIRROR_ENABLED=true` (and review the `BLS_OBSERVATIONS_MIRROR_*` vars in [`.env.example`](./.env.example)).
-2. Run the one-time bootstrap out-of-band — it downloads the full LABSTAT observation set and can take a while:
-
-   ```sh
-   node dist/services/bls-observations/subprocess.js --init
-   ```
-
-The mirror harvests every survey in the catalog's survey list — OE included, whatever `BLS_CATALOG_INCLUDE_OES` says — so it covers CM and CI too (about 55 MB of `cm.data.*` / `ci.data.*` files). An incremental refresh reads only files published after the mirror's last one, so a mirror bootstrapped before CM and CI joined picks each file up at its next BLS publication; until then those series come from the live API when fallback is on. Until the bootstrap completes, requests fall back to the live API (unless `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`). When a live fallback fails — quota exhausted, BLS unreachable — the series the mirror served are still returned, and `enrichment.notice` names each unserved SeriesID with the failure's reason and recovery. Mirror rows carry no BLS calculations: with `calculations: true`, a mirror-served series comes back without calculation fields, `enrichment.calculationsApplied` is `false`, and the notice names it. On HTTP transport, an incremental refresh runs on the `BLS_OBSERVATIONS_MIRROR_REFRESH_CRON` schedule. In containers, mount a persistent volume at `BLS_OBSERVATIONS_MIRROR_PATH`.
-
-**Upgrading an existing mirror.** A mirror bootstrapped before sentinel rows were stored is missing the periods BLS publishes with its `-` missing-value marker. Opening such a mirror clears its sync checkpoint once, so the next refresh re-reads every LABSTAT file and fills them in — no operator action beyond letting that refresh run, and it takes as long as a full read. The mirror keeps serving throughout.
+For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls_get_latest` from an embedded SQLite store of the LABSTAT files instead of the BLS API, removing the 500/day quota cap; requests fall back to the live API until it is built. Enable it with `BLS_OBSERVATIONS_MIRROR_ENABLED=true`, then run the one-time bootstrap: `node dist/services/bls-observations/subprocess.js --init`. Settings, survey coverage, fallback and calculation behavior, and upgrade notes are in [docs/observation-mirror.md](./docs/observation-mirror.md).
 
 ## Running the server
 
@@ -315,6 +305,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/bls-periods` | Annual-average period semantics (`M13`/`Q05`/`S03`) shared by the API and mirror paths. |
 | `src/services/canvas-bridge` | DataCanvas bridge — dataframe registration, SQL gate, lifecycle management. |
 | `docs/design.md` | Full tool surface specification, service architecture, and error contracts. |
+| `docs/observation-mirror.md` | Observation mirror setup, coverage, and upgrade notes. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide

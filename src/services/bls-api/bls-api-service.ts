@@ -35,6 +35,7 @@ import {
   notFound,
   serializationError,
   serviceUnavailable,
+  timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
@@ -57,6 +58,9 @@ import type {
 
 /** In-memory survey cache TTL — 30 days. */
 const SURVEY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Leaves 15s of headroom for clients with a 60s request timeout, including reissue. */
+const LIVE_OPERATION_BUDGET_MS = 45_000;
 
 /** Stands in for the configured API key wherever BLS echoes it back to us. */
 const REDACTED_API_KEY = '[REDACTED]';
@@ -232,7 +236,7 @@ type SeriesAdvisory = NonNullable<SeriesData['failure']>;
 export interface BatchFetchOptions {
   /**
    * Request BLS's annual-average rows (period M13/Q05/S03) alongside the real
-   * periods. Off unless asked: the rows are a year's mean, not an extra period,
+   * periods. Off unless asked: the rows are BLS-computed annual summaries, not extra periods,
    * so a caller reducing `observations` would double-count each year.
    */
   annualAverage?: boolean;
@@ -346,9 +350,9 @@ export class BlsApiService {
   /** Live API batch fetch — one `POST /timeseries/data`, re-issued once on the generic rejection. */
   private fetchSeriesLive(options: BatchFetchOptions, ctx: Context): Promise<SeriesData[]> {
     return this.withCatalogReissue(
-      (catalog) =>
-        withRetry(
-          async () => {
+      (catalog, deadlineAt) =>
+        this.withLiveRetry(
+          async (signal) => {
             const body: Record<string, unknown> = {
               seriesid: options.seriesIds,
               registrationkey: this.apiKey,
@@ -359,20 +363,21 @@ export class BlsApiService {
             if (options.calculations) body.calculations = true;
             if (options.annualAverage) body.annualaverage = true;
 
-            const response = await fetch(`${this.baseUrl}/timeseries/data`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'User-Agent': this.userAgent },
-              body: JSON.stringify(body),
-              signal: ctx.signal,
-            });
+            const text = await this.requestText(
+              `${this.baseUrl}/timeseries/data`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'User-Agent': this.userAgent },
+                body: JSON.stringify(body),
+              },
+              signal,
+              ctx,
+            );
 
-            return this.parseSeriesResponse(await response.text(), options, ctx);
+            return this.parseSeriesResponse(text, options, ctx);
           },
-          {
-            operation: 'BlsApiService.fetchSeries',
-            baseDelayMs: 1500,
-            signal: ctx.signal,
-          },
+          ctx,
+          deadlineAt,
         ),
       ctx,
     );
@@ -395,18 +400,24 @@ export class BlsApiService {
    * re-issue rejects at `fetch` without being sent.
    */
   private async withCatalogReissue(
-    send: (catalog: boolean) => Promise<SeriesData[]>,
+    send: (catalog: boolean, deadlineAt: number) => Promise<SeriesData[]>,
     ctx: Context,
   ): Promise<SeriesData[]> {
+    const deadlineAt = Date.now() + LIVE_OPERATION_BUDGET_MS;
+    let series: SeriesData[];
     try {
-      return await send(true);
+      series = await send(true, deadlineAt);
     } catch (error) {
+      ctx.signal.throwIfAborted();
       if (!(error instanceof McpError && error.data?.reason === 'request_rejected')) throw error;
       ctx.log.notice('BLS rejected a request carrying catalog metadata; re-issuing it without');
-      const series = await send(false);
-      const metadata = await lookupCatalogMetadata(series.map((s) => s.seriesId));
-      return series.map((s) => ({ ...s, ...catalogFields(metadata.get(s.seriesId)) }));
+      series = await send(false, deadlineAt);
     }
+    const metadata = await lookupCatalogMetadata(series.map((s) => s.seriesId));
+    return series.map((s) => {
+      const fields = catalogFields(metadata.get(s.seriesId));
+      return { ...fields, ...s, ...(fields.title && { title: fields.title }) };
+    });
   }
 
   /** Fetch the single most recent observation for one series. */
@@ -449,21 +460,22 @@ export class BlsApiService {
 
     // ── Live API path (default / fallback) ──────────────────────────────────
     const series = await this.withCatalogReissue(
-      (catalog) =>
-        withRetry(
-          async () => {
+      (catalog, deadlineAt) =>
+        this.withLiveRetry(
+          async (signal) => {
             const url = `${this.baseUrl}/timeseries/data/${encodeURIComponent(seriesId)}?latest=true${catalog ? '&catalog=true' : ''}&registrationkey=${this.apiKey}`;
-            const response = await fetch(url, {
-              headers: { 'User-Agent': this.userAgent },
-              signal: ctx.signal,
-            });
-            return this.parseSeriesResponse(await response.text(), { seriesIds: [seriesId] }, ctx);
+            const text = await this.requestText(
+              url,
+              {
+                headers: { 'User-Agent': this.userAgent },
+              },
+              signal,
+              ctx,
+            );
+            return this.parseSeriesResponse(text, { seriesIds: [seriesId] }, ctx);
           },
-          {
-            operation: 'BlsApiService.fetchLatest',
-            baseDelayMs: 1500,
-            signal: ctx.signal,
-          },
+          ctx,
+          deadlineAt,
         ),
       ctx,
     );
@@ -530,18 +542,25 @@ export class BlsApiService {
       return this.surveyCache.surveys;
     }
 
-    const surveys = await withRetry(
-      async () => {
+    const surveys = await this.withLiveRetry(
+      async (signal) => {
         const url = `${this.baseUrl}/surveys?registrationkey=${this.apiKey}`;
-        const response = await fetch(url, {
-          headers: { 'User-Agent': this.userAgent },
-          signal: ctx.signal,
-        });
-        const text = await response.text();
+        const text = await this.requestText(
+          url,
+          {
+            headers: { 'User-Agent': this.userAgent },
+          },
+          signal,
+          ctx,
+        );
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
             'BLS surveys API returned HTML instead of JSON — likely rate-limited.',
-            { reason: 'service_unavailable', ...ctx.recoveryFor('service_unavailable') },
+            {
+              reason: 'service_unavailable',
+              retryable: true,
+              ...ctx.recoveryFor('service_unavailable'),
+            },
           );
         }
         let parsed: BlsSurveysResponse;
@@ -550,7 +569,11 @@ export class BlsApiService {
         } catch (e: unknown) {
           throw serializationError(
             'Failed to parse BLS surveys response as JSON',
-            { reason: 'serialization_failure', ...ctx.recoveryFor('serialization_failure') },
+            {
+              reason: 'serialization_failure',
+              retryable: false,
+              ...ctx.recoveryFor('serialization_failure'),
+            },
             { cause: e },
           );
         }
@@ -584,15 +607,95 @@ export class BlsApiService {
           };
         });
       },
-      {
-        operation: 'BlsApiService.listSurveys',
-        baseDelayMs: 1500,
-        signal: ctx.signal,
-      },
+      ctx,
+      Date.now() + LIVE_OPERATION_BUDGET_MS,
     );
 
     this.surveyCache = { surveys, cachedAt: Date.now() };
     return surveys;
+  }
+
+  /** One deadline spans the retry ladder and any catalog-less reissue. */
+  private async withLiveRetry<T>(
+    send: (signal: AbortSignal) => Promise<T>,
+    ctx: Context,
+    deadlineAt: number,
+  ): Promise<T> {
+    try {
+      return await withRetry(
+        ({ signal }) => {
+          ctx.signal.throwIfAborted();
+          if (Date.now() >= deadlineAt) throw this.upstreamTimeout(ctx);
+          return send(signal);
+        },
+        {
+          operation: 'BLS API request',
+          baseDelayMs: 1500,
+          signal: ctx.signal,
+          deadlineMs: Math.max(0, deadlineAt - Date.now()),
+        },
+      );
+    } catch (error) {
+      ctx.signal.throwIfAborted();
+      if (error instanceof McpError && error.data?.reason === 'retry_deadline_exceeded') {
+        throw this.upstreamTimeout(ctx, error);
+      }
+      throw error;
+    }
+  }
+
+  private upstreamTimeout(ctx: Context, cause?: unknown): McpError {
+    const lastFailure = cause instanceof McpError ? cause.cause : undefined;
+    const status = lastFailure instanceof McpError ? lastFailure.data?.status : undefined;
+    return timeout(
+      'BLS API request exceeded its 45-second operation budget.',
+      {
+        reason: 'upstream_timeout',
+        retryable: true,
+        ...(typeof status === 'number' && { status }),
+        ...ctx.recoveryFor('upstream_timeout'),
+      },
+      { cause },
+    );
+  }
+
+  /** Check status before payload parsing; only transport/body I/O errors are normalized. */
+  private async requestText(
+    url: string,
+    init: RequestInit,
+    signal: AbortSignal,
+    ctx: Context,
+  ): Promise<string> {
+    const controller = new AbortController();
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.any([signal, controller.signal]),
+      });
+      if (!response.ok) {
+        throw serviceUnavailable(`BLS API returned HTTP ${response.status}.`, {
+          reason: 'service_unavailable',
+          status: response.status,
+          retryable: [408, 429, 500, 502, 503, 504].includes(response.status),
+          ...ctx.recoveryFor('service_unavailable'),
+        });
+      }
+      return await response.text();
+    } catch (error) {
+      ctx.signal.throwIfAborted();
+      if (signal.aborted || error instanceof McpError) throw error;
+      throw serviceUnavailable(
+        'BLS API could not complete the upstream request.',
+        {
+          reason: 'service_unavailable',
+          retryable: true,
+          ...ctx.recoveryFor('service_unavailable'),
+        },
+        { cause: error },
+      );
+    } finally {
+      controller.abort();
+    }
   }
 
   /**
@@ -632,12 +735,17 @@ export class BlsApiService {
 
   private parseSeriesResponse(
     text: string,
-    options: Pick<BatchFetchOptions, 'seriesIds'>,
+    options: BatchFetchOptions,
     ctx: Context,
   ): SeriesData[] {
     if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
       throw serviceUnavailable(
         'BLS API returned HTML instead of JSON — likely rate-limited or temporarily unavailable.',
+        {
+          reason: 'service_unavailable',
+          retryable: true,
+          ...ctx.recoveryFor('service_unavailable'),
+        },
       );
     }
 
@@ -645,7 +753,15 @@ export class BlsApiService {
     try {
       parsed = JSON.parse(text) as BlsApiResponse;
     } catch (e: unknown) {
-      throw serializationError('Failed to parse BLS API response as JSON', {}, { cause: e });
+      throw serializationError(
+        'Failed to parse BLS API response as JSON',
+        {
+          reason: 'serialization_failure',
+          retryable: false,
+          ...ctx.recoveryFor('serialization_failure'),
+        },
+        { cause: e },
+      );
     }
 
     // Check for known BLS error messages
@@ -717,12 +833,49 @@ export class BlsApiService {
     }
 
     const byId = new Map((parsed.Results?.series ?? []).map((raw) => [raw.seriesID, raw]));
+    const failureMessages = new Set(
+      [...failures.values()].flat().map((failure) => failure.message),
+    );
+    const advisories = messages.filter((message) => !failureMessages.has(message));
+    const reduction = messages
+      .map((message) =>
+        /Year range has been reduced to the system-allowed limit of (\d+) years/i.exec(message),
+      )
+      .find((match) => match !== null);
+    const request = {
+      advisories,
+      ...(options.startYear !== undefined && { startYearApplied: options.startYear }),
+      ...(options.endYear !== undefined && {
+        endYearApplied:
+          reduction && options.startYear !== undefined
+            ? Math.min(options.endYear, options.startYear + Number(reduction[1]) - 1)
+            : options.endYear,
+      }),
+    };
+    const capped = messages.some((message) =>
+      message.toLowerCase().includes('requested series list has been reduced'),
+    );
     const series = options.seriesIds.flatMap((seriesId): SeriesData[] => {
       const raw = byId.get(seriesId);
       // The entry reports the class of the failure, which every advisory for one
       // SeriesID shares; the full set shapes the request-level error instead.
       const failure = failures.get(seriesId)?.[0];
-      if (!raw) return failure ? [{ seriesId, observations: [], failure }] : [];
+      if (!raw)
+        return failure
+          ? [{ seriesId, observations: [], failure, request }]
+          : capped
+            ? [
+                {
+                  seriesId,
+                  observations: [],
+                  request,
+                  failure: {
+                    reason: 'series_omitted',
+                    message: 'BLS omitted this series after applying its request limit.',
+                  },
+                },
+              ]
+            : [];
       const cat = raw.catalog;
       return [
         {
@@ -731,6 +884,8 @@ export class BlsApiService {
           ...(cat?.area && { area: cat.area }),
           ...(cat?.item && { item: cat.item }),
           ...(cat?.seasonality && { seasonal: cat.seasonality }),
+          ...(cat?.measure_data_type && { measure: cat.measure_data_type }),
+          ...(advisories.length > 0 && { request }),
           observations: raw.data.map((obs) => this.normalizeObs(obs)),
           ...(failure && { failure }),
         },

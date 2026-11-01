@@ -24,6 +24,7 @@ export interface RawSeries {
     area?: string;
     item?: string;
     series_id?: string;
+    measure_data_type?: string;
   };
   data: RawObservation[];
   seriesID: string;
@@ -69,7 +70,7 @@ export interface SeriesData {
   /** Per-series advisory attached to a successful mixed batch. */
   failure?: {
     message: string;
-    reason: 'no_data_for_period' | 'series_not_found';
+    reason: 'no_data_for_period' | 'series_not_found' | 'series_omitted';
   };
   item?: string;
   /**
@@ -84,7 +85,10 @@ export interface SeriesData {
     reason?: string;
     recovery?: string;
   };
+  measure?: string;
   observations: Observation[];
+  /** Effective live request settings; sparse observations alone never change these. */
+  request?: { advisories: string[]; startYearApplied?: number; endYearApplied?: number };
   seasonal?: string;
   seriesId: string;
   /** `'mirror'` when the local observation mirror served the series; its rows carry no BLS calculations. */

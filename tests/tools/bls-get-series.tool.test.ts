@@ -61,6 +61,40 @@ function bulkySeries(seriesId = 'LNS14000000'): SeriesData {
 }
 
 describe('blsGetSeriesTool', () => {
+  it('normalizes IDs before retrieval and preserves full oversized inline results without canvas', async () => {
+    fetchSeriesMock.mockResolvedValue([bulkySeries()]);
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: [' lns14000000 ', 'LNS14000000'] },
+      { context: { errors: blsGetSeriesTool.errors } },
+    );
+    expect(fetchSeriesMock.mock.calls.at(-1)?.[0].seriesIds).toEqual(['LNS14000000']);
+    expect(result.structuredContent).toMatchObject({
+      spilled: false,
+      seriesRequested: 1,
+      series: [
+        {
+          observationCount: 900,
+          observations: expect.arrayContaining([
+            {
+              year: '2074',
+              period: 'M12',
+              periodName: 'December',
+              value: '4.9',
+              available: true,
+              footnotes: ['P: Preliminary figure subject to revision in a later release'],
+            },
+          ]),
+        },
+      ],
+    });
+    expect(
+      result.content
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n'),
+    ).toContain('2074');
+  });
   beforeEach(() => {
     canvasBridge = undefined;
     registerDataframeMock.mockReset();
@@ -277,7 +311,7 @@ describe('blsGetSeriesTool', () => {
     expect(enriched.seriesRequested).toBe(2);
     expect(enriched.startYearApplied).toBe(2020);
     expect(enriched.endYearApplied).toBe(2024);
-    expect(enriched.calculationsApplied).toBe(true);
+    expect(enriched.calculationsApplied).toBe(false);
   });
 
   it('throws on service error (quota_exceeded)', async () => {
@@ -546,9 +580,9 @@ describe('blsGetSeriesTool', () => {
     expect(() => blsGetSeriesTool.input.parse({ series_ids: [] })).toThrow();
   });
 
-  it('rejects series_ids array with more than 50 entries', () => {
+  it('accepts above-cap inputs for explicit remainder reporting', () => {
     const ids = Array.from({ length: 51 }, (_, i) => `LNS${String(i).padStart(8, '0')}`);
-    expect(() => blsGetSeriesTool.input.parse({ series_ids: ids })).toThrow();
+    expect(blsGetSeriesTool.input.parse({ series_ids: ids }).series_ids).toHaveLength(51);
   });
 
   it('passes quota_exceeded error from service through unchanged', async () => {
@@ -752,16 +786,16 @@ describe('blsGetSeriesTool', () => {
     expect(text).not.toContain('bls_search_series');
   });
 
-  it('throws canvas_unavailable when the result spills and canvas is not configured', async () => {
+  it('returns all observations inline when canvas is not configured', async () => {
     fetchSeriesMock.mockResolvedValue([bulkySeries()]);
     canvasBridge = undefined;
 
     const ctx = createMockContext({ errors: blsGetSeriesTool.errors });
     const input = blsGetSeriesTool.input.parse({ series_ids: ['LNS14000000'] });
 
-    await expect(blsGetSeriesTool.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'canvas_unavailable' },
-    });
+    const result = await blsGetSeriesTool.handler(input, ctx);
+    expect(result.spilled).toBe(false);
+    expect(result.series[0]!.observations).toHaveLength(900);
   });
 
   it('returns a dataset handle when the result spills and registration succeeds', async () => {
@@ -991,7 +1025,6 @@ describe('blsGetSeriesTool — a repeated SeriesID is one series', () => {
       series: [
         { seriesId: 'LNS14000000', observationCount: 2 },
         { seriesId: 'CES0000000001', observationCount: 1 },
-        { seriesId: 'LNS14000000', observationCount: 2 },
       ],
       totalObservations: 3,
       availableObservations: 3,
@@ -1031,8 +1064,14 @@ describe('blsGetSeriesTool — a repeated SeriesID is one series', () => {
 
 describe('blsGetSeriesTool — spill failures name the applied window (#79)', () => {
   beforeEach(() => {
-    canvasBridge = undefined;
+    canvasBridge = { registerDataframe: registerDataframeMock };
     registerDataframeMock.mockReset();
+    registerDataframeMock.mockImplementation((_ctx, options) => {
+      throw serviceUnavailable(`Registration failed. ${options.appliedScope}`, {
+        reason: 'canvas_registration_failed',
+        recovery: { hint: options.appliedScope },
+      });
+    });
     fetchSeriesMock.mockReset();
     fetchSeriesMock.mockResolvedValue([bulkySeries()]);
   });
@@ -1050,7 +1089,7 @@ describe('blsGetSeriesTool — spill failures name the applied window (#79)', ()
       error: {
         message: expect.stringContaining('2000–2019'),
         data: {
-          reason: 'canvas_unavailable',
+          reason: 'canvas_registration_failed',
           recovery: { hint: expect.stringContaining('2000–2019') },
         },
       },
@@ -1210,7 +1249,8 @@ describe('blsGetSeriesTool — annual averages (#53)', () => {
     expect(enriched.annualAverageRows).toBe(2);
     expect(enriched.totalObservations).toBe(4);
     expect(enriched.notice).toContain('M13');
-    expect(enriched.notice).toMatch(/mean of that year/i);
+    expect(enriched.notice).toContain('BLS-computed annual summary rows');
+    expect(enriched.notice).toContain('not additional periods or universally arithmetic means');
   });
 
   it('counts Q05 and S03 rows, not just M13', async () => {

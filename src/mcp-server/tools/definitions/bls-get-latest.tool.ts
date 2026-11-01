@@ -8,6 +8,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
 /**
@@ -19,7 +20,14 @@ import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
  * served by the observations mirror, or by a live leg that finished before the
  * quota ran out — those are kept, and the notice names the reason instead.
  */
-const REQUEST_LEVEL_REASONS = new Set(['invalid_api_key', 'quota_exceeded', 'series_locked']);
+const REQUEST_LEVEL_REASONS = new Set([
+  'invalid_api_key',
+  'quota_exceeded',
+  'series_locked',
+  'service_unavailable',
+  'serialization_failure',
+  'upstream_timeout',
+]);
 
 const ObservationSchema = z.object({
   year: z.string().describe('Observation year (e.g. "2024").'),
@@ -39,10 +47,33 @@ const ObservationSchema = z.object({
 export const blsGetLatestTool = tool('bls_get_latest', {
   title: 'Get Latest BLS Observation',
   description:
-    'Return the single most recent observation for one or more BLS series. Use for "what is X right now" questions — the current unemployment rate, the latest CPI reading, etc. Each series consumes one API query against the 500/day limit; for the current value of many series, bls_get_series with a 1-year window is more quota-efficient (one query for up to 50 series). Recommended limit: 10 series; maximum: 50.',
+    'Return the single most recent observation for BLS series. SeriesIDs are trimmed, uppercased, and deduplicated in first-occurrence order. Processes the first 50 unique IDs and returns the exact remainder as unprocessedSeriesIds for a separate request. Each processed series costs one API query; bls_get_series with a 1-year window uses one query for a batch. Recommended limit: 10 series.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
+    {
+      reason: 'service_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'BLS is unreachable or returns an unsuccessful HTTP response, and no requested series returned an observation.',
+      thrownBy: 'service',
+      recovery: 'Check BLS API availability and network access before retrying.',
+    },
+    {
+      reason: 'serialization_failure',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'BLS returns malformed JSON, and no requested series returned an observation.',
+      retryable: false,
+      thrownBy: 'service',
+      recovery: 'BLS returned an invalid response. Retry later; report persistent failures.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'The live BLS request exceeds its shared 45-second operation budget, and no requested series returned an observation.',
+      retryable: true,
+      thrownBy: 'service',
+      recovery: 'BLS did not respond within the operation budget. Retry after a short delay.',
+    },
     {
       reason: 'invalid_api_key',
       code: JsonRpcErrorCode.ConfigurationError,
@@ -72,11 +103,10 @@ export const blsGetLatestTool = tool('bls_get_latest', {
 
   input: z.object({
     series_ids: z
-      .array(z.string().min(1))
+      .array(z.string().trim().min(1))
       .min(1)
-      .max(50)
       .describe(
-        'One or more BLS SeriesIDs (1–50). Each consumes one daily API query. Use bls_search_series to resolve concepts to SeriesIDs. Recommended: ≤10 series.',
+        'BLS SeriesIDs, trimmed, uppercased, and deduplicated in first-occurrence order. Processes the first 50 unique IDs; unprocessedSeriesIds names the exact remainder. Each processed ID consumes one daily API query. Recommended: ≤10 series.',
       ),
   }),
 
@@ -86,13 +116,14 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         z
           .object({
             seriesId: z.string().describe('BLS SeriesID.'),
-            title: z.string().optional().describe('Series name when returned by the API.'),
-            area: z.string().optional().describe('Geographic area when returned by the API.'),
-            item: z.string().optional().describe('Item/subject when returned by the API.'),
+            title: z.string().optional().describe('Series name from BLS or the catalog index.'),
+            area: z.string().optional().describe('Geographic area from BLS or the catalog index.'),
+            item: z.string().optional().describe('Item/subject from BLS or the catalog index.'),
+            measure: z.string().optional().describe('Measurement type and units supplied by BLS.'),
             seasonal: z
               .string()
               .optional()
-              .describe('Seasonality indicator when returned by the API.'),
+              .describe('Seasonality indicator from BLS or the catalog index.'),
             latestObservation: ObservationSchema.optional().describe('Most recent observation.'),
           })
           .describe('Latest observation result for one BLS series.'),
@@ -109,7 +140,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
             error: z
               .string()
               .describe(
-                'Error message. Common values: "Series does not exist" or "Invalid Series" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data). The generic "Your request has failed. Please check your input parameters, and try your request again." means BLS rejected the request itself twice, the second time without catalog metadata, rather than naming the SeriesID. A quota, API-key, or database-lock failure lands here only when another series returned an observation; notice then names its reason and recovery.',
+                'Error message. Common values: "Series does not exist" or "Invalid Series" (invalid SeriesID — use bls_search_series to find valid IDs), "No observations returned" (series exists but has no current data). The generic "Your request has failed. Please check your input parameters, and try your request again." means BLS rejected the request itself twice, the second time without catalog metadata, rather than naming the SeriesID. A quota, API-key, database-lock, availability, malformed-response, or timeout failure lands here only when another series returned an observation; notice then names its reason and recovery.',
               ),
           })
           .describe(
@@ -122,22 +153,37 @@ export const blsGetLatestTool = tool('bls_get_latest', {
   }),
 
   enrichment: {
+    unprocessedSeriesIds: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Canonical unique SeriesIDs beyond the 50-series cap, in original order. Request these separately.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when one or more series failed — bls_search_series for a SeriesID BLS rejected, or the reason and recovery for a quota, API-key, or database-lock failure that left other series answered. Absent when all series returned data.',
+        'Guidance for unprocessed IDs, unavailable observations, or failed series — bls_search_series for a SeriesID BLS rejected, or the reason and recovery for a request failure that left other series answered. Absent when all requested IDs returned available observations.',
       ),
+  },
+
+  enrichmentTrailer: {
+    unprocessedSeriesIds: { render: (ids) => ids?.map(escapeMarkdownInline).join(', ') ?? '' },
+    notice: { render: escapeMarkdownInline },
   },
 
   async handler(input, ctx) {
     ctx.log.info('Executing bls_get_latest', { count: input.series_ids.length });
     const service = getBlsApiService();
+    const canonicalIds = [...new Set(input.series_ids.map((id) => id.trim().toUpperCase()))];
+    const seriesIds = canonicalIds.slice(0, 50);
+    const unprocessedSeriesIds = canonicalIds.slice(50);
+    if (unprocessedSeriesIds.length > 0) ctx.enrich({ unprocessedSeriesIds });
 
     // Pair each seriesId with its settlement so downstream logic has the id regardless
     // of whether the fetch succeeded or rejected (rejections don't carry the seriesId).
     const pairs = await Promise.allSettled(
-      input.series_ids.map(async (seriesId) => ({
+      seriesIds.map(async (seriesId) => ({
         seriesId,
         data: await service.fetchLatest(seriesId, ctx),
       })),
@@ -150,6 +196,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       title?: string;
       area?: string;
       item?: string;
+      measure?: string;
       seasonal?: string;
       latestObservation?: {
         year: string;
@@ -162,12 +209,11 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     }> = [];
     const failed: Array<{ seriesId: string; error: string }> = [];
     const requestLevel: Array<{ seriesId: string; error: McpError; reason: string }> = [];
-    let succeededCount = 0;
     let unavailableCount = 0;
 
     for (const [i, settlement] of pairs.entries()) {
-      // i is always within bounds — pairs is derived 1:1 from input.series_ids.
-      const requestedId = input.series_ids[i] ?? '';
+      // Settlements and canonical IDs have the same positions and length.
+      const requestedId = seriesIds[i] as string;
       if (settlement.status === 'rejected') {
         const err: unknown = settlement.reason;
         if (err instanceof McpError) {
@@ -197,6 +243,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         ...(data.title && { title: data.title }),
         ...(data.area && { area: data.area }),
         ...(data.item && { item: data.item }),
+        ...(data.measure && { measure: data.measure }),
         ...(data.seasonal && { seasonal: data.seasonal }),
         latestObservation: {
           year: obs.year,
@@ -208,20 +255,23 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         },
       });
       if ((obs.available ?? obs.value !== '-') === false) unavailableCount++;
-      succeededCount++;
     }
 
     const [firstRequestLevel] = requestLevel;
-    if (firstRequestLevel && succeededCount === 0) throw firstRequestLevel.error;
+    if (firstRequestLevel && results.length === 0) throw firstRequestLevel.error;
 
     const notices: string[] = [];
+    if (unprocessedSeriesIds.length > 0)
+      notices.push(
+        `Requested ${canonicalIds.length} unique series; applied limit 50. Request the remaining SeriesIDs separately: ${unprocessedSeriesIds.join(', ')}.`,
+      );
     if (requestLevel.length === 0) {
       if (failed.length > 0) {
-        const allFailed = succeededCount === 0;
+        const allFailed = results.length === 0;
         notices.push(
           allFailed
             ? `All ${failed.length} series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.`
-            : `${failed.length} of ${input.series_ids.length} series failed. Use bls_search_series to verify the failing SeriesIDs.`,
+            : `${failed.length} of ${seriesIds.length} series failed. Use bls_search_series to verify the failing SeriesIDs.`,
         );
       }
     } else {
@@ -260,7 +310,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
 
     return {
       results,
-      succeeded: succeededCount,
+      succeeded: results.length,
       failed,
     };
   },
@@ -270,27 +320,31 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     for (const r of result.results) {
       const obs = r.latestObservation;
       if (!obs) continue;
-      lines.push(`**${r.seriesId}**${r.title ? ` — ${r.title}` : ''}`);
+      lines.push(
+        `**${escapeMarkdownInline(r.seriesId)}**${r.title ? ` — ${escapeMarkdownInline(r.title)}` : ''}`,
+      );
       const periodStr = obs.periodName
         ? `${obs.periodName} ${obs.year}`
         : `${obs.period} ${obs.year}`;
       lines.push(
         (obs.available ?? obs.value !== '-')
-          ? `Value: **${obs.value}** (${periodStr})`
-          : `Value: **Unavailable** (BLS raw value: \`${obs.value}\`; ${periodStr})`,
+          ? `Value: **${escapeMarkdownInline(obs.value)}** (${escapeMarkdownInline(periodStr)})`
+          : `Value: **Unavailable** (BLS raw value: \`${obs.value}\`; ${escapeMarkdownInline(periodStr)})`,
       );
       lines.push(`Available: ${(obs.available ?? obs.value !== '-') ? 'yes' : 'no'}`);
-      lines.push(`Period: ${obs.period}`);
-      if (obs.footnotes?.length) lines.push(`Footnotes: ${obs.footnotes.join('; ')}`);
-      if (r.area) lines.push(`Area: ${r.area}`);
-      if (r.item) lines.push(`Item: ${r.item}`);
-      if (r.seasonal) lines.push(`Seasonality: ${r.seasonal}`);
+      lines.push(`Period: ${escapeMarkdownInline(obs.period)}`);
+      if (obs.footnotes?.length)
+        lines.push(`Footnotes: ${escapeMarkdownInline(obs.footnotes.join('; '))}`);
+      if (r.area) lines.push(`Area: ${escapeMarkdownInline(r.area)}`);
+      if (r.item) lines.push(`Item: ${escapeMarkdownInline(r.item)}`);
+      if (r.measure) lines.push(`Measure: ${escapeMarkdownInline(r.measure)}`);
+      if (r.seasonal) lines.push(`Seasonality: ${escapeMarkdownInline(r.seasonal)}`);
       lines.push('');
     }
     if (result.failed.length > 0) {
       lines.push(`**${result.failed.length} failed:**`);
       for (const f of result.failed) {
-        lines.push(`- ${f.seriesId}: ${f.error}`);
+        lines.push(`- ${escapeMarkdownInline(f.seriesId)}: ${escapeMarkdownInline(f.error)}`);
       }
     }
     const total = result.results.length + result.failed.length;

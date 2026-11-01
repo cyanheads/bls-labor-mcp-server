@@ -5,6 +5,7 @@
  * @module index
  */
 
+import { loadEnvFile } from 'node:process';
 import { createApp, disabledTool, z } from '@cyanheads/mcp-ts-core';
 import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 import { requestContextService, schedulerService, withExtra } from '@cyanheads/mcp-ts-core/utils';
@@ -29,6 +30,19 @@ import {
 } from './services/bls-observations/bls-observations-service.js';
 import { runObservationsSubprocess } from './services/bls-observations/subprocess.js';
 import { initCanvasBridge } from './services/canvas-bridge/canvas-bridge.js';
+
+/**
+ * Load .env before choosing tools without validating framework config outside
+ * createApp's startup-error boundary. Native loading preserves exported values.
+ */
+try {
+  loadEnvFile();
+} catch (error) {
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+}
+if (normalizeEnv({ provider: process.env.CANVAS_PROVIDER_TYPE }).provider === undefined) {
+  process.env.CANVAS_PROVIDER_TYPE = 'duckdb';
+}
 
 /** Select tools without parsing config before createApp can report startup errors. */
 const registrationEnv = normalizeEnv({
@@ -60,16 +74,16 @@ const dropTool = !canvasEnabled
         hint: 'BLS_DATAFRAME_DROP_ENABLED=true',
       });
 
-const instructions =
-  'Use the bls_* tools to fetch US labor, price, and employment statistics from the Bureau of Labor Statistics public API v2. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Series use opaque positional SeriesIDs (e.g. LNS14000000); surveys use two-letter codes (CU, CE, LN). Workflow: bls_list_surveys, then bls_search_series (offline, no quota) to resolve concepts to SeriesIDs, then bls_get_series for history or bls_get_latest for current values. bls_search_series covers an offline index of the major surveys; series in other surveys are fetched by SeriesID with bls_get_series. ' +
-  (canvasEnabled
-    ? 'Large results spill to a DataCanvas dataframe. Call bls_dataframe_describe with dataset.name to inspect column_schema, then use that table name in bls_dataframe_query SQL.'
-    : 'DataCanvas is disabled. If a history request exceeds the inline budget, narrow start_year/end_year or enable CANVAS_PROVIDER_TYPE=duckdb and restart.');
+const canvasInstructions = canvasEnabled
+  ? 'Large results spill to a DataCanvas dataframe: describe dataset.name with bls_dataframe_describe before using the table in bls_dataframe_query SQL.'
+  : 'DataCanvas is disabled; full results return inline.';
+const instructions = `Use bls_* for published US labor, price, and employment statistics. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Surveys use two-letter codes; series use opaque SeriesIDs. Discover surveys with bls_list_surveys when needed, resolve concepts through bls_search_series (offline, no quota), then use bls_get_series for history or bls_get_latest for a current observation. Fetch series outside the offline index using a known BLS SeriesID. IDs are trimmed, uppercased, and deduplicated; batch history is more quota-efficient than per-series latest requests. ${canvasInstructions}`;
 
 await createApp({
   name: 'bls-labor-mcp-server',
   title: 'bls-labor-mcp-server',
   instructions,
+  skills: 'skills',
   landing: { requireAuth: false },
   // No tool asks the caller for input mid-handler, so nothing needs a session.
   sessionMode: 'stateless',

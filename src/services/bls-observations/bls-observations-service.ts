@@ -40,7 +40,7 @@ export type { MirrorRunOptions };
  * A real observation always beats an annual average. Ordering on (year, period)
  * alone would not: an average shares the year it summarizes and lexically
  * outranks the periods it is built from (`"M13" > "M12"`, `"Q05" > "Q04"`,
- * `"S03" > "S02"`), so the year's mean would be served as the current reading.
+ * `"S03" > "S02"`), so the annual summary would be served as the current reading.
  * An average wins only against another average — for a series holding nothing
  * else, it is that series' only observation.
  *
@@ -217,7 +217,7 @@ export class BlsObservationsService {
    * Query the single most recent real observation for each series ID.
    *
    * Mirrors the live API's `?latest=true`, which never sends `annualaverage` and
-   * so never answers with a year's mean. There is no opt-in here: an annual
+   * so never answers with a supplemental annual summary. There is no opt-in here: an annual
    * average is not a candidate for "latest" — see {@link isLaterObservation}.
    */
   async queryLatest(seriesIds: string[]): Promise<MirrorSeriesResult> {

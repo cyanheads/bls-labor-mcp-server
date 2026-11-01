@@ -38,7 +38,8 @@ describe('blsDataframeDescribeTool', () => {
             ? { name: 'df_AAAAA_BBBBB' }
             : {};
       const result = await runToolContract(definition, input);
-      const hint = definition.errors![0]!.recovery;
+      const hint =
+        'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment and restart to enable dataframe tools.';
 
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({

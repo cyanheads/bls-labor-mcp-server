@@ -3,6 +3,7 @@
  * @module tests/tools/bls-dataframe-query.tool.test
  */
 
+import { validationError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsDataframeQueryTool } from '@/mcp-server/tools/definitions/bls-dataframe-query.tool.js';
@@ -54,6 +55,41 @@ describe('blsDataframeQueryTool', () => {
     expect(result.row_count).toBe(2);
     expect(result.rows).toHaveLength(2);
     expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('offers a different registration name on both error surfaces (#115)', async () => {
+    canvasBridgeEnabled = true;
+    mockQuery.mockRejectedValue(
+      validationError('Table name already exists.', {
+        reason: 'register_as_clash',
+        tableName: 'unemp',
+      }),
+    );
+
+    const result = await runToolContract(blsDataframeQueryTool, {
+      sql: 'SELECT 1 AS value',
+      register_as: 'unemp',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'register_as_clash',
+          recovery: {
+            hint: 'Choose a different register_as name; the existing dataframe is unchanged.',
+          },
+        },
+      },
+    });
+    const text = result.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    expect(text).toContain(
+      'Choose a different register_as name; the existing dataframe is unchanged.',
+    );
+    expect(text).not.toContain('Drop it');
   });
 
   it('enriches with notice naming row_limit when it is the binding cap', async () => {
@@ -276,22 +312,41 @@ describe('blsDataframeQueryTool', () => {
     expect(() => blsDataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 0 })).toThrow();
   });
 
-  it('rejects row_limit above 10000', () => {
-    expect(() =>
-      blsDataframeQueryTool.input.parse({ sql: 'SELECT 1', row_limit: 10001 }),
-    ).toThrow();
-  });
+  it.each([{ row_limit: 1.5 }, { preview: -1 }, { preview: 0.5 }])(
+    'retains integer and minimum validation for %j',
+    (limits) => {
+      expect(() => blsDataframeQueryTool.input.parse({ sql: 'SELECT 1', ...limits })).toThrow();
+    },
+  );
 
-  it('rejects preview above 10000', () => {
-    expect(() => blsDataframeQueryTool.input.parse({ sql: 'SELECT 1', preview: 10001 })).toThrow();
-  });
-
-  it('rejects preview above row_limit', () => {
-    const input = { sql: 'SELECT 1', preview: 1001, row_limit: 1000 };
-    expect(() => blsDataframeQueryTool.input.parse(input)).toThrow(
-      'preview must be less than or equal to row_limit',
-    );
-  });
+  it.each([
+    [20000, 20000, 10000, 10000],
+    [1000, 2000, 1000, 1000],
+    [20000, 0, 10000, 0],
+  ])(
+    'clamps row_limit=%i preview=%i and reports applied limits',
+    async (row_limit, preview, rowLimit, appliedPreview) => {
+      canvasBridgeEnabled = true;
+      mockQuery.mockResolvedValue({ result: { columns: ['x'], rowCount: 0, rows: [] } });
+      const response = await runToolContract(blsDataframeQueryTool, {
+        sql: 'SELECT 1',
+        row_limit,
+        preview,
+      });
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.anything(),
+        'SELECT 1',
+        expect.objectContaining({ rowLimit, preview: appliedPreview }),
+      );
+      expect(response.structuredContent).toMatchObject({
+        row_count: 0,
+        notice: expect.stringContaining(`requested row_limit=${row_limit}, preview=${preview}`),
+      });
+      expect(JSON.stringify(response.content)).toContain(
+        `applied row_limit=${rowLimit}, preview=${appliedPreview}`,
+      );
+    },
+  );
 
   it('formats rows with pipe-escaped cell values', () => {
     const output = {
@@ -316,7 +371,7 @@ describe('blsDataframeQueryTool', () => {
     // A bare backslash is consumed as an escape by the renderer, so the literal
     // value has to arrive with its backslash doubled and the pipe escaped on top.
     expect(text).toContain('x\\\\\\|y');
-    expect(text).toContain('a\\\\*b');
+    expect(text).toContain(String.raw`a\\\*b`);
   });
 
   it('escapes backslashes in serialized object cells', () => {
@@ -327,8 +382,9 @@ describe('blsDataframeQueryTool', () => {
     };
     const blocks = blsDataframeQueryTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    // JSON.stringify already emits `C:\\tmp`; both backslashes need doubling.
-    expect(text).toContain('C:\\\\\\\\tmp');
+    // Markdown consumes a backslash only before punctuation, so three preserve
+    // the two backslashes JSON needs before the ordinary letter t.
+    expect(text).toContain(String.raw`C:\\\tmp`);
     expect(text).toContain('a\\|b');
   });
 

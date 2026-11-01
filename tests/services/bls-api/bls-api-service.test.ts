@@ -14,7 +14,10 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
   const original = await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>();
   return {
     ...original,
-    withRetry: (fn: () => Promise<unknown>) => fn(),
+    withRetry: (
+      fn: (attempt: { signal: AbortSignal; remainingMs: number }) => Promise<unknown>,
+      options: { signal: AbortSignal },
+    ) => fn({ signal: options.signal, remainingMs: 45_000 }),
   };
 });
 
@@ -94,6 +97,44 @@ async function captureBody(
 }
 
 describe('BlsApiService.fetchSeries — annualaverage flag (#53)', () => {
+  it('preserves reduction advisories and upstream measurement metadata', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      okJson({
+        ...SUCCESS_RESPONSE,
+        message: [
+          'Year range has been reduced to the system-allowed limit of 10 years.',
+          'Calculations have been disabled for this request.',
+        ],
+        Results: {
+          series: [
+            {
+              ...SUCCESS_RESPONSE.Results.series[0],
+              catalog: { measure_data_type: 'Number in thousands' },
+            },
+          ],
+        },
+      }),
+    );
+    try {
+      const result = await new BlsApiService(apiKey, baseUrl, userAgent).fetchSeries(
+        { seriesIds: ['LNS14000000'], startYear: 2010, endYear: 2024 },
+        createMockContext(),
+      );
+      expect(result[0]).toMatchObject({
+        measure: 'Number in thousands',
+        request: {
+          startYearApplied: 2010,
+          endYearApplied: 2019,
+          advisories: [
+            'Year range has been reduced to the system-allowed limit of 10 years.',
+            'Calculations have been disabled for this request.',
+          ],
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
   it('omits annualaverage for a ranged request that did not ask for it', async () => {
     // The flag was previously derived from the presence of a year bound, so a
     // ranged request silently returned annual-average rows nobody asked for.

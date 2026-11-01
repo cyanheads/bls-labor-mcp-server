@@ -230,6 +230,25 @@ describe('bls_search_series over a seeded catalog', () => {
   });
 
   describe('offset omitted (characterization)', () => {
+    it.each([0, 50, 100, 150])(
+      'clamps oversized pages at offset %i without losing paging guidance',
+      async (offset) => {
+        const { structured, text } = await call({
+          query: 'unemployment rate',
+          survey: 'LN',
+          limit: 500,
+          offset,
+        });
+        expect(structured.limitApplied).toBe(50);
+        expect(structured.series).toHaveLength(offset === 150 ? 0 : offset === 100 ? 20 : 50);
+        expect(structured.notice).toContain('Requested limit=500; applied limit=50.');
+        expect(text).toContain('Requested limit=500; applied limit=50.');
+        if (offset === 0 || offset === 50) expect(structured.nextOffset).toBe(offset + 50);
+        else expect(structured.nextOffset).toBeUndefined();
+        if (offset === 150) expect(text).toContain('past the last');
+      },
+    );
+
     it('returns the first page with total, truncation, shown, and cap', async () => {
       const { structured } = await call({ query: 'unemployment rate', survey: 'LN' });
       expect(structured.series).toHaveLength(10);
@@ -280,7 +299,7 @@ describe('bls_search_series over a seeded catalog', () => {
       expect(ids(padded.structured)).toEqual(ids(canonical.structured));
       expect(padded.structured.totalCount).toBe(canonical.structured.totalCount);
       expect(padded.structured.surveyFilter).toBe('CU');
-      expect(padded.text).toContain('**surveyFilter:** CU');
+      expect(padded.text).toContain('**surveyFilter:** `CU`');
     });
 
     it('applies a padded area as its trimmed value and echoes the trimmed value', async () => {

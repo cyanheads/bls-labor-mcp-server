@@ -7,6 +7,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import {
   getBlsCatalogService,
   OES_SURVEY_ABBR,
@@ -26,7 +27,7 @@ function normalizeFilter(value: string | undefined): string | undefined {
 export const blsSearchSeriesTool = tool('bls_search_series', {
   title: 'Search BLS Series',
   description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag, and publication frequency for surveys that publish one series at several frequencies) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE only when the server sets BLS_CATALOG_INCLUDE_OES=true); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts state names, MSA names, or FIPS area codes.`,
-  annotations: { readOnlyHint: true, openWorldHint: true },
+  annotations: { readOnlyHint: true, openWorldHint: false },
 
   errors: [
     {
@@ -68,9 +69,10 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .number()
       .int()
       .min(1)
-      .max(50)
       .default(10)
-      .describe('Maximum number of results to return (1–50, default 10).'),
+      .describe(
+        'Maximum number of results to return (default 10); requests above 50 are clamped to 50 with notice.',
+      ),
     offset: z
       .number()
       .int()
@@ -181,7 +183,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .string()
       .optional()
       .describe(
-        'Guidance on the result: the survey is not in the offline index, the offset is past the last result, nothing matched, which offset fetches the next page, or, on the last page of a capped list, that other series may also match. Absent when this page ends an uncapped list with results.',
+        'Requested and applied limits when clamped, plus guidance on unindexed surveys, offsets past the end, empty results, the next page, or the capped candidate pool. Absent when the limit was unchanged and this page ends an uncapped list with results.',
       ),
   },
 
@@ -209,7 +211,11 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
 
     const survey = normalizeFilter(input.survey)?.toUpperCase();
     const area = normalizeFilter(input.area);
-    const { limit, offset } = input;
+    const { offset } = input;
+    const limit = Math.min(input.limit, 50);
+    const clampNotice =
+      input.limit > limit ? `Requested limit=${input.limit}; applied limit=${limit}. ` : '';
+    const notice = (message: string) => ctx.enrich.notice(`${clampNotice}${message}`);
     const result = await service.search({
       query: input.query,
       survey,
@@ -237,8 +243,8 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     ctx.enrich.total(total);
     ctx.enrich.echo(input.query);
 
-    // One notice per response — the framework keeps the last one written. A page
-    // with results after it carries only the next-page guidance; otherwise the
+    // One notice per response — prepend any clamp disclosure to the guidance. A page
+    // with results after it carries next-page guidance; otherwise the
     // precedence is un-indexed survey, offset past the end, no match, then the
     // capped-pool note on a last page.
     const range = `results ${offset + 1}–${offset + shown}`;
@@ -246,32 +252,34 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       ctx.enrich.truncated({
         shown,
         cap: limit,
-        guidance: `Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page.`,
+        guidance: `${clampNotice}Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page.`,
       });
     } else if (survey !== undefined && !service.indexedSurveys.includes(survey)) {
       const oesHint =
         survey === OES_SURVEY_ABBR.toUpperCase() && !service.includeOes
           ? ' OE (OEWS) series are indexed only when the server sets BLS_CATALOG_INCLUDE_OES=true.'
           : '';
-      ctx.enrich.notice(
+      notice(
         `Survey ${survey} has no series in the offline catalog index (indexed: ${service.indexedSurveys.join(', ')}). Use bls_list_surveys for valid codes; series in other surveys are fetchable by SeriesID via bls_get_series.${oesHint}`,
       );
     } else if (total > 0 && offset >= total) {
-      ctx.enrich.notice(
+      notice(
         `Offset ${offset} is past the last of ${total} results. Pass an offset below ${total} (offset 0 is the first page).`,
       );
     } else if (total === 0) {
       const hasFilters =
         survey !== undefined || area !== undefined || input.seasonal_adjustment !== undefined;
-      ctx.enrich.notice(
+      notice(
         hasFilters
           ? 'No matching series found. Try removing the survey/area/seasonal filter or broadening the query.'
           : 'No matching series found. Try broadening the query, checking spelling, or using a BLS SeriesID directly.',
       );
     } else if (capped) {
-      ctx.enrich.notice(
+      notice(
         `Showing ${range}, the last of ${total} ranked candidates. The candidate pool is capped, so other series may also match. Narrow the query or add survey/area filters to reach them.`,
       );
+    } else if (clampNotice) {
+      ctx.enrich.notice(clampNotice.trim());
     }
 
     return {
@@ -298,10 +306,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     }
     const lines: string[] = [`**${result.series.length} series returned:**\n`];
     for (const s of result.series) {
-      const parts: string[] = [`**${s.seriesId}**`];
-      parts.push(`— ${s.title}`);
-      if (s.area) parts.push(`· ${s.area}`);
-      if (s.seasonal) parts.push(`(${[s.seasonal, s.frequency].filter(Boolean).join(', ')})`);
+      const parts: string[] = [`**${escapeMarkdownInline(s.seriesId)}**`];
+      parts.push(`— ${escapeMarkdownInline(s.title)}`);
+      if (s.area) parts.push(`· ${escapeMarkdownInline(s.area)}`);
+      if (s.seasonal)
+        parts.push(
+          `(${[s.seasonal, ...(s.frequency ? [s.frequency] : [])].map(escapeMarkdownInline).join(', ')})`,
+        );
       parts.push(`[${s.survey}]`);
       const coverage =
         s.startYear !== undefined && s.endYear !== undefined
@@ -312,9 +323,11 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
               ? `through ${s.endYear}`
               : '';
       if (coverage || s.endPeriod)
-        parts.push(`· Coverage: ${[coverage, s.endPeriod].filter(Boolean).join(' ')}`);
+        parts.push(
+          `· Coverage: ${escapeMarkdownInline([coverage, s.endPeriod].filter(Boolean).join(' '))}`,
+        );
       lines.push(parts.join(' '));
-      if (s.item) lines.push(`  _${s.item}_`);
+      if (s.item) lines.push(`  _${escapeMarkdownInline(s.item)}_`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

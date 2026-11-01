@@ -78,6 +78,26 @@ describe('bls_get_series spill schema on the DuckDB canvas (#97)', () => {
     await canvas.shutdown(ctx.series as unknown as Parameters<DataCanvas['shutdown']>[0]);
   });
 
+  it('preserves measurement units in the typed spill column', async () => {
+    const source = { ...spillingSeries(() => '2'), measure: 'Number in thousands' };
+    fetchSeriesMock.mockResolvedValue([source]);
+    const result = await blsGetSeriesTool.handler(
+      blsGetSeriesTool.input.parse({ series_ids: [source.seriesId] }),
+      ctx.series,
+    );
+    expect(result.series[0]!.measure).toBe('Number in thousands');
+    expect(blsGetSeriesTool.format!(result)).toMatchObject([
+      { text: expect.stringContaining('Measure: Number in thousands') },
+    ]);
+    const queried = await blsDataframeQueryTool.handler(
+      blsDataframeQueryTool.input.parse({
+        sql: `SELECT measure, count(*) AS n FROM ${result.dataset!.name} GROUP BY measure`,
+      }),
+      ctx.query,
+    );
+    expect(queried.rows).toEqual([{ measure: 'Number in thousands', n: '900' }]);
+  });
+
   /** Spill `series`, then describe the table through the tool contract. */
   async function spillAndDescribe(series: SeriesData, calculations?: boolean) {
     fetchSeriesMock.mockResolvedValue([series]);

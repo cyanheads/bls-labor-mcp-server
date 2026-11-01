@@ -45,6 +45,7 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
 
 import { blsGetLatestTool } from '@/mcp-server/tools/definitions/bls-get-latest.tool.js';
 import { blsGetSeriesTool } from '@/mcp-server/tools/definitions/bls-get-series.tool.js';
+import { blsListSurveysTool } from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
 import { initBlsApiService } from '@/services/bls-api/bls-api-service.js';
 
 function okJson(payload: unknown): Response {
@@ -99,7 +100,10 @@ const seriesContext = { context: { errors: blsGetSeriesTool.errors } };
 const latestContext = { context: { errors: blsGetLatestTool.errors } };
 
 beforeEach(() => {
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Unexpected unmocked BLS request'));
   state.config.observationsMirrorEnabled = false;
+  state.config.apiKey = 'test-key';
+  state.catalog.isLoaded = true;
   state.mirror.queryBySeries.mockReset();
   state.mirror.queryLatest.mockReset();
   state.catalog.lookupByIds.mockReset();
@@ -108,8 +112,535 @@ beforeEach(() => {
   initBlsApiService({} as AppConfig, undefined);
 });
 
+describe('canonical retrieval and truthful metadata', () => {
+  it.each([
+    ['series', blsGetSeriesTool],
+    ['latest', blsGetLatestTool],
+  ] as const)(
+    '%s canonicalizes IDs without restricting valid shapes and hydrates ordinary live metadata',
+    async (name, tool) => {
+      const ids = ['OEUM004266000000029114103', 'PCU1133--1133--'];
+      state.catalog.lookupByIds.mockResolvedValue(
+        new Map([
+          [
+            ids[0]!,
+            {
+              seriesId: ids[0]!,
+              title: 'Decoded duration and units',
+              areaName: 'Catalog area',
+              seasonal: false,
+            },
+          ],
+        ]),
+      );
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+        const requested =
+          name === 'series'
+            ? (JSON.parse(init!.body as string) as { seriesid: string[] }).seriesid
+            : [decodeURIComponent(String(url).split('/timeseries/data/')[1]!.split('?')[0]!)];
+        return Promise.resolve(
+          okJson({
+            status: 'REQUEST_SUCCEEDED',
+            responseTime: 1,
+            Results: {
+              series: requested.map((seriesID) => ({
+                seriesID,
+                catalog: {
+                  series_title: 'Generic upstream',
+                  area: 'API area',
+                  measure_data_type: 'Number in thousands',
+                },
+                data: [{ year: '2025', period: 'M01', value: '2' }],
+              })),
+            },
+          }),
+        );
+      });
+      const result = await runToolContract(
+        tool,
+        { series_ids: [' oeum004266000000029114103 ', ids[0]!, 'pcu1133--1133--'] },
+        { context: { errors: tool.errors } },
+      );
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured[name === 'series' ? 'series' : 'results']).toMatchObject([
+        {
+          seriesId: ids[0],
+          title: 'Decoded duration and units',
+          area: 'API area',
+          measure: 'Number in thousands',
+        },
+        { seriesId: ids[1], title: 'Generic upstream', measure: 'Number in thousands' },
+      ]);
+      expect(spy).toHaveBeenCalledTimes(name === 'series' ? 1 : 2);
+      expect(contentText(result)).toContain('Measure: Number in thousands');
+      expect(contentText(result)).toContain('Decoded duration and units');
+    },
+  );
+
+  it.each([
+    ['series', false, 25],
+    ['series', true, 50],
+    ['latest', false, 50],
+  ] as const)(
+    '%s applies its effective cap keyed=%s before I/O and preserves the exact remainder',
+    async (name, keyed, cap) => {
+      state.config.apiKey = keyed ? 'test-key' : '';
+      initBlsApiService({} as AppConfig, undefined);
+      const ids = Array.from({ length: 53 }, (_, i) => `TEST${i}`);
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) =>
+        name === 'series'
+          ? Promise.resolve(liveWithCalculations(init))
+          : Promise.resolve(
+              okJson({
+                status: 'REQUEST_SUCCEEDED',
+                responseTime: 1,
+                Results: {
+                  series: [
+                    {
+                      seriesID: String(url).split('/timeseries/data/')[1]!.split('?')[0],
+                      data: [{ year: '2025', period: 'M01', value: '1' }],
+                    },
+                  ],
+                },
+              }),
+            ),
+      );
+      const tool = name === 'series' ? blsGetSeriesTool : blsGetLatestTool;
+      const result = await runToolContract(
+        tool,
+        { series_ids: [' test0 ', ...ids] },
+        { context: { errors: tool.errors } },
+      );
+      expect(result.structuredContent).toMatchObject({ unprocessedSeriesIds: ids.slice(cap) });
+      expect(contentText(result)).toContain(`applied limit ${cap}`);
+      expect(contentText(result)).toContain('TEST52');
+      expect(spy).toHaveBeenCalledTimes(name === 'series' ? 1 : 50);
+      if (name === 'series')
+        expect(JSON.parse(spy.mock.calls[0]![1]!.body as string).seriesid).toEqual(
+          ids.slice(0, cap),
+        );
+      expect(
+        (result.structuredContent as Record<string, unknown[]>)[
+          name === 'series' ? 'series' : 'results'
+        ],
+      ).toHaveLength(cap);
+    },
+  );
+
+  it('rejects whitespace-only IDs before I/O on both branches', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        Results: {
+          series: [{ seriesID: '   ', data: [{ year: '2025', period: 'M01', value: '1' }] }],
+        },
+      }),
+    );
+    for (const tool of [blsGetSeriesTool, blsGetLatestTool]) {
+      const result = await runToolContract(
+        tool,
+        { series_ids: ['   '] },
+        { context: { errors: tool.errors } },
+      );
+      expect(result.structuredContent).toHaveProperty('error');
+    }
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('reports explicit upstream reductions without deriving the window from sparse observations', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        message: [
+          'Year range has been reduced to the system-allowed limit of 10 years.',
+          'Calculations have been disabled for this request. test-key',
+        ],
+        Results: {
+          series: [{ seriesID: 'GOOD', data: [{ year: '2018', period: 'M01', value: '3' }] }],
+        },
+      }),
+    );
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['GOOD'], start_year: 2010, end_year: 2024, calculations: true },
+      seriesContext,
+    );
+    expect(result.structuredContent).toMatchObject({
+      startYearApplied: 2010,
+      endYearApplied: 2019,
+      calculationsApplied: false,
+    });
+    const text = contentText(result);
+    expect(text).toContain('Year range has been reduced');
+    expect(text).toContain('no calculation values for GOOD');
+    expect(JSON.stringify(result)).not.toContain('test-key');
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        Results: {
+          series: [{ seriesID: 'GOOD', data: [{ year: '2018', period: 'M01', value: '3' }] }],
+        },
+      }),
+    );
+    const sparse = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['GOOD'], start_year: 2010, end_year: 2024 },
+      seriesContext,
+    );
+    expect(sparse.structuredContent).toMatchObject({
+      startYearApplied: 2010,
+      endYearApplied: 2024,
+    });
+  });
+
+  it('preserves supported calculations when another data-bearing series has none', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        Results: {
+          series: [
+            {
+              seriesID: 'GOOD',
+              data: [
+                {
+                  year: '2025',
+                  period: 'M01',
+                  value: '3',
+                  calculations: { pct_changes: { '1': '0.2' } },
+                },
+              ],
+            },
+            { seriesID: 'PLAIN', data: [{ year: '2025', period: 'Q01', value: '4' }] },
+          ],
+        },
+      }),
+    );
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['GOOD', 'PLAIN'], calculations: true },
+      seriesContext,
+    );
+    expect(result.structuredContent).toMatchObject({
+      calculationsApplied: false,
+      series: [{ observations: [{ pctChange1Month: '0.2' }] }, { seriesId: 'PLAIN' }],
+    });
+    expect(contentText(result)).toContain('0.2');
+    expect(contentText(result)).toContain('no calculation values for PLAIN');
+  });
+
+  it('keeps upstream metadata with the catalog unavailable and distinguishes upstream omissions from invalid IDs', async () => {
+    state.catalog.isLoaded = false;
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        message: [
+          'Requested Series list has been reduced to the system-allowed limit of 25 series.',
+          'Invalid Series for Series BAD',
+        ],
+        Results: {
+          series: [
+            {
+              seriesID: 'GOOD',
+              catalog: { series_title: 'API title' },
+              data: [{ year: '2025', period: 'M01', value: '1' }],
+            },
+          ],
+        },
+      }),
+    );
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['GOOD', 'BAD', 'OMITTED'] },
+      seriesContext,
+    );
+    expect(result.structuredContent).toMatchObject({
+      series: [
+        { seriesId: 'GOOD', title: 'API title' },
+        { seriesId: 'BAD', observationCount: 0 },
+        { seriesId: 'OMITTED', observationCount: 0 },
+      ],
+    });
+    const series = (result.structuredContent as { series: Record<string, unknown>[] }).series;
+    expect(series[0]).not.toHaveProperty('measure');
+    expect(state.catalog.lookupByIds).not.toHaveBeenCalled();
+    expect(contentText(result)).toContain('BLS reports BAD is invalid');
+    expect(contentText(result)).toContain('BLS omitted OMITTED');
+    expect(contentText(result)).not.toContain('BLS reports OMITTED is invalid');
+  });
+});
+
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+const liveToolRuns = [
+  {
+    name: 'series',
+    run: () => runToolContract(blsGetSeriesTool, { series_ids: ['LNS14000000'] }, seriesContext),
+  },
+  {
+    name: 'latest',
+    run: () => runToolContract(blsGetLatestTool, { series_ids: ['LNS14000000'] }, latestContext),
+  },
+  {
+    name: 'surveys',
+    run: () =>
+      runToolContract(blsListSurveysTool, {}, { context: { errors: blsListSurveysTool.errors } }),
+  },
+];
+
+describe('live failures reach both tool response surfaces', () => {
+  it.each(['series', 'latest'])(
+    '%s preserves mirror success when a live peer exhausts the body budget',
+    async (name) => {
+      vi.useFakeTimers();
+      state.config.observationsMirrorEnabled = true;
+      state.mirror.queryBySeries.mockResolvedValue({
+        observations: [mirrorRow('GOOD', '2025', 'M01', '4.4')],
+        complete: false,
+        missedIds: ['BAD'],
+      });
+      state.mirror.queryLatest.mockImplementation((ids: string[]) =>
+        Promise.resolve({
+          observations: ids[0] === 'GOOD' ? [mirrorRow('GOOD', '2025', 'M01', '4.4')] : [],
+          complete: ids[0] === 'GOOD',
+          missedIds: ids[0] === 'GOOD' ? [] : ids,
+        }),
+      );
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{'));
+                init!.signal!.addEventListener(
+                  'abort',
+                  () => controller.error(init!.signal!.reason),
+                  { once: true },
+                );
+              },
+            }),
+          ),
+        ),
+      );
+      const pending =
+        name === 'series'
+          ? runToolContract(blsGetSeriesTool, { series_ids: ['GOOD', 'BAD'] }, seriesContext)
+          : runToolContract(blsGetLatestTool, { series_ids: ['GOOD', 'BAD'] }, latestContext);
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining('upstream_timeout'),
+      });
+      expect(contentText(result)).toContain('GOOD');
+      expect(contentText(result)).toContain('4.4');
+      expect(contentText(result)).toContain('upstream_timeout');
+      expect(contentText(result)).not.toContain('bls_search_series');
+      expect(spy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(['series', 'latest'])(
+    '%s surfaces timeout when the mirror misses every ID',
+    async (name) => {
+      vi.useFakeTimers();
+      state.config.observationsMirrorEnabled = true;
+      state.mirror.queryBySeries.mockResolvedValue({
+        observations: [],
+        complete: false,
+        missedIds: ['BAD'],
+      });
+      state.mirror.queryLatest.mockResolvedValue({
+        observations: [],
+        complete: false,
+        missedIds: ['BAD'],
+      });
+      vi.spyOn(globalThis, 'fetch').mockImplementation(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), {
+              once: true,
+            });
+          }),
+      );
+      const pending =
+        name === 'series'
+          ? runToolContract(blsGetSeriesTool, { series_ids: ['BAD'] }, seriesContext)
+          : runToolContract(blsGetLatestTool, { series_ids: ['BAD'] }, latestContext);
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: { reason: 'upstream_timeout', recovery: { hint: expect.stringContaining('BLS') } },
+        },
+      });
+      expect(contentText(result)).toContain('upstream_timeout');
+    },
+  );
+
+  it.each(['series', 'latest'])(
+    '%s never returns partial mirror data after caller cancellation',
+    async (name) => {
+      vi.useFakeTimers();
+      const caller = new AbortController();
+      state.config.observationsMirrorEnabled = true;
+      state.mirror.queryBySeries.mockResolvedValue({
+        observations: [mirrorRow('GOOD', '2025', 'M01', '4.4')],
+        complete: false,
+        missedIds: ['BAD'],
+      });
+      state.mirror.queryLatest.mockImplementation((ids: string[]) =>
+        Promise.resolve({
+          observations: ids[0] === 'GOOD' ? [mirrorRow('GOOD', '2025', 'M01', '4.4')] : [],
+          complete: ids[0] === 'GOOD',
+          missedIds: ids[0] === 'GOOD' ? [] : ids,
+        }),
+      );
+      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), {
+              once: true,
+            });
+          }),
+      );
+      const pending =
+        name === 'series'
+          ? runToolContract(
+              blsGetSeriesTool,
+              { series_ids: ['GOOD', 'BAD'] },
+              { context: { errors: blsGetSeriesTool.errors, signal: caller.signal } },
+            )
+          : runToolContract(
+              blsGetLatestTool,
+              { series_ids: ['GOOD', 'BAD'] },
+              { context: { errors: blsGetLatestTool.errors, signal: caller.signal } },
+            );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spy).toHaveBeenCalledTimes(1);
+      caller.abort(new Error('caller cancelled the live fallback'));
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(contentText(result)).toContain('caller cancelled the live fallback');
+      expect(result.structuredContent).not.toHaveProperty('series');
+      expect(result.structuredContent).not.toHaveProperty('results');
+      await vi.runAllTimersAsync();
+      expect(spy).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(liveToolRuns)(
+    '$name reports availability failures with status and recovery',
+    async ({ run }) => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+        Promise.resolve(new Response('private body test-key', { status: 403 })),
+      );
+      const result = await run();
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'service_unavailable',
+            status: 403,
+            retryable: false,
+            recovery: { hint: expect.stringContaining('BLS') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('Recovery:');
+      expect(contentText(result)).toContain('service_unavailable');
+      expect(JSON.stringify(result)).not.toContain('private body');
+      expect(JSON.stringify(result)).not.toContain('test-key');
+    },
+  );
+
+  it.each(liveToolRuns)('$name reports malformed payloads with recovery', async ({ run }) => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(new Response('{bad json')),
+    );
+    const result = await run();
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'serialization_failure',
+          retryable: false,
+          recovery: { hint: expect.stringContaining('BLS') },
+        },
+      },
+    });
+    expect(contentText(result)).toContain('Recovery:');
+    expect(contentText(result)).toContain('serialization_failure');
+  });
+
+  it.each(liveToolRuns)('$name reports budget expiry with stable BLS recovery', async ({ run }) => {
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), {
+            once: true,
+          });
+        }),
+    );
+    const pending = run();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'upstream_timeout',
+          retryable: true,
+          recovery: { hint: expect.stringContaining('BLS') },
+        },
+      },
+    });
+    expect(contentText(result)).toContain('Recovery:');
+    expect(contentText(result)).toContain('upstream_timeout');
+  });
+
+  it('latest keeps a success and names an unavailable peer without blaming SeriesIDs', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) =>
+      Promise.resolve(
+        String(url).includes('/GOOD?')
+          ? okJson({
+              status: 'REQUEST_SUCCEEDED',
+              message: [],
+              Results: {
+                series: [
+                  { seriesID: 'GOOD', data: [{ year: '2025', period: 'M01', value: '4.4' }] },
+                ],
+              },
+            })
+          : new Response('', { status: 403 }),
+      ),
+    );
+    const result = await runToolContract(
+      blsGetLatestTool,
+      { series_ids: ['GOOD', 'BAD'] },
+      latestContext,
+    );
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      succeeded: 1,
+      results: [{ seriesId: 'GOOD' }],
+      failed: [{ seriesId: 'BAD' }],
+      notice: expect.stringContaining('service_unavailable'),
+    });
+    expect(contentText(result)).toContain('4.4');
+    expect(contentText(result)).toContain('service_unavailable');
+    expect(contentText(result)).not.toContain('verify the failing SeriesIDs');
+    expect(contentText(result)).not.toContain('bls_search_series');
+  });
 });
 
 describe('bls_get_series — failed live fallback keeps the mirrored series (#80)', () => {
@@ -158,7 +689,7 @@ describe('bls_get_series — failed live fallback keeps the mirrored series (#80
     expect(text).not.toContain('bls_search_series');
   });
 
-  it('names the message when the live failure has no reason', async () => {
+  it('names the typed availability failure without exposing the raw transport message', async () => {
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Unable to connect.'));
     // The real retry ladder backs off between the four attempts a network error earns.
     vi.useFakeTimers();
@@ -174,9 +705,11 @@ describe('bls_get_series — failed live fallback keeps the mirrored series (#80
 
     const { notice } = result.structuredContent as { notice: string };
     expect(notice).toContain('LNU00009999');
-    expect(notice).toContain('Unable to connect. (failed after 4 attempts)');
+    expect(notice).toContain('service_unavailable');
+    expect(notice).toContain('BLS API availability');
     expect(notice).not.toContain('bls_search_series');
-    expect(contentText(result)).toContain('Unable to connect.');
+    expect(contentText(result)).toContain('service_unavailable');
+    expect(contentText(result)).not.toContain('Unable to connect.');
   });
 
   it('reports a doubly rejected fallback as a rejected request, not an invalid SeriesID', async () => {

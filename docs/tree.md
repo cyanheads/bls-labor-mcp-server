@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-10-19 01:58:57
+Generated on: 2026-11-01 04:51:08
 
 ```text
 bls-labor-mcp-server/
@@ -33,7 +33,8 @@ bls-labor-mcp-server/
 │   └── template.md
 ├── docs/
 │   ├── design.md
-│   └── idea.md
+│   ├── idea.md
+│   └── observation-mirror.md
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
@@ -42,6 +43,8 @@ bls-labor-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -140,6 +143,9 @@ bls-labor-mcp-server/
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── bls-labor-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -181,6 +187,8 @@ bls-labor-mcp-server/
 │   ├── integration/
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── agent-doc-entry.test.ts
 │   ├── services/
 │   │   ├── bls-api/
 │   │   │   ├── bls-api-mirror.test.ts
@@ -205,6 +213,7 @@ bls-labor-mcp-server/
 │   │   ├── bls-data-tools.service.test.ts
 │   │   ├── bls-dataframe-describe.tool.test.ts
 │   │   ├── bls-dataframe-drop.tool.test.ts
+│   │   ├── bls-dataframe-query.canvas.test.ts
 │   │   ├── bls-dataframe-query.tool.test.ts
 │   │   ├── bls-get-latest.tool.test.ts
 │   │   ├── bls-get-series.canvas.test.ts
@@ -230,7 +239,9 @@ bls-labor-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

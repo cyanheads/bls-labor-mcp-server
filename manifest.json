@@ -22,6 +22,7 @@
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
         "NODE_ENV": "production",
+        "CANVAS_PROVIDER_TYPE": "none",
         "BLS_API_KEY": "${user_config.BLS_API_KEY}"
       }
     }

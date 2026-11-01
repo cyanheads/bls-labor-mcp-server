@@ -273,8 +273,19 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     expect(() => blsSearchSeriesTool.input.parse({ query: 'test', limit: 0 })).toThrow();
   });
 
-  it('rejects limit above 50', () => {
-    expect(() => blsSearchSeriesTool.input.parse({ query: 'test', limit: 51 })).toThrow();
+  it('rejects fractional limits', () => {
+    expect(() => blsSearchSeriesTool.input.parse({ query: 'test', limit: 1.5 })).toThrow();
+  });
+
+  it('clamps limit above 50 and discloses the request even on an empty page', async () => {
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
+    const input = blsSearchSeriesTool.input.parse({ query: 'test', limit: 51 });
+    await blsSearchSeriesTool.handler(input, ctx);
+    expect(mockSearch).toHaveBeenLastCalledWith(expect.objectContaining({ limit: 50 }));
+    expect(getEnrichment(ctx).limitApplied).toBe(50);
+    expect(getEnrichment(ctx).notice).toContain('Requested limit=51; applied limit=50.');
+    expect(getEnrichment(ctx).notice).toContain('No matching series');
   });
 
   it('formats output with item when present (renamed from itemName)', () => {

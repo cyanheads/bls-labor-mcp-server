@@ -1,7 +1,7 @@
 /**
  * @fileoverview Drop a canvas dataframe by name. Idempotent. Opt-in via
  * BLS_DATAFRAME_DROP_ENABLED=true — off by default since per-table TTL handles
- * cleanup. Requires CANVAS_PROVIDER_TYPE=duckdb.
+ * cleanup. Unavailable when CANVAS_PROVIDER_TYPE=none.
  * @module mcp-server/tools/definitions/bls-dataframe-drop
  */
 

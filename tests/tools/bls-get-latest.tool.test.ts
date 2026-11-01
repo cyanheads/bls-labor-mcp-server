@@ -361,9 +361,9 @@ describe('blsGetLatestTool — additional coverage', () => {
     expect(() => blsGetLatestTool.input.parse({ series_ids: [] })).toThrow();
   });
 
-  it('rejects series_ids array with more than 50 entries', () => {
+  it('accepts above-cap inputs for explicit remainder reporting', () => {
     const ids = Array.from({ length: 51 }, (_, i) => `ID${i}`);
-    expect(() => blsGetLatestTool.input.parse({ series_ids: ids })).toThrow();
+    expect(blsGetLatestTool.input.parse({ series_ids: ids }).series_ids).toHaveLength(51);
   });
 
   it('formats output with failed series listed', () => {
