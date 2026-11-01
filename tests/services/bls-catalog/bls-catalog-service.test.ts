@@ -5432,6 +5432,17 @@ describe('BlsCatalogService.load — measure (#127)', () => {
     await svc.shutdown();
   });
 
+  it('leaves a cold survey unindexed, and says so, when its measure table also decodes its item', async () => {
+    // CU reads its item and its measure from cu.item.
+    const { 'cu.item': _dropped, ...withoutItem } = MEASURE_FILES;
+    const { svc, warnings } = await harvestFrom(withoutItem);
+    expect(svc.indexedSurveys).not.toContain('CU');
+    expect(warnings.filter((w) => w.includes('cu.item'))).toEqual([
+      '[bls-labor-mcp-server] Catalog: cu.item unavailable (HTTP 404) — its indexed rows are kept.\n',
+    ]);
+    await svc.shutdown();
+  });
+
   it('keeps a warm survey’s rows, measure included, when its measure table is unavailable', async () => {
     const dbPath = join(tmpDir, 'measure-warm.db');
     const old = createCatalogStore(dbPath);

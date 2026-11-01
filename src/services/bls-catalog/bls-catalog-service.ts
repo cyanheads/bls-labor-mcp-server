@@ -1568,11 +1568,18 @@ export class BlsCatalogService {
           cause = `body read failed: ${failure(error)}`;
         }
       }
-      // A survey with no indexed rows still indexes without its measure table (see parseSeries).
-      const kept =
-        warm || table !== survey.measure?.table
-          ? 'its indexed rows are kept'
-          : 'its rows index without a measure';
+      /**
+       * A survey with no indexed rows still indexes without its measure table
+       * (see parseSeries) — unless another dimension decodes through the same
+       * table (CU's item, PR's title), whose failure keeps the survey out.
+       */
+      const measureOnly =
+        !warm &&
+        table === survey.measure?.table &&
+        ![survey.area, survey.item, survey.frequency, ...(survey.title ?? [])].some(
+          (d) => d !== undefined && dimensionTables(d).includes(table),
+        );
+      const kept = measureOnly ? 'its rows index without a measure' : 'its indexed rows are kept';
       warn(`${abbr}.${table} unavailable (${cause}) — ${kept}.`);
     }
 
