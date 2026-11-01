@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-31 · ⚠️ Breaking
+
+BLS request fidelity, bounded retries, and a published labor-data guide.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-18 · ⚠️ Breaking · 🛡️ Security
 
 Series coverage and geographic relevance with complete-survey refreshes and bounded search expansion.
