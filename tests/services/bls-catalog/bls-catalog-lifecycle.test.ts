@@ -247,7 +247,8 @@ describe('configuration changes inside the TTL (#84)', () => {
     const svc = new BlsCatalogService(BASE, 'ua/1.0', path, 168, false);
     await svc.load(1);
 
-    expect(requested).toEqual([]);
+    // No survey is re-harvested; the OE code tables, which it does not hold, are requested.
+    expect(requested.sort()).toEqual(['oe.area', 'oe.datatype', 'oe.occupation']);
     expect(svc.totalSeries).toBe(1);
     await svc.shutdown();
   });

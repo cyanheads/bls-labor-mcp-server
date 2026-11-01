@@ -28,6 +28,7 @@ import {
   scheduleBlsCatalogRefresh,
   shutdownBlsCatalogService,
 } from '@/services/bls-catalog/bls-catalog-service.js';
+import { storeOewsTables } from './oews-fixtures.js';
 
 const coreConfig = {} as AppConfig;
 const coreStorage = {} as StorageService;
@@ -63,6 +64,7 @@ async function seed(path: string, completedAt: Date): Promise<void> {
     })),
     [],
   );
+  await storeOewsTables(store);
   await store.writeState({
     status: 'complete',
     completedAt: completedAt.toISOString(),

@@ -32,7 +32,7 @@ import {
   unpublishedOewsHint,
 } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
-import { OE_TABLE_FILES, tsv } from './oews-fixtures.js';
+import { OE_TABLE_FILES, storeOewsTables, tsv } from './oews-fixtures.js';
 
 let tmpDir: string;
 let dbCounter = 0;
@@ -64,13 +64,14 @@ function toMirrorRow(s: CatalogSeries): MirrorRow {
 }
 
 /**
- * Seed a fresh SQLite catalog with `entries` and the default survey list, then
- * return a loaded service over it (warm path, no harvest).
+ * Seed a fresh SQLite catalog with `entries`, the OE code tables, and the
+ * default survey list, then return a loaded service over it (warm path, no harvest).
  */
 async function seedAndLoad(entries: CatalogSeries[]): Promise<BlsCatalogService> {
   const dbPath = join(tmpDir, `catalog-${dbCounter++}.db`);
   const store = createCatalogStore(dbPath);
   await store.applyBatch(entries.map(toMirrorRow), []);
+  await storeOewsTables(store);
   await store.writeState({
     status: 'complete',
     completedAt: new Date().toISOString(),
@@ -4494,6 +4495,7 @@ describe('BlsCatalogService.load racing shutdown', () => {
     const dbPath = join(tmpDir, 'race.db');
     const store = createCatalogStore(dbPath);
     await store.applyBatch(FIXTURES.map(toMirrorRow), []);
+    await storeOewsTables(store); // a complete index with its tables: nothing is due
     await store.writeState({
       status: 'complete',
       completedAt: new Date().toISOString(),
@@ -6409,6 +6411,23 @@ describe('BlsCatalogService.load — the OE code tables on the refresh schedule 
     vi.setSystemTime(T0 + 169 * HOUR);
     const lapsed = await check(restarted, requested);
     expect(lapsed).toEqual(expect.arrayContaining([...OE_FILES, 'jt.series']));
+    await restarted.shutdown();
+  });
+
+  it('retries the tables at the first check after a restart when none are stored', async () => {
+    const path = join(tmpDir, `oe-restart-${dbCounter++}.db`);
+    const { requested, failing } = serveCatalog();
+    failing.add('oe.datatype');
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    await svc.load(1); // every survey succeeds, so the state is complete; the tables fail
+    expect(await stateOf(path)).toMatchObject({ status: 'complete' });
+    expect(svc.storedOewsTables).toBeUndefined();
+    await svc.shutdown();
+
+    failing.clear();
+    const restarted = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    expect((await check(restarted, requested)).sort()).toEqual([...OE_FILES].sort());
+    expect(restarted.storedOewsTables).toBeDefined();
     await restarted.shutdown();
   });
 });

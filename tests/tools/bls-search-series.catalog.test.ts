@@ -181,7 +181,10 @@ async function seedCatalog(dbPath: string, rows: CatalogSeries[]): Promise<void>
  */
 const fetched: string[] = [];
 
-/** Point the service at a freshly seeded index and load it. Any fetch fails the load loudly. */
+/**
+ * Point the service at a freshly seeded index and load it. The index holds no
+ * OE code tables, so the load requests them; every fetch rejects, and none is stored.
+ */
 async function startService(
   env: Record<string, string> = {},
   rows: CatalogSeries[] = ALL_ROWS,
@@ -225,10 +228,14 @@ describe('bls_search_series over a seeded catalog', () => {
   beforeAll(() => startService());
   afterAll(() => stopService());
 
-  it('loads the seeded index without fetching', () => {
+  it('loads the seeded index, fetching only the OE code tables it does not hold', () => {
     expect(getBlsCatalogService().totalSeries).toBe(ALL_ROWS.length);
-    expect(globalThis.fetch).not.toHaveBeenCalled();
-    expect(fetched).toEqual([]);
+    expect(fetched.map((u) => u.slice(u.lastIndexOf('/') + 1)).sort()).toEqual([
+      'oe.area',
+      'oe.datatype',
+      'oe.occupation',
+    ]);
+    expect(getBlsCatalogService().storedOewsTables).toBeUndefined();
   });
 
   describe('offset omitted (characterization)', () => {

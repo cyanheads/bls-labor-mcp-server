@@ -1252,8 +1252,9 @@ export class BlsCatalogService {
   /**
    * The first check's schedule, from the stored sync state: every survey last
    * succeeded at the stored completion when the state records a complete
-   * harvest of the configured survey list (persisted in `checkpoint`), and so
-   * did the OE code tables, which do not hold the state incomplete. Otherwise —
+   * harvest of the configured survey list (persisted in `checkpoint`). The OE
+   * code tables do not hold the state incomplete, so a completion vouches for
+   * them only when a usable set is stored; without one they are due. Otherwise —
    * an incomplete refresh, a missing list (an index from an earlier release), a
    * different list, or a completion an index-version migration cleared —
    * nothing has a record, so all is due.
@@ -1267,7 +1268,7 @@ export class BlsCatalogService {
     ) {
       return new Map();
     }
-    const current = [...this.surveys.map((s) => s.abbr), OEWS_TABLES];
+    const current = [...this.surveys.map((s) => s.abbr), ...(this.oewsTables ? [OEWS_TABLES] : [])];
     return new Map(
       current.map((unit): [string, SurveyRefresh] => [unit, { state: 'current', succeededAtMs }]),
     );

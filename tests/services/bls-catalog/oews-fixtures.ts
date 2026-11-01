@@ -6,6 +6,8 @@
  * @module tests/services/bls-catalog/oews-fixtures
  */
 
+import type { MirrorStore } from '@cyanheads/mcp-ts-core/mirror';
+
 /** Render rows as a LABSTAT flat file: tab-delimited, CRLF line endings. */
 export function tsv(...rows: string[][]): string {
   return `${rows.map((r) => r.join('\t')).join('\r\n')}\r\n`;
@@ -102,3 +104,16 @@ export const OE_TABLE_FILES: Readonly<Record<string, string>> = {
   'oe.occupation': OE_OCCUPATION,
   'oe.datatype': OE_DATATYPE,
 };
+
+/**
+ * Store the three tables in a catalog index, as a harvest that fetched them
+ * leaves it: a seeded `complete` state then vouches for them on restart too.
+ */
+export async function storeOewsTables(store: MirrorStore): Promise<void> {
+  const insert = (await store.raw()).prepare(
+    'INSERT INTO bls_oews_tables (name, body) VALUES (?, ?)',
+  );
+  for (const [file, body] of Object.entries(OE_TABLE_FILES)) {
+    insert.run(file.slice('oe.'.length), body);
+  }
+}
