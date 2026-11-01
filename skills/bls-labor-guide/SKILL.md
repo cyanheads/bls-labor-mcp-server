@@ -13,13 +13,13 @@ Use BLS for published US labor, employment, price, compensation, and productivit
 
 ## Identifiers
 
-Survey abbreviations come from `bls_list_surveys`. Resolve concepts with `bls_search_series` and retain the returned SeriesID and decoded meaning together; do not construct an ID by guessing its positional codes. Search also accepts a known SeriesID for exact lookup.
+Survey abbreviations come from `bls_list_surveys`. Resolve concepts with `bls_search_series` and retain the returned SeriesID and decoded meaning together; do not construct an ID by guessing its positional codes. The one exception is a row search itself marks composed (OEWS wage series built from code tables): it is unconfirmed until `bls_get_series` returns data for it, and BLS leaves many occupation-area cells unpublished, so fall back to the state or national row for the same occupation. Search also accepts a known SeriesID for exact lookup.
 
-For a survey outside the offline index, obtain its SeriesID from an authoritative BLS source before fetching: listing the survey does not make its series searchable here. Dataframe names come from `bls_get_series`'s `dataset.name`, `bls_dataframe_describe`, or `bls_dataframe_query`'s `registered_as`.
+For a survey outside the offline index, obtain its SeriesID from an authoritative BLS source before fetching: listing the survey does not make its series searchable here, and each listed survey's `searchCoverage` says whether search reaches it. Dataframe names come from `bls_get_series`'s `dataset.name`, `bls_dataframe_describe`, or `bls_dataframe_query`'s `registered_as`.
 
 ## Gates
 
-- Before selecting a search hit, check its subject, geography, seasonal adjustment, and publication frequency. A title can appear at several frequencies. The `area` search is a substring filter, not a geocoder; numeric fragments can match unrelated IDs. Confirm the returned area rather than trusting the filter alone.
+- Before selecting a search hit, check its subject, geography, seasonal adjustment, and publication frequency. A title can appear at several frequencies. The `area` search is not a geocoder: pass a state as `TX` or `48`, a metro area as its CBSA (`42660`), a county as its 5-digit FIPS (`53033`), a city as state plus place FIPS (`5363000`), and a CPI area as 4 digits (`0100`). Place names are substring matches. Confirm the returned area rather than trusting the filter alone.
 - Before concluding that BLS lacks a series, check whether its survey is indexed, follow available search pages, and inspect capped-result notices. Narrow a capped search instead of treating its count as exhaustive. A catalog snapshot can miss new series; its first and last years do not prove continuous coverage or discontinuation.
 - Before comparing observations, establish compatible geography, units, frequency, and seasonal treatment from the returned metadata and series meaning. A CPI index level is not a percent inflation rate; a change already encoded in a series is not its underlying level. If units remain unknown, resolve them from BLS before labeling or combining the values.
 - Before calculating, check availability and footnotes. The raw `-` value is missing, never zero. Keep missing periods visible when computing changes or rolling windows; twelve rows are not necessarily twelve consecutive months.

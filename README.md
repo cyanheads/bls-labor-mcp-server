@@ -47,16 +47,16 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 
 ### `bls_list_surveys` <sub>tool</sub>
 
-- Optional `category` filters survey programs by subject; returns codes, names, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`).
+- Optional `category` filters survey programs by subject; returns codes, names, and calculation-support flags (`allowsNetChange`, `allowsPercentChange`, `hasAnnualAverages`). Each row's `searchCoverage` (`indexed`, `composed`, or `none`) says whether `bls_search_series` reaches the survey, with `seriesIndexed` for indexed ones.
 - Backed by the BLS surveys API with 30-day process-local caching. Annual-average support is advisory; read `bls_get_series`'s `annualAverageRows` for the rows actually returned.
 
 ---
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Search by text or SeriesID, with optional `survey`, `area` (substring of area, title, or SeriesID), and `seasonal_adjustment`; blank filters are omitted. `limit` defaults to 10 and requests above 50 clamp to 50 with notice, with `offset` pagination. Without an area filter, place names prefer matching decoded areas; national series win equal-score ties within each preference group. Exact SeriesIDs rank first.
+- Search by text or SeriesID, with optional `survey`, `area`, and `seasonal_adjustment`; blank filters are omitted. `area` takes a USPS or 2-digit FIPS state code; a 3-, 4-, 5-, or 7-digit CSA, CPI area, county or CBSA, or state + place code; otherwise a substring of area, title, or SeriesID (all-digit values outside those lengths add a notice). `limit` defaults to 10 and requests above 50 clamp to 50 with notice, with `offset` pagination. Exact SeriesIDs rank first, then series matching every query word, with any place the query names in full ahead of the rest; at equal score, current series rank first, then national ones, then the JOLTS aggregate.
 - Returns decoded SeriesIDs, titles, `frequency`, and independently optional `startYear`, `endYear`, and `endPeriod` coverage (for example, `1982–2005 Q04`). Coverage describes the catalog snapshot, not continuous observations. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
-- Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Unindexed surveys remain fetchable by SeriesID.
+- Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Under `survey: "OE"` without those rows, it composes OEWS SeriesIDs from the OE code tables, up to 50 per search; each is marked `composed: true` and is unconfirmed until `bls_get_series` returns data for it. Unindexed surveys remain fetchable by SeriesID.
 
 ---
 
@@ -235,8 +235,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `BLS_BASE_URL` | BLS API v2 base URL. | `https://api.bls.gov/publicAPI/v2` |
 | `BLS_CATALOG_BASE_URL` | LABSTAT flat-file base URL. Override to point at a local mirror. | `https://download.bls.gov/pub/time.series` |
 | `BLS_CATALOG_DB_PATH` | On-disk SQLite catalog index — queried on demand and persisted across restarts. Empty uses an in-memory DB (re-harvested each boot). Mount a volume here in containers. | `.cache/bls-catalog.db` |
-| `BLS_CATALOG_CACHE_TTL_HOURS` | Catalog freshness window in hours — re-harvest once the index is older, checked at startup and hourly while running. | `168` (7 days) |
-| `BLS_CATALOG_INCLUDE_OES` | Include the OES/OEWS wage survey (~6M series / ~1.2 GB; multi-minute first harvest). Off by default — OES series stay fetchable by ID. | `false` |
+| `BLS_CATALOG_CACHE_TTL_HOURS` | Per-survey catalog freshness window in hours — a survey re-harvests once its last success is older, and a failed survey's retry backoff is capped at this many hourly checks. Checked at startup and hourly while running. | `168` (7 days) |
+| `BLS_CATALOG_INCLUDE_OES` | Include the OES/OEWS wage survey (~6M series / ~1.26 GB; Bun-only; multi-minute first harvest). Off by default — OES series stay fetchable by ID, and search composes them from the small OE code tables. | `false` |
 | `BLS_OBSERVATIONS_MIRROR_ENABLED` | Serve observations from a local SQLite mirror instead of the live API (requires a one-time bootstrap — see below). | `false` |
 | `BLS_DATASET_TTL_SECONDS` | Per-dataframe TTL for canvas-registered tables, in seconds. | `86400` (24 h) |
 | `BLS_DATAFRAME_DROP_ENABLED` | Expose `bls_dataframe_drop`. TTL handles cleanup by default. | `false` |
@@ -257,7 +257,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Observation mirror (optional)
 
-For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls_get_latest` from an embedded SQLite store of the LABSTAT files instead of the BLS API, removing the 500/day quota cap; requests fall back to the live API until it is built. Enable it with `BLS_OBSERVATIONS_MIRROR_ENABLED=true`, then run the one-time bootstrap: `node dist/services/bls-observations/subprocess.js --init`. Settings, survey coverage, fallback and calculation behavior, and upgrade notes are in [docs/observation-mirror.md](./docs/observation-mirror.md).
+For high-volume workloads, an opt-in local mirror serves `bls_get_series` / `bls_get_latest` from an embedded SQLite store of the LABSTAT files instead of the BLS API, removing the 500/day quota cap; requests fall back to the live API until it is built. Enable it with `BLS_OBSERVATIONS_MIRROR_ENABLED=true`, then run the one-time bootstrap: `node dist/services/bls-observations/subprocess.js --init`. Settings, survey coverage, harvest checkpoint and exit codes, fallback and calculation behavior, and upgrade notes are in [docs/observation-mirror.md](./docs/observation-mirror.md).
 
 ## Running the server
 
@@ -302,7 +302,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/bls-api` | BLS API v2 service — batch fetch, latest-value GET, surveys metadata. |
 | `src/services/bls-catalog` | LABSTAT flat-file catalog — offline series index and search. |
 | `src/services/bls-observations` | Optional LABSTAT observation mirror — embedded SQLite store, ingester, and refresh subprocess. |
-| `src/services/bls-periods` | Annual-average period semantics (`M13`/`Q05`/`S03`) shared by the API and mirror paths. |
+| `src/services/bls-periods` | Period-code semantics shared by the API and mirror paths: annual-average codes (`M13`/`Q05`/`S03`) and the live API's period names. |
 | `src/services/canvas-bridge` | DataCanvas bridge — dataframe registration, SQL gate, lifecycle management. |
 | `docs/design.md` | Full tool surface specification, service architecture, and error contracts. |
 | `docs/observation-mirror.md` | Observation mirror setup, coverage, and upgrade notes. |

@@ -44,7 +44,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - `calculations: true` requests BLS-server-side net change and percent change; a survey returns whichever it supports (CPI/PPI return percent change only). A “does not produce calculations” advisory preserves observations without calculation fields; an explicit “does not support calculations” rejection raises `calculations_not_supported` — `bls_list_surveys` predicts which come back. Mirror-served series carry no calculations; `bls_get_series` then reports `calculationsApplied: false`.
 - With catalog metadata requested, BLS intermittently answers a request holding a nonexistent SeriesID with a generic `REQUEST_FAILED` naming no series. The service re-issues such a request once without catalog metadata (one extra query, on that answer only) and fills the metadata from the catalog index.
 
-**Catalog search is offline.** `bls_search_series` queries an on-disk SQLite index of the LABSTAT flat files, harvested at startup when the index is missing or stale and re-checked by an hourly `bls-catalog-refresh` job — no API quota consumed. A harvest removes rows its survey's `.series` file no longer lists and rows of surveys no longer configured. Bump `CATALOG_INDEX_VERSION` in `bls-catalog-service.ts` whenever the harvest's output changes, so persisted indexes re-harvest after an upgrade; a change to the configured survey set needs no bump, since the persisted survey list marks the index stale on its own. The BLS FAQ confirms there is no API catalog endpoint.
+**Catalog search is offline.** `bls_search_series` queries an on-disk SQLite index of the LABSTAT flat files, harvested at startup when the index is missing or stale and re-checked by an hourly `bls-catalog-refresh` job — no API quota consumed. Freshness is per survey: each hourly check harvests only the surveys whose TTL lapsed or whose failure backoff (counted in checks, capped at `BLS_CATALOG_CACHE_TTL_HOURS`) ran out, and an index with no series harvests every survey. A harvest removes rows its survey's `.series` file no longer lists and rows of surveys no longer configured. Every check also stores the OE code tables (`bls_oews_tables`), from which `bls_search_series` composes OEWS SeriesIDs while OE rows are not indexed. Bump `CATALOG_INDEX_VERSION` in `bls-catalog-service.ts` (currently 5) whenever the harvest's output changes, so persisted indexes re-harvest after an upgrade; a change to the configured survey set needs no bump, since the persisted survey list marks the index stale on its own. The BLS FAQ confirms there is no API catalog endpoint.
 
 ---
 
@@ -217,14 +217,16 @@ src/
       types.ts                          # BLS API types
     bls-catalog/
       bls-catalog-service.ts            # LABSTAT flat-file catalog (offline search + on-disk cache)
+      area-filter.ts                    # `area` grammar: state, CSA, CPI area, county/CBSA, and place codes → area names
+      oews-composition.ts               # OEWS SeriesIDs composed from the OE code tables when OE rows are not indexed
       types.ts                          # Catalog domain types
     bls-observations/                   # Optional observation mirror (opt-in, default off)
-      bls-observations-service.ts       # defineMirror wrapper — SQLite store + query
-      ingester.ts                       # LABSTAT .data.* sync generator
+      bls-observations-service.ts       # defineMirror wrapper — SQLite store, query, footnote tables
+      ingester.ts                       # LABSTAT .data.* sync generator (directory-listing discovery, checkpoint)
       subprocess.ts                     # Event-loop-safe harvest subprocess (dual-role entry)
       types.ts                          # Observation row types
     bls-periods/
-      period-codes.ts                   # Annual-average period semantics (M13/Q05/S03) — shared by the API and mirror paths
+      period-codes.ts                   # Period-code semantics: annual-average codes (M13/Q05/S03) and the live API's period names — shared by the API and mirror paths
     canvas-bridge/
       canvas-bridge.ts                  # DataCanvas bridge (dataframe registration, SQL gate, lifecycle)
   mcp-server/
@@ -400,7 +402,7 @@ import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service
 - [ ] BLS wrapping: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
 - [ ] BLS wrapping: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] BLS wrapping: tests include at least one sparse payload case with omitted upstream fields
-- [ ] Error contracts declared for quota_exceeded, series_not_found, series_locked, no_data_for_period, calculations_not_supported, catalog_unavailable (see design.md)
+- [ ] Error contracts declared for quota_exceeded, series_not_found, series_locked, no_data_for_period, calculations_not_supported, catalog_loading, catalog_unavailable (see design.md)
 - [ ] A “does not produce calculations” advisory preserves observations; an explicit “does not support calculations” rejection retains `calculations_not_supported`; mirror-served rows report `calculationsApplied: false`
 - [ ] `bls_get_latest` issues N concurrent GETs (one per SeriesID, fanned out via `Promise.allSettled`) — keep recommended limit ≤10 in docs
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
