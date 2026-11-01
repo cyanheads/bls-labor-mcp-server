@@ -1162,6 +1162,11 @@ describe('bls_search_series — OEWS SeriesIDs composed from the OE code tables 
   it.each([
     ['an occupation the tables lack', { query: 'zzzqqq', survey: 'OE' }],
     ['an area the tables lack', { query: 'registered nurses', survey: 'OE', area: 'Atlantis' }],
+    // No substring fallback applies to an all-digit area under OE, so no fragment notice either.
+    [
+      'an all-digit area of no OEWS code length',
+      { query: 'registered nurses', survey: 'OE', area: '123456' },
+    ],
     [
       'an OEWS SeriesID whose codes the tables lack',
       { query: 'OEUM009999900000029114103', survey: 'OE' },

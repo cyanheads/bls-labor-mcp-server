@@ -232,12 +232,6 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     const limit = Math.min(input.limit, 50);
     const clampNotice =
       input.limit > limit ? `Requested limit=${input.limit}; applied limit=${limit}. ` : '';
-    const fragmentNotice =
-      area !== undefined && areaForm(area).kind === 'fragment'
-        ? 'The all-digit area is not an area-code length, so it matched as a substring of the area name, title, or SeriesID. Area codes are 2 digits (state FIPS), 3 (CSA), 4 (CPI area), 5 (county FIPS or CBSA), or 7 (state + place FIPS); a USPS code such as TX also names a state. '
-        : '';
-    const prefix = `${clampNotice}${fragmentNotice}`;
-    const notice = (message: string) => ctx.enrich.notice(`${prefix}${message}`);
     const result = await service.search({
       query: input.query,
       survey,
@@ -246,6 +240,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       limit,
       offset,
     });
+    // OEWS composition reads `area` by its own grammar, with no substring fallback for digits.
+    const fragmentNotice =
+      !result.composed && area !== undefined && areaForm(area).kind === 'fragment'
+        ? 'The all-digit area is not an area-code length, so it matched as a substring of the area name, title, or SeriesID. Area codes are 2 digits (state FIPS), 3 (CSA), 4 (CPI area), 5 (county FIPS or CBSA), or 7 (state + place FIPS); a USPS code such as TX also names a state. '
+        : '';
+    const prefix = `${clampNotice}${fragmentNotice}`;
+    const notice = (message: string) => ctx.enrich.notice(`${prefix}${message}`);
     const { total, capped } = result;
     const shown = result.series.length;
     const nextOffset = offset + shown < total ? offset + shown : undefined;
