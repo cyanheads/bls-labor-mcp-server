@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-11-01
+
+The catalog refreshes per survey and indexes eight more, bls_search_series composes OEWS SeriesIDs and ranks complete matches first, and the observation mirror reads every file BLS serves and returns rows shaped like the live API.
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-31 · ⚠️ Breaking
 
 BLS request fidelity, bounded retries, and a published labor-data guide.

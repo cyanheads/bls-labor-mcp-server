@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 04:57:39
+Generated on: 2026-11-01 12:36:09
 
 ```text
 bls-labor-mcp-server/
@@ -169,7 +169,9 @@ bls-labor-mcp-server/
 │   │   │   ├── bls-api-service.ts
 │   │   │   └── types.ts
 │   │   ├── bls-catalog/
+│   │   │   ├── area-filter.ts
 │   │   │   ├── bls-catalog-service.ts
+│   │   │   ├── oews-composition.ts
 │   │   │   └── types.ts
 │   │   ├── bls-observations/
 │   │   │   ├── bls-observations-service.ts
@@ -183,6 +185,19 @@ bls-labor-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
+│   │   ├── labstat-listings/
+│   │   │   ├── ce.files
+│   │   │   ├── ce.listing
+│   │   │   ├── ce.stale
+│   │   │   ├── jt.files
+│   │   │   ├── jt.listing
+│   │   │   ├── jt.stale
+│   │   │   ├── pc.files
+│   │   │   ├── pc.listing
+│   │   │   ├── pc.stale
+│   │   │   ├── wp.files
+│   │   │   ├── wp.listing
+│   │   │   └── wp.stale
 │   │   ├── bls-live-responses.ts
 │   │   └── duckdb-canvas.ts
 │   ├── integration/
@@ -196,13 +211,18 @@ bls-labor-mcp-server/
 │   │   │   ├── bls-api-service-retry.test.ts
 │   │   │   └── bls-api-service.test.ts
 │   │   ├── bls-catalog/
+│   │   │   ├── area-filter.test.ts
 │   │   │   ├── bls-catalog-lifecycle.test.ts
 │   │   │   ├── bls-catalog-refresh.test.ts
-│   │   │   └── bls-catalog-service.test.ts
+│   │   │   ├── bls-catalog-service.test.ts
+│   │   │   ├── linear-time.ts
+│   │   │   ├── oews-composition.test.ts
+│   │   │   └── oews-fixtures.ts
 │   │   ├── bls-observations/
 │   │   │   ├── bls-observations-routing.test.ts
 │   │   │   ├── bls-observations-service.test.ts
 │   │   │   ├── ingester.test.ts
+│   │   │   ├── labstat-fake.ts
 │   │   │   ├── mirror-migration.test.ts
 │   │   │   └── subprocess.test.ts
 │   │   ├── bls-periods/
