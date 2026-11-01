@@ -35,7 +35,7 @@ Live series use local-catalog titles where available and preserve optional BLS `
 
 ### Resources
 
-None — all data is dynamic (time series by definition). Tool surface is self-sufficient.
+`skill://bls-labor-guide/SKILL.md` serves the published BLS labor guide, covering SeriesID resolution, compatible comparisons, missing observations, annual summaries, and DataCanvas analysis. Time-series data remains available through tools.
 
 ### Prompts
 
@@ -266,7 +266,7 @@ BLS missing-value rows preserve the raw `value: "-"` for round-tripping and expo
 - **`bls_decode_series_id` tool** → declined. Decoding is better done as enriched output in `bls_search_series` results (return the decoded components alongside the ID). A standalone decode tool adds a round-trip for no workflow benefit.
 - **`bls_compare_series` tool** → declined. Cross-series comparison is arithmetic the agent can do from `bls_get_series` output. A dedicated comparison tool would be pure wrapper around data the agent already has.
 - **App tool for tabular results** → declined. No MCP Apps-capable client justification; DataCanvas via `api-canvas` handles the spillover case without the iframe/CSP/format-twin maintenance cost.
-- **Resources** → declined. BLS data is time-dynamic by nature (series values change monthly). There's no stable-URI, cacheable, injectable-context use case that tools don't already serve.
+- **Time-series resources** → declined. BLS observations change over time and remain tool results; the stable guide resource provides usage instructions rather than observations.
 - **Catalog refresh by `setTimeout(ttl)`** → declined for an hourly scheduler check. Timers clamp delays above 2^31−1 ms (~596 h), and `BLS_CATALOG_CACHE_TTL_HOURS` has no upper bound, so a long TTL would fire at once and loop.
 - **Catalog config staleness through `CATALOG_INDEX_VERSION`** → declined for the persisted survey list. Index-version migrations run only when the code constant rises and cannot see the runtime environment, so an OES off → on → off toggle has no monotonic version. Freshness follows the refresh status and configured survey list rather than `indexedSurveys`: retained rows do not prove that a survey refreshed successfully.
 - **Catalog stale-row removal by generation column** (`DELETE WHERE gen != current`) → declined for a per-survey diff, which needs no schema migration.
