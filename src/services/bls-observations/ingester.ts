@@ -334,8 +334,10 @@ type DataFileOutcome =
 
 /**
  * Stream one data file's rows as pages of {@link PAGE_SIZE}, retrying a
- * transient failure from the file's first unread row. A file without the
- * observation header is unread: nothing in it can be ingested.
+ * transient failure from the row the read began at (the top of the file, or an
+ * init's resume row): a retry yields again any pages the failed attempt sent,
+ * which upsert by row key. A file without the observation header is unread:
+ * nothing in it can be ingested.
  */
 async function* readDataFile(
   url: string,
