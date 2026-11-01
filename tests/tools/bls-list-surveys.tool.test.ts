@@ -4,12 +4,13 @@
  */
 
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   blsListSurveysTool,
   CATEGORY_MAP,
 } from '@/mcp-server/tools/definitions/bls-list-surveys.tool.js';
 import { SURVEY_CAPABILITIES } from '@/services/bls-api/bls-api-service.js';
+import type { SurveySearchCoverage } from '@/services/bls-catalog/types.js';
 
 const MOCK_SURVEYS = [
   {
@@ -40,6 +41,14 @@ const listSurveysMock = vi.fn();
 vi.mock('@/services/bls-api/bls-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/bls-api/bls-api-service.js')>()),
   getBlsApiService: () => ({ listSurveys: listSurveysMock }),
+}));
+
+/** The catalog's answer per survey; the default is a catalog whose first load has not completed. */
+let searchCoverage: (abbr: string) => SurveySearchCoverage | undefined = () => undefined;
+
+vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/bls-catalog/bls-catalog-service.js')>()),
+  getBlsCatalogService: () => ({ searchCoverage: (abbr: string) => searchCoverage(abbr) }),
 }));
 
 describe('blsListSurveysTool', () => {
@@ -354,9 +363,142 @@ describe('blsListSurveysTool — category coverage of the full survey inventory 
     expect(blsListSurveysTool.input.shape.category.description).toMatch(/more than one category/);
   });
 
-  it('says in the tool description that search covers only the offline index', () => {
+  it('says in the tool description that searchCoverage tells how bls_search_series reaches a survey', () => {
     expect(blsListSurveysTool.description).toContain(
-      'bls_search_series covers only the surveys in its offline index',
+      "each row's searchCoverage says whether bls_search_series reaches the survey through its offline index, composes its SeriesIDs from code tables, or cannot search it, in which case its series are fetched by SeriesID with bls_get_series",
     );
+    expect(blsListSurveysTool.description).not.toContain('covers only the surveys');
+  });
+});
+
+describe('blsListSurveysTool — searchCoverage (#121)', () => {
+  const mk = (surveyAbbreviation: string, surveyName: string) => ({
+    surveyAbbreviation,
+    surveyName,
+    allowsNetChange: false,
+    allowsPercentChange: false,
+    hasAnnualAverages: false,
+  });
+  const SURVEYS = [
+    mk('CE', 'Current Employment Statistics'),
+    mk('CU', 'CPI - All Urban Consumers'),
+    mk('EN', 'Quarterly Census of Employment and Wages'),
+    mk('LN', 'Labor Force Statistics from the Current Population Survey'),
+    mk('OE', 'Occupational Employment and Wage Statistics'),
+  ];
+  /** A catalog index holding CE, CU, and LN, with the OE code tables stored. */
+  const LOADED: Record<string, SurveySearchCoverage> = {
+    CE: { searchCoverage: 'indexed', seriesIndexed: 2 },
+    CU: { searchCoverage: 'indexed', seriesIndexed: 1 },
+    LN: { searchCoverage: 'indexed', seriesIndexed: 120 },
+    OE: { searchCoverage: 'composed' },
+  };
+  const loaded = (abbr: string): SurveySearchCoverage => LOADED[abbr] ?? { searchCoverage: 'none' };
+
+  beforeEach(() => {
+    listSurveysMock.mockResolvedValue(SURVEYS);
+  });
+
+  afterEach(() => {
+    searchCoverage = () => undefined;
+  });
+
+  async function list(category?: 'wages') {
+    const ctx = createMockContext({ errors: blsListSurveysTool.errors });
+    const result = await blsListSurveysTool.handler(
+      blsListSurveysTool.input.parse(category ? { category } : {}),
+      ctx,
+    );
+    const text = (blsListSurveysTool.format!(result)[0] as { text: string }).text;
+    const rows = Object.fromEntries(
+      result.surveys.map((s) => [
+        s.abbreviation,
+        { searchCoverage: s.searchCoverage, seriesIndexed: s.seriesIndexed },
+      ]),
+    );
+    return { result, rows, text };
+  }
+
+  it('marks indexed surveys with their counts, OE composed, and every other survey none', async () => {
+    searchCoverage = loaded;
+    const { result, rows, text } = await list();
+    expect(rows).toEqual({
+      CE: { searchCoverage: 'indexed', seriesIndexed: 2 },
+      CU: { searchCoverage: 'indexed', seriesIndexed: 1 },
+      EN: { searchCoverage: 'none', seriesIndexed: undefined },
+      LN: { searchCoverage: 'indexed', seriesIndexed: 120 },
+      OE: { searchCoverage: 'composed', seriesIndexed: undefined },
+    });
+    expect(result.surveys.find((s) => s.abbreviation === 'EN')).not.toHaveProperty('seriesIndexed');
+    expect(text.split('\n').slice(2)).toEqual([
+      '**CE** — Current Employment Statistics · search: indexed, 2 series indexed',
+      '**CU** — CPI - All Urban Consumers · search: indexed, 1 series indexed',
+      '**EN** — Quarterly Census of Employment and Wages · search: none',
+      '**LN** — Labor Force Statistics from the Current Population Survey · search: indexed, 120 series indexed',
+      '**OE** — Occupational Employment and Wage Statistics · search: composed',
+    ]);
+  });
+
+  it('returns the same values for the rows a category filter keeps', async () => {
+    searchCoverage = loaded;
+    const { rows } = await list('wages');
+    expect(rows).toEqual({
+      CE: { searchCoverage: 'indexed', seriesIndexed: 2 },
+      EN: { searchCoverage: 'none', seriesIndexed: undefined },
+      OE: { searchCoverage: 'composed', seriesIndexed: undefined },
+    });
+  });
+
+  it('omits both fields on every row before the first catalog load completes', async () => {
+    const { result, text } = await list();
+    for (const s of result.surveys) {
+      expect(s).not.toHaveProperty('searchCoverage');
+      expect(s).not.toHaveProperty('seriesIndexed');
+    }
+    expect(text).not.toContain('search:');
+  });
+
+  it('marks every survey none, OE included, over a loaded but empty index', async () => {
+    searchCoverage = () => ({ searchCoverage: 'none' });
+    const { rows, text } = await list();
+    expect(Object.values(rows)).toEqual(
+      SURVEYS.map(() => ({ searchCoverage: 'none', seriesIndexed: undefined })),
+    );
+    expect(text).toContain('**OE** — Occupational Employment and Wage Statistics · search: none');
+  });
+
+  it('reads the catalog on each call, so a harvest between calls shows without a restart', async () => {
+    searchCoverage = loaded;
+    expect((await list()).rows.CE).toEqual({ searchCoverage: 'indexed', seriesIndexed: 2 });
+    searchCoverage = (abbr) =>
+      abbr === 'CE' ? { searchCoverage: 'indexed', seriesIndexed: 3 } : loaded(abbr);
+    expect((await list()).rows.CE).toEqual({ searchCoverage: 'indexed', seriesIndexed: 3 });
+  });
+
+  it('renders each field that structuredContent carries', () => {
+    const blocks = blsListSurveysTool.format!({
+      surveys: [
+        {
+          abbreviation: 'CE',
+          name: 'CES',
+          allowsNetChange: false,
+          allowsPercentChange: false,
+          hasAnnualAverages: false,
+        },
+        {
+          abbreviation: 'JT',
+          name: 'JOLTS',
+          allowsNetChange: false,
+          allowsPercentChange: false,
+          hasAnnualAverages: false,
+          searchCoverage: 'indexed',
+          seriesIndexed: 11,
+        },
+      ],
+      total: 2,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**CE** — CES\n');
+    expect(text).toContain('**JT** — JOLTS · search: indexed, 11 series indexed');
   });
 });

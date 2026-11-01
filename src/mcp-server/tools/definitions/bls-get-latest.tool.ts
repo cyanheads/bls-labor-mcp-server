@@ -10,6 +10,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
+import { unpublishedOewsHint } from '@/services/bls-catalog/bls-catalog-service.js';
 
 /**
  * Failures that are verdicts on the request rather than on one series. Every
@@ -163,7 +164,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       .string()
       .optional()
       .describe(
-        'Guidance for unprocessed IDs, unavailable observations, or failed series — bls_search_series for a SeriesID BLS rejected, or the reason and recovery for a request failure that left other series answered. Absent when all requested IDs returned available observations.',
+        'Guidance for unprocessed IDs, unavailable observations, or failed series — bls_search_series for a SeriesID BLS rejected, the state or national row to request for an OEWS SeriesID BLS reports nonexistent, or the reason and recovery for a request failure that left other series answered. Absent when all requested IDs returned available observations.',
       ),
   },
 
@@ -209,6 +210,8 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     }> = [];
     const failed: Array<{ seriesId: string; error: string }> = [];
     const requestLevel: Array<{ seriesId: string; error: McpError; reason: string }> = [];
+    /** The row to request instead of each OEWS SeriesID BLS reports nonexistent (#119). */
+    const oewsFallbacks = new Map<string, string>();
     let unavailableCount = 0;
 
     for (const [i, settlement] of pairs.entries()) {
@@ -221,6 +224,9 @@ export const blsGetLatestTool = tool('bls_get_latest', {
           if (typeof reason === 'string' && REQUEST_LEVEL_REASONS.has(reason)) {
             requestLevel.push({ seriesId: requestedId, error: err, reason });
           }
+          const fallback =
+            reason === 'series_not_found' ? unpublishedOewsHint(requestedId) : undefined;
+          if (fallback) oewsFallbacks.set(requestedId, fallback);
         }
         const errorMsg = err instanceof Error ? err.message : String(err);
         failed.push({ seriesId: requestedId, error: errorMsg });
@@ -265,8 +271,14 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       notices.push(
         `Requested ${canonicalIds.length} unique series; applied limit 50. Request the remaining SeriesIDs separately: ${unprocessedSeriesIds.join(', ')}.`,
       );
+    /** Failed IDs named and sent to bls_search_series. */
+    const searchNotice = (ids: string[]) =>
+      `${ids.join(', ')} failed. Use bls_search_series to verify ${ids.length === 1 ? 'that SeriesID' : 'those SeriesIDs'}.`;
     if (requestLevel.length === 0) {
-      if (failed.length > 0) {
+      const searchable = failed.filter((f) => !oewsFallbacks.has(f.seriesId));
+      if (oewsFallbacks.size > 0) {
+        if (searchable.length > 0) notices.push(searchNotice(searchable.map((f) => f.seriesId)));
+      } else if (failed.length > 0) {
         const allFailed = results.length === 0;
         notices.push(
           allFailed
@@ -280,12 +292,10 @@ export const blsGetLatestTool = tool('bls_get_latest', {
         reasons: [...new Set(requestLevel.map((r) => r.reason))],
       });
       const requestLevelIds = new Set(requestLevel.map((r) => r.seriesId));
-      const unresolved = failed.filter((f) => !requestLevelIds.has(f.seriesId));
-      if (unresolved.length > 0) {
-        notices.push(
-          `${unresolved.map((f) => f.seriesId).join(', ')} failed. Use bls_search_series to verify ${unresolved.length === 1 ? 'that SeriesID' : 'those SeriesIDs'}.`,
-        );
-      }
+      const unresolved = failed.filter(
+        (f) => !requestLevelIds.has(f.seriesId) && !oewsFallbacks.has(f.seriesId),
+      );
+      if (unresolved.length > 0) notices.push(searchNotice(unresolved.map((f) => f.seriesId)));
       const byReason = new Map<string, { ids: string[]; hint: unknown }>();
       for (const { seriesId, error, reason } of requestLevel) {
         const group = byReason.get(reason) ?? {
@@ -300,6 +310,9 @@ export const blsGetLatestTool = tool('bls_get_latest', {
           `${ids.join(', ')} failed with ${reason}, a failure of the request rather than of the SeriesID.${typeof hint === 'string' ? ` ${hint}` : ''}`,
         );
       }
+    }
+    for (const [seriesId, fallback] of oewsFallbacks) {
+      notices.push(`BLS reports ${seriesId} is invalid or does not exist. ${fallback}`);
     }
     if (unavailableCount > 0) {
       notices.push(

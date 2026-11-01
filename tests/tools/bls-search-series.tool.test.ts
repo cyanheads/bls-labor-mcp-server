@@ -3,9 +3,11 @@
  * @module tests/tools/bls-search-series.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsSearchSeriesTool } from '@/mcp-server/tools/definitions/bls-search-series.tool.js';
+import type { CatalogReadiness } from '@/services/bls-catalog/types.js';
 
 const MOCK_SERIES = [
   {
@@ -20,7 +22,7 @@ const MOCK_SERIES = [
 const mockSearch = vi.fn().mockResolvedValue({ series: MOCK_SERIES, total: 1, capped: false });
 let mockIsLoaded = true;
 let mockTotalSeries = 847000;
-let mockCatalogLoadError: string | undefined;
+let mockReadiness: CatalogReadiness = { status: 'ready' };
 
 vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/bls-catalog/bls-catalog-service.js')>()),
@@ -31,8 +33,8 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) 
     get totalSeries() {
       return mockTotalSeries;
     },
-    get catalogLoadError() {
-      return mockCatalogLoadError;
+    get readiness() {
+      return mockReadiness;
     },
     indexedSurveys: ['CE', 'CU', 'LN'],
     includeOes: false,
@@ -41,15 +43,28 @@ vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) 
 }));
 
 describe('blsSearchSeriesTool', () => {
-  it('throws catalog_unavailable when catalog is not loaded', async () => {
-    mockIsLoaded = false;
+  it('throws catalog_loading, retryable, while a harvest builds an index with no series (#112)', async () => {
+    mockReadiness = { status: 'loading' };
+    mockSearch.mockClear();
     const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
 
     await expect(blsSearchSeriesTool.handler(input, ctx)).rejects.toThrow(
-      expect.objectContaining({ data: expect.objectContaining({ reason: 'catalog_unavailable' }) }),
+      expect.objectContaining({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: expect.objectContaining({ reason: 'catalog_loading', retryable: true }),
+      }),
     );
-    mockIsLoaded = true;
+    expect(mockSearch).not.toHaveBeenCalled();
+    mockReadiness = { status: 'ready' };
+  });
+
+  it('declares catalog_loading retryable and logged below error (#112)', () => {
+    expect(blsSearchSeriesTool.errors?.find((e) => e.reason === 'catalog_loading')).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      severity: 'notice',
+    });
   });
 
   it('returns series from catalog on happy path and enriches with totals', async () => {
@@ -177,20 +192,23 @@ describe('blsSearchSeriesTool — additional coverage', () => {
   beforeEach(() => {
     mockIsLoaded = true;
     mockTotalSeries = 847000;
-    mockCatalogLoadError = undefined;
+    mockReadiness = { status: 'ready' };
     mockSearch.mockResolvedValue({ series: MOCK_SERIES, total: 1, capped: false });
   });
 
-  it('throws catalog_unavailable when catalog loaded but empty (totalSeries === 0)', async () => {
-    mockIsLoaded = true;
+  it('throws catalog_unavailable with the load error when no harvest is running (#112)', async () => {
     mockTotalSeries = 0;
-    mockCatalogLoadError = 'All LABSTAT downloads returned empty.';
+    mockReadiness = { status: 'unavailable', error: 'All LABSTAT downloads returned empty.' };
 
     const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: 'unemployment' });
 
     await expect(blsSearchSeriesTool.handler(input, ctx)).rejects.toThrow(
-      expect.objectContaining({ data: expect.objectContaining({ reason: 'catalog_unavailable' }) }),
+      expect.objectContaining({
+        code: JsonRpcErrorCode.InternalError,
+        message: expect.stringContaining('All LABSTAT downloads returned empty.'),
+        data: expect.objectContaining({ reason: 'catalog_unavailable' }),
+      }),
     );
   });
 
@@ -314,5 +332,70 @@ describe('blsSearchSeriesTool — additional coverage', () => {
     const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
     const input = blsSearchSeriesTool.input.parse({ query: longQuery });
     await expect(blsSearchSeriesTool.handler(input, ctx)).resolves.toBeDefined();
+  });
+});
+
+describe('blsSearchSeriesTool — composed OEWS rows (#119)', () => {
+  const COMPOSED_ROW = {
+    seriesId: 'OEUN000000000000029114103',
+    title: 'Hourly mean wage for Registered Nurses in All Industries in the United States',
+    surveyAbbr: 'OE',
+    areaName: 'National',
+    itemName: 'Registered Nurses',
+    seasonal: false,
+    composed: true as const,
+  };
+
+  beforeEach(() => {
+    mockReadiness = { status: 'ready' };
+    mockTotalSeries = 847000;
+  });
+
+  async function run(query: string, survey?: string) {
+    const ctx = createMockContext({ errors: blsSearchSeriesTool.errors });
+    const result = await blsSearchSeriesTool.handler(
+      blsSearchSeriesTool.input.parse({ query, survey }),
+      ctx,
+    );
+    const text = (blsSearchSeriesTool.format!(result)[0] as { text: string }).text;
+    return { result, notice: getEnrichment(ctx).notice, text };
+  }
+
+  it('marks a composed row on both surfaces and gives the composed notice, not the not-indexed one', async () => {
+    mockSearch.mockResolvedValueOnce({
+      series: [COMPOSED_ROW],
+      total: 1,
+      capped: false,
+      composed: true,
+    });
+    const { result, notice, text } = await run('registered nurses', 'OE');
+    expect(result.series).toEqual([
+      {
+        seriesId: 'OEUN000000000000029114103',
+        title: 'Hourly mean wage for Registered Nurses in All Industries in the United States',
+        survey: 'OE',
+        area: 'National',
+        item: 'Registered Nurses',
+        seasonal: 'Not Seasonally Adjusted',
+        composed: true,
+      },
+    ]);
+    expect(notice).toContain('composed from the OE code tables');
+    expect(notice).not.toContain('has no series in the offline catalog index');
+    expect(text).toContain('[OE] · composed (unconfirmed)');
+  });
+
+  it('leaves indexed rows unmarked and keeps the not-indexed notice when nothing was composed', async () => {
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
+    const oe = await run('registered nurses', 'OE');
+    expect(oe.notice).toBe(
+      'Survey OE has no series in the offline catalog index (indexed: CE, CU, LN). Use bls_list_surveys for valid codes; series in other surveys are fetchable by SeriesID via bls_get_series. OE (OEWS) series are indexed only when the server sets BLS_CATALOG_INCLUDE_OES=true.',
+    );
+
+    mockSearch.mockResolvedValueOnce({ series: MOCK_SERIES, total: 1, capped: false });
+    const indexed = await run('unemployment');
+    expect(indexed.result.series[0]).not.toHaveProperty('composed');
+    expect(indexed.notice).toBeUndefined();
+    expect(indexed.text).not.toContain('composed');
   });
 });

@@ -425,3 +425,57 @@ describe('blsGetLatestTool — additional coverage', () => {
     expect(text).toContain('December 2024');
   });
 });
+
+describe('blsGetLatestTool — failed-series notices (#119)', () => {
+  const METRO = 'OEUM004766000000029114103';
+  const notFoundError = () => notFound('Series does not exist', { reason: 'series_not_found' });
+
+  async function noticeFor(ids: string[]) {
+    const ctx = createMockContext({ errors: blsGetLatestTool.errors });
+    await blsGetLatestTool.handler(blsGetLatestTool.input.parse({ series_ids: ids }), ctx);
+    return getEnrichment(ctx).notice;
+  }
+
+  it('keeps the search notice for failed non-OEWS series, all failed or some', async () => {
+    fetchLatestMock.mockReset().mockRejectedValue(notFoundError());
+    expect(await noticeFor(['BOGUS1', 'BOGUS2'])).toBe(
+      'All 2 series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.',
+    );
+    fetchLatestMock
+      .mockReset()
+      .mockResolvedValueOnce(MOCK_SERIES)
+      .mockRejectedValue(notFoundError());
+    expect(await noticeFor(['LNS14000000', 'BOGUS1'])).toBe(
+      '1 of 2 series failed. Use bls_search_series to verify the failing SeriesIDs.',
+    );
+  });
+
+  it('keeps the search notice beside a request-level failure for a non-OEWS series', async () => {
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    fetchLatestMock
+      .mockReset()
+      .mockResolvedValueOnce(MOCK_SERIES)
+      .mockRejectedValueOnce(notFoundError())
+      .mockRejectedValueOnce(serviceUnavailable('quota', { reason: 'quota_exceeded' }));
+    expect(await noticeFor(['LNS14000000', 'BOGUS1', 'LNU00009999'])).toBe(
+      'BOGUS1 failed. Use bls_search_series to verify that SeriesID. LNU00009999 failed with quota_exceeded, a failure of the request rather than of the SeriesID.',
+    );
+  });
+
+  it('names the national row instead of search for an unpublished OEWS series', async () => {
+    fetchLatestMock
+      .mockReset()
+      .mockResolvedValueOnce(MOCK_SERIES)
+      .mockRejectedValue(notFoundError());
+    expect(await noticeFor(['LNS14000000', METRO])).toBe(
+      `BLS reports ${METRO} is invalid or does not exist. BLS leaves many OEWS occupation–area cells unpublished; request the national row OEUN000000000000029114103 for the same occupation and data type.`,
+    );
+  });
+
+  it('keeps the search notice for an OEWS series that failed for another reason', async () => {
+    fetchLatestMock.mockReset().mockRejectedValue(new Error('socket hang up'));
+    expect(await noticeFor([METRO])).toBe(
+      'All 1 series failed. Use bls_search_series to verify the SeriesIDs are valid before retrying.',
+    );
+  });
+});

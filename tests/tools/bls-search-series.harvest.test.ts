@@ -22,16 +22,13 @@ import {
   initBlsCatalogService,
   shutdownBlsCatalogService,
 } from '@/services/bls-catalog/bls-catalog-service.js';
+import { tsv } from '../services/bls-catalog/oews-fixtures.js';
 
 const BASE_URL = 'https://download.bls.gov/pub/time.series';
 
 /** `initBlsCatalogService` takes the core handles positionally and reads neither. */
 const coreConfig = {} as AppConfig;
 const coreStorage = {} as StorageService;
-
-function tsv(...rows: string[][]): string {
-  return `${rows.map((r) => r.join('\t')).join('\r\n')}\r\n`;
-}
 
 const PERIODS = ['', '2000', 'M12', '2026', 'M07'];
 
@@ -209,18 +206,106 @@ describe('bls_search_series over a harvested JOLTS catalog', () => {
   });
 });
 
-describe('bls_search_series before the catalog harvest', () => {
-  it('fails with catalog_unavailable until the index has loaded', async () => {
-    const result = await runToolContract(
+describe('bls_search_series while the catalog holds no series (#112)', () => {
+  const search = () =>
+    runToolContract(
       blsSearchSeriesTool,
       { query: 'job openings' },
       { context: { errors: blsSearchSeriesTool.errors } },
     );
+  type ErrorEnvelope = {
+    error: { code: number; message: string; data: { recovery?: { hint: string } } };
+  };
+  const envelope = (result: Awaited<ReturnType<typeof search>>) =>
+    (result.structuredContent as ErrorEnvelope).error;
 
-    expect(result.isError).toBe(true);
+  /**
+   * Hold every download until the returned release runs (or its request aborts);
+   * requests keep their served bodies.
+   */
+  function holdDownloads(): () => void {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const serveNow = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (url, init) => {
+      await new Promise<void>((resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+        void gate.then(resolve);
+      });
+      return serveNow(url, init);
+    });
+    return release;
+  }
+
+  it('reports catalog_loading, retryable, during the first harvest and answers once it finishes', async () => {
+    const release = holdDownloads();
+    const loading = getBlsCatalogService().load(1);
+
+    const during = await search();
+    expect(during.isError).toBe(true);
+    expect(during.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'catalog_loading', retryable: true },
+      },
+    });
+    expect(envelope(during).data.recovery?.hint).toMatch(/retry/i);
+    expect(text(during)).toContain('(reason catalog_loading · retryable)');
+    expect(text(during)).not.toMatch(/restart|may have failed/i);
+
+    release();
+    await loading;
+    const after = await search();
+    expect(after.isError).toBeFalsy();
+    expect(text(after)).toContain('JTS000000000000000JOL');
+  });
+
+  it('reports catalog_unavailable once every attempt comes back empty, and catalog_loading while the next check retries', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation(() =>
+      Promise.resolve(new Response('', { status: 404 })),
+    );
+    const svc = getBlsCatalogService();
+    await svc.load(1);
+
+    const failed = await search();
+    expect(failed.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InternalError, data: { reason: 'catalog_unavailable' } },
+    });
+    expect(envelope(failed).message).toContain('all LABSTAT downloads returned empty');
+    expect(envelope(failed).data.recovery?.hint).toMatch(/hourly/);
+    expect(envelope(failed).data.recovery?.hint).toContain('BLS_CATALOG_BASE_URL');
+    expect(text(failed)).toContain('(reason catalog_unavailable)');
+
+    // The hourly tick's retry of the empty index is a harvest in flight again.
+    const release = holdDownloads();
+    const retry = svc.load(1);
+    const retrying = await search();
+    expect(retrying.structuredContent).toMatchObject({
+      error: { data: { reason: 'catalog_loading', retryable: true } },
+    });
+    release();
+    await retry;
+    expect((await search()).structuredContent).toMatchObject({
+      error: { data: { reason: 'catalog_unavailable' } },
+    });
+  });
+
+  it('reports catalog_unavailable naming the failure when the load rejects, never catalog_loading', async () => {
+    const svc = getBlsCatalogService();
+    const store = (svc as unknown as { store: { applyBatch: (...args: never[]) => unknown } })
+      .store;
+    vi.spyOn(store, 'applyBatch').mockRejectedValue(
+      new Error('SQLITE_FULL: database or disk is full'),
+    );
+    await expect(svc.load(1)).rejects.toThrow('SQLITE_FULL');
+
+    const result = await search();
     expect(result.structuredContent).toMatchObject({
       error: { data: { reason: 'catalog_unavailable' } },
     });
-    expect(text(result)).toContain('catalog_unavailable');
+    expect(envelope(result).message).toContain('SQLITE_FULL: database or disk is full');
+    expect(text(result)).not.toContain('catalog_loading');
   });
 });

@@ -7,14 +7,15 @@
  * candidate query rescored by a bespoke relevance function — the index lives on
  * disk, not the JS heap, so large surveys do not inflate memory. No API quota is
  * consumed; the BLS FAQ confirms there is no API catalog endpoint. An hourly
- * scheduler job re-harvests the index once its TTL lapses, so a long-running
- * process stays current without a restart.
+ * scheduler job checks each survey and re-harvests those whose TTL lapsed or
+ * whose failure backoff ran out, so a long-running process stays current
+ * without a restart.
  * @module services/bls-catalog/bls-catalog-service
  */
 
 import { setImmediate as nextTurn, setTimeout as sleep } from 'node:timers/promises';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { internalError } from '@cyanheads/mcp-ts-core/errors';
+import { internalError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import {
   type MirrorRow,
   type MirrorStore,
@@ -26,12 +27,32 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { schedulerService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  AREA_CODE_SOURCES,
+  type AreaIndex,
+  indexAreas,
+  type ResolvedArea,
+  resolveArea,
+} from './area-filter.js';
+import {
+  composeOewsSearch,
+  OEWS_TABLE_NAMES,
+  type OewsTableName,
+  type OewsTables,
+  oewsFallbacks,
+  parseOewsTables,
+} from './oews-composition.js';
 import type {
+  CatalogReadiness,
   CatalogSearchInput,
   CatalogSearchResult,
   CatalogSeries,
   CodeDimension,
   SurveyDefinition,
+  SurveyFailure,
+  SurveyLoad,
+  SurveyRefresh,
+  SurveySearchCoverage,
 } from './types.js';
 
 /** A dimension keyed by `key` columns — by default the table's own `{table}_code`. */
@@ -39,15 +60,38 @@ function dim(table: string, ...key: string[]): CodeDimension {
   return { table, key: key.length > 0 ? key : [`${table}_code`] };
 }
 
+/** The code tables a dimension reads: its own, then its fallback's. */
+function dimensionTables({ table, fallback }: CodeDimension): string[] {
+  return fallback ? [table, ...dimensionTables(fallback.dimension)] : [table];
+}
+
+/**
+ * The SM area: a metro row's metro area, or a statewide row's state. Statewide
+ * rows carry `area_code` `00000`, which `sm.area` labels "Statewide".
+ */
+const SM_AREA: CodeDimension = {
+  ...dim('area'),
+  fallback: { code: '00000', dimension: dim('state') },
+};
+
 /**
  * Surveys fetched at startup. Chosen to cover >95% of real-world queries.
  * Each entry maps the LABSTAT file abbreviation to its program name and the
  * `.series` columns decoded through companion code tables: `area` and `item`
  * for every row, `frequency` for surveys that publish one series at several
  * frequencies under the same `series_title` (CU and CW monthly/semiannual, LN
- * monthly/quarterly/annual), and `title` for surveys whose `.series` file ships
- * no `series_title` (JT, EC, PR). Only the tables these dimensions name are
- * fetched, and each exists in the survey's LABSTAT directory.
+ * monthly/quarterly/annual, BD quarterly/annual), and `title` for surveys whose
+ * `.series` file ships no `series_title` (JT, EC, PR, SM, EE). Only the tables
+ * these dimensions name are fetched, and each exists in the survey's LABSTAT
+ * directory. Entries marked `catalogOnly` (SM through EE) stay out of the
+ * observations mirror: their data files total 1.78 GB.
+ *
+ * `measure` names the table whose label the BLS API returns verbatim as
+ * `catalog.measure_data_type`, so a series served without the API (the
+ * observations mirror) carries the same `measure` the live path does. Surveys
+ * without one leave it unset: BLS's API returns no catalog for JOLTS or the
+ * SIC-basis ECI series, so there is no string to reproduce. The catalog-only
+ * surveys leave it unset too: the mirror never serves them.
  */
 const SURVEYS: SurveyDefinition[] = [
   {
@@ -55,6 +99,7 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'CPI - All Urban Consumers',
     area: dim('area'),
     item: dim('item'),
+    measure: dim('item'),
     frequency: dim('periodicity'),
   },
   {
@@ -62,21 +107,43 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'Consumer Price Index - Average Price Data',
     area: dim('area'),
     item: dim('item'),
+    measure: dim('item'),
   },
-  { abbr: 'ce', name: 'CES - Employment, Hours, and Earnings', item: dim('industry') },
-  { abbr: 'ln', name: 'CPS - Labor Force Statistics', frequency: dim('periodicity') },
+  {
+    abbr: 'ce',
+    name: 'CES - Employment, Hours, and Earnings',
+    item: dim('industry'),
+    measure: dim('datatype', 'data_type_code'),
+  },
+  {
+    abbr: 'ln',
+    name: 'CPS - Labor Force Statistics',
+    measure: dim('tdat'),
+    frequency: dim('periodicity'),
+  },
   /**
    * No `item`: every LAUS title already opens with its measure ("Unemployment
    * Rate: Texas (S)"), and repeating it in `item_name` lifts ~8K state and local
    * rows over the national CPS series for measure queries.
    */
-  { abbr: 'la', name: 'LAUS - Local Area Unemployment Statistics', area: dim('area') },
+  {
+    abbr: 'la',
+    name: 'LAUS - Local Area Unemployment Statistics',
+    area: dim('area'),
+    measure: dim('measure'),
+  },
   {
     abbr: 'pc',
     name: 'PPI - Industry Data',
     item: dim('product', 'industry_code', 'product_code'),
+    measure: dim('product', 'industry_code', 'product_code'),
   },
-  { abbr: 'wp', name: 'PPI - Commodity Data', item: dim('item', 'group_code', 'item_code') },
+  {
+    abbr: 'wp',
+    name: 'PPI - Commodity Data',
+    item: dim('item', 'group_code', 'item_code'),
+    measure: dim('item', 'group_code', 'item_code'),
+  },
   /**
    * The acronym alone: the name prefixes every synthesized JT title, and the
    * spelled-out "Job Openings and Labor Turnover" would put "job openings" into
@@ -94,19 +161,27 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'OES/OEWS - Occupational Employment and Wage Statistics',
     area: dim('area'),
     item: dim('occupation'),
+    measure: dim('datatype'),
   },
   /** The SIC-basis Employment Cost Index; every series ends in 2005. */
   {
     abbr: 'ec',
     name: 'ECI (SIC basis, ended 2005)',
     title: [dim('compensation', 'comp_code'), dim('group'), dim('ownership'), dim('periodicity')],
+    footnoteUnlabeled: true,
   },
   {
     abbr: 'pr',
     name: 'Major Sector Productivity and Costs',
+    measure: dim('measure'),
     title: [dim('measure'), dim('sector'), dim('duration')],
   },
-  { abbr: 'mp', name: 'Major Sector Total Factor Productivity', item: dim('sector') },
+  {
+    abbr: 'mp',
+    name: 'Major Sector Total Factor Productivity',
+    item: dim('sector'),
+    measure: dim('measure'),
+  },
   /**
    * Appended rather than grouped with the CPI family above: `SURVEY_ABBRS`
    * indices are load-bearing for the observations ingester's resume cursor
@@ -117,6 +192,7 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'CPI-W - Urban Wage Earners and Clerical Workers',
     area: dim('area'),
     item: dim('item'),
+    measure: dim('item'),
     frequency: dim('periodicity'),
   },
   /**
@@ -130,27 +206,91 @@ const SURVEYS: SurveyDefinition[] = [
     name: 'ECEC - Employer Costs for Employee Compensation',
     area: dim('area'),
     item: dim('estimate'),
+    measure: dim('datatype'),
   },
-  { abbr: 'ci', name: 'ECI - Employment Cost Index', area: dim('area'), item: dim('estimate') },
+  {
+    abbr: 'ci',
+    name: 'ECI - Employment Cost Index',
+    area: dim('area'),
+    item: dim('estimate'),
+    measure: dim('estimate'),
+  },
+  /**
+   * No `series_title`, and BLS's own catalog title is generic. The full program
+   * name leads the synthesized title: its "State" is what lifts a statewide row
+   * for a query that names one ("nonfarm employment Washington state").
+   */
+  {
+    abbr: 'sm',
+    name: 'SAE - State and Area Employment, Hours, and Earnings',
+    area: SM_AREA,
+    item: dim('industry'),
+    title: [dim('data_type'), dim('industry'), SM_AREA],
+    catalogOnly: true,
+  },
+  { abbr: 'le', name: 'CPS - Weekly and Hourly Earnings', area: dim('fips'), catalogOnly: true },
+  { abbr: 'ei', name: 'Import/Export Price Indexes', catalogOnly: true },
+  {
+    abbr: 'su',
+    name: 'C-CPI-U - Chained CPI',
+    area: dim('area'),
+    item: dim('item'),
+    catalogOnly: true,
+  },
+  {
+    abbr: 'ip',
+    name: 'Industry Productivity',
+    area: dim('area'),
+    item: dim('measure'),
+    catalogOnly: true,
+  },
+  {
+    abbr: 'bd',
+    name: 'BED - Business Employment Dynamics',
+    area: dim('state'),
+    item: dim('industry'),
+    frequency: dim('periodicity'),
+    catalogOnly: true,
+  },
+  { abbr: 'lu', name: 'CPS - Union Affiliation', area: dim('fips'), catalogOnly: true },
+  /** The SIC-basis CES, which ships no `series_title`; every series ends by 2003. */
+  {
+    abbr: 'ee',
+    name: 'CES (SIC basis, ended 2003)',
+    title: [dim('datatype', 'data_type_code'), dim('industry')],
+    footnoteUnlabeled: true,
+    catalogOnly: true,
+  },
 ];
 
 /**
- * Canonical harvest order of LABSTAT survey abbreviations, derived from
- * `SURVEYS`. The observations ingester imports this rather than restating the
- * list, so a survey correction lands in one place and the two harvests cannot
- * drift apart. Order is load-bearing: the ingester's resume cursor encodes a
- * survey's index into this array.
+ * The observations mirror's harvest order of LABSTAT survey abbreviations: the
+ * `SURVEYS` entries not marked `catalogOnly`, in order. The observations
+ * ingester imports this rather than restating the list, so a survey correction
+ * lands in one place and the two harvests cannot drift apart. Order is
+ * load-bearing: the ingester's resume cursor encodes a survey's index into this
+ * array.
  */
-export const SURVEY_ABBRS: readonly string[] = SURVEYS.map((s) => s.abbr);
+export const SURVEY_ABBRS: readonly string[] = SURVEYS.filter((s) => !s.catalogOnly).map(
+  (s) => s.abbr,
+);
 
 /**
- * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.2 GB, 32× every
- * other survey combined. It is excluded from the catalog unless explicitly opted
- * in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default index small (~170K
- * series), the first harvest fast, and on-disk size modest. OES series remain
- * fetchable by ID via bls_get_series; they are simply not in the search index.
+ * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.26 GB, over
+ * 20× every other survey combined. Its series are excluded from the index unless
+ * explicitly opted in (`BLS_CATALOG_INCLUDE_OES=true`, which only the Bun
+ * runtime can read into one string), keeping the default index small, the
+ * first harvest fast, and on-disk size modest. Every harvest stores OE's small
+ * code tables instead, and while the index holds no OE rows bls_search_series
+ * composes OEWS SeriesIDs from them (`oews-composition.ts`).
  */
 export const OES_SURVEY_ABBR = 'oe';
+
+/** Schedule key of the OE code tables, a harvest unit beside the surveys. */
+const OEWS_TABLES = 'oe-tables';
+
+/** The persisted OE code tables, one row per file, holding its LABSTAT text. */
+const OEWS_TABLES_TABLE = 'bls_oews_tables';
 
 /** The surveys a harvest fetches: every `SURVEYS` entry, less OES unless opted in. */
 function configuredSurveys(includeOes: boolean): SurveyDefinition[] {
@@ -158,16 +298,22 @@ function configuredSurveys(includeOes: boolean): SurveyDefinition[] {
 }
 
 /**
+ * The catalog's survey abbreviations, in `SURVEYS` order: every survey a
+ * harvest fetches, the catalog-only ones included.
+ */
+export function catalogSurveyAbbrs(includeOes: boolean): string[] {
+  return configuredSurveys(includeOes).map((s) => s.abbr);
+}
+
+/**
  * The configured survey list as a completed harvest persists it in the sync
- * state's `checkpoint`: the harvested abbreviations in `SURVEYS` order,
- * comma-joined. `load()` treats an index whose stored list is missing or
- * different as stale, so a changed `BLS_CATALOG_INCLUDE_OES` or survey set
- * re-harvests on the next boot even inside the TTL.
+ * state's `checkpoint`: `catalogSurveyAbbrs`, comma-joined. `load()` treats an
+ * index whose stored list is missing or different as stale, so a changed
+ * `BLS_CATALOG_INCLUDE_OES` or survey set re-harvests on the next boot even
+ * inside the TTL.
  */
 export function catalogSurveyList(includeOes: boolean): string {
-  return configuredSurveys(includeOes)
-    .map((s) => s.abbr)
-    .join(',');
+  return catalogSurveyAbbrs(includeOes).join(',');
 }
 
 /** Known common series to boost in search rankings. */
@@ -176,7 +322,7 @@ const COMMON_SERIES: Record<string, string> = {
   CES0000000001: 'total nonfarm payrolls seasonally adjusted',
   CUUR0000SA0: 'cpi-u all items u.s. city average not seasonally adjusted',
   CUSR0000SA0: 'cpi-u all items u.s. city average seasonally adjusted',
-  WPUFD49104: 'ppi finished goods',
+  WPUFD4: 'ppi final demand not seasonally adjusted',
   JTS000000000000000JOL: 'jolts job openings all industries',
   LNS11300000: 'labor force participation rate',
   LNS12000000: 'civilian employment level',
@@ -226,11 +372,20 @@ function wholeTerms(text: string): Set<string> {
  *
  * A phrase matches where a word starts (`startsWord`), and its end may run
  * on into the word: `ppi` never fires inside "shopping", while `job vacanc`
- * matches "job vacancies" and `payroll` matches "payrolls".
+ * matches "job vacancies" and `payroll` matches "payrolls". A fired phrase's
+ * words also count as matched on every row of its surveys when the rescore
+ * asks whether a row matches every query word, so the index names
+ * (`consumer price index`) are phrases of their own.
  */
 const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: readonly string[] }> = [
-  { phrases: ['inflation', 'cost of living', 'consumer price', 'cpi'], surveys: ['CU'] },
-  { phrases: ['producer price', 'wholesale price', 'ppi'], surveys: ['WP', 'PC'] },
+  {
+    phrases: ['inflation', 'cost of living', 'consumer price index', 'consumer price', 'cpi'],
+    surveys: ['CU'],
+  },
+  {
+    phrases: ['producer price index', 'producer price', 'wholesale price', 'ppi'],
+    surveys: ['WP', 'PC'],
+  },
   { phrases: ['jobs', 'job growth', 'payroll', 'nonfarm', 'wage', 'earnings'], surveys: ['CE'] },
   { phrases: ['job opening', 'labor turnover', 'job vacanc', 'quits', 'jolts'], surveys: ['JT'] },
   { phrases: ['unemployment', 'jobless', 'labor force participation'], surveys: ['LN'] },
@@ -241,18 +396,75 @@ const CONCEPT_ALIASES: ReadonlyArray<{ phrases: readonly string[]; surveys: read
   { phrases: ['employment cost index', 'eci'], surveys: ['CI'] },
 ];
 
+/** A survey's core measure, by its decoded item names. */
+interface CoreMeasure {
+  items: readonly string[];
+  survey: string;
+}
+
 /**
- * Survey codes whose concept aliases the lowercased `query` names. One linear
- * scan per alias phrase over caller text.
+ * What a query means by `core` (a whole word) beside one of a survey's concept
+ * aliases (`core inflation`, `core cpi`, `core ppi`). The measure's rows join
+ * the candidates, count `core` as matched, and take the headline boost.
+ * Without an alias, `core` is an ordinary word.
  */
+const CORE_MEASURES: readonly CoreMeasure[] = [
+  { survey: 'CU', items: ['All items less food and energy'] },
+  {
+    survey: 'WP',
+    items: [
+      'Final demand less foods and energy',
+      'Final demand less foods, energy, and trade services',
+    ],
+  },
+];
+
+/** A concept alias the query names: its surveys and the phrases that fired. */
+interface FiredAlias {
+  phrases: readonly string[];
+  surveys: readonly string[];
+}
+
+/** The concept aliases the lowercased `query` names. One linear scan per alias phrase over caller text. */
+function firedAliases(query: string): FiredAlias[] {
+  const fired: FiredAlias[] = [];
+  for (const { phrases, surveys } of CONCEPT_ALIASES) {
+    const named = phrases.filter((p) => startsWord(query, p));
+    if (named.length > 0) fired.push({ phrases: named, surveys });
+  }
+  return fired;
+}
+
+/** Survey codes whose concept aliases the lowercased `query` names. */
 export function conceptAliasSurveys(query: string): Set<string> {
-  const surveys = new Set<string>();
-  for (const alias of CONCEPT_ALIASES) {
-    if (alias.phrases.some((p) => startsWord(query, p))) {
-      for (const s of alias.surveys) surveys.add(s);
+  return new Set(firedAliases(query).flatMap((a) => a.surveys));
+}
+
+/**
+ * Survey → the query tokens its fired alias phrases name, which every row of
+ * that survey counts as matched. A token equal to a phrase word counts; one
+ * extending the phrase's last word counts too, since that word may run on
+ * ("openings" for `job opening`).
+ */
+function aliasWords(
+  fired: readonly FiredAlias[],
+  tokens: readonly string[],
+): Map<string, Set<string>> {
+  const words = new Map<string, Set<string>>();
+  for (const { phrases, surveys } of fired) {
+    const covered = tokens.filter((t) =>
+      phrases.some((p) => {
+        const parts = p.split(' ');
+        return parts.includes(t) || t.startsWith(parts.at(-1) ?? p);
+      }),
+    );
+    for (const survey of surveys) {
+      const set = words.get(survey) ?? new Set<string>();
+      for (const t of covered) set.add(t);
+      words.set(survey, set);
     }
   }
-  return surveys;
+  return words;
 }
 
 /**
@@ -322,9 +534,10 @@ const CATALOG_FTS = `${CATALOG_TABLE}_fts`;
 const AREA_MATCH_COLUMNS = ['area_name', 'title', 'series_id'] as const;
 
 /**
- * The decoded area labels that mean "the whole country": the CPI/AP
+ * The decoded area labels that mean "the whole country": the CPI/AP/SU
  * `U.S. city average`, the JOLTS `Total US` state code, the CM/CI
- * `United States (National)` area, and the opt-in OEWS `National` area. Rows
+ * `United States (National)` area, the opt-in OEWS `National` area, the
+ * LE/LU/IP `U.S. Total`, the BD `U.S. totals`, and the SM `All States`. Rows
  * carrying one, and rows with no decoded area (CE, LN, and the other national
  * surveys), are national for the rescore's tie-break.
  */
@@ -333,6 +546,9 @@ const NATIONAL_AREAS: ReadonlySet<string> = new Set([
   'Total US',
   'United States (National)',
   'National',
+  'U.S. Total',
+  'U.S. totals',
+  'All States',
 ]);
 
 /** Geographic boilerplate and modifiers do not identify a place on their own. */
@@ -365,8 +581,125 @@ const GEOGRAPHIC_STOP_WORDS = new Set([
   'national',
   'total',
   'average',
+  'balance',
+  'part',
+  'village',
+  'msa',
+  'csa',
+  'cdp',
 ]);
-const GEOGRAPHIC_WORDS = 'bls_geographic_words';
+
+/**
+ * Words a query uses to join or qualify, never to name: a row need not match
+ * them to match every query word, and they never make an area-name part.
+ */
+const FUNCTION_WORDS: ReadonlySet<string> = new Set([
+  'a',
+  'an',
+  'and',
+  'at',
+  'by',
+  'for',
+  'in',
+  'less',
+  'of',
+  'on',
+  'or',
+  'per',
+  'the',
+  'to',
+  'with',
+]);
+
+/**
+ * CPS demographic labels. A part of an area name made only of these (White
+ * County) never names a place: `white unemployment rate` asks for the CPS
+ * group.
+ */
+const DEMOGRAPHIC_LABELS: ReadonlySet<string> = new Set([
+  'white',
+  'black',
+  'african',
+  'american',
+  'asian',
+  'hispanic',
+  'latino',
+  'men',
+  'women',
+]);
+
+/** One part of a decoded area name, split on `-` `,` `/` `(` `)`, and its distinctive words. */
+interface AreaPart {
+  area: string;
+  words: readonly string[];
+}
+
+/**
+ * Index the decoded area names by distinctive word — three or more
+ * characters, no geographic boilerplate or function word — for each part of
+ * the name. A query names an area when it holds every distinctive word of
+ * one part: `black hawk` names Black Hawk County, `black` alone does not.
+ * National areas and parts made only of CPS demographic labels name nothing.
+ */
+function indexAreaParts(areas: Iterable<string>): Map<string, AreaPart[]> {
+  const places = new Map<string, AreaPart[]>();
+  for (const area of areas) {
+    if (NATIONAL_AREAS.has(area)) continue;
+    for (const piece of area.toLowerCase().split(/[-,/()]/)) {
+      const words = [
+        ...new Set(
+          (piece.match(/[\p{L}\p{N}\p{M}]+/gu) ?? []).filter(
+            (w) => w.length >= 3 && !GEOGRAPHIC_STOP_WORDS.has(w) && !FUNCTION_WORDS.has(w),
+          ),
+        ),
+      ];
+      if (words.length === 0 || words.every((w) => DEMOGRAPHIC_LABELS.has(w))) continue;
+      const part = { area, words };
+      for (const word of words) {
+        const parts = places.get(word);
+        if (parts) parts.push(part);
+        else places.set(word, [part]);
+      }
+    }
+  }
+  return places;
+}
+
+/** The decoded areas whose name a query names, given the query's whole words. */
+function namedAreas(
+  places: ReadonlyMap<string, readonly AreaPart[]>,
+  words: ReadonlySet<string>,
+): Set<string> {
+  const named = new Set<string>();
+  for (const word of words) {
+    for (const part of places.get(word) ?? []) {
+      if (part.words.every((w) => words.has(w))) named.add(part.area);
+    }
+  }
+  return named;
+}
+
+/**
+ * The FTS condition a candidate must meet to match every required query word:
+ * an `AND` of the words its survey's alias does not cover, `''` when the alias
+ * covers them all. Without `surveys` it applies to every other survey.
+ */
+interface AllWordsMatch {
+  match: string;
+  surveys?: readonly string[];
+}
+
+/** A scored candidate and its rank keys; every key but `score` is 0 or 1. */
+interface RankedSeries {
+  aggregate: number;
+  allWords: number;
+  current: number;
+  exact: number;
+  national: number;
+  place: number;
+  s: CatalogSeries;
+  score: number;
+}
 
 /**
  * Escape `text` for a `LIKE … ESCAPE '\'` pattern so `%`, `_`, and `\` match
@@ -389,15 +722,21 @@ export function escapeLike(text: string): string {
  * Version 2: header-keyed code tables and synthesized JT/EC/PR titles.
  * Version 3: the `frequency` column (CU, CW, LN) and the CM/CI surveys.
  * Version 4: independently optional coverage columns and complete survey decoding.
+ * Version 5: the decoded `measure` column, and the OE code tables
+ * (`bls_oews_tables`) OEWS composition reads.
  */
-const CATALOG_INDEX_VERSION = 4;
+const CATALOG_INDEX_VERSION = 5;
 
 /** Code-table key (the key column values joined by a tab, which no field contains) → label. */
 type CodeLabels = Map<string, string>;
 
-/** A dimension resolved against one `.series` header: its key column indices and labels. */
+/**
+ * A dimension resolved against one `.series` header: its key column indices,
+ * its labels, and the decoder a row carrying its fallback code reads instead.
+ */
 interface Decoder {
   cols: number[];
+  fallback?: { code: string; decoder: Decoder };
   labels: CodeLabels;
 }
 
@@ -413,6 +752,16 @@ async function pause(signal: AbortSignal, ms?: number): Promise<void> {
   const wait =
     ms === undefined ? nextTurn(undefined, { signal }) : sleep(ms, undefined, { signal });
   await wait.catch(() => signal.throwIfAborted());
+}
+
+/** Each indexed survey's row count, by code in sorted order — one covering scan of the `survey_abbr` index. */
+function surveyCounts(db: SqliteHandle): Map<string, number> {
+  const rows = db
+    .prepare<{ survey_abbr: string; n: number }>(
+      `SELECT survey_abbr, COUNT(*) AS n FROM ${CATALOG_TABLE} GROUP BY survey_abbr ORDER BY survey_abbr`,
+    )
+    .all();
+  return new Map(rows.map((r) => [r.survey_abbr, r.n]));
 }
 
 /** Distinct survey codes in the index, sorted — a covering scan of the `survey_abbr` index. */
@@ -464,14 +813,20 @@ function coverageYear(value: string | undefined): number | undefined {
   return Number.isInteger(year) && year > 0 && String(year) === value ? year : undefined;
 }
 
-/** A row's decoded label for a dimension; undefined when its code is not in the table. */
+/**
+ * A row's decoded label for a dimension — through its fallback when the row
+ * carries the fallback code; undefined when its code is not in the table.
+ */
 function decode(decoder: Decoder | undefined, parts: string[]): string | undefined {
-  return decoder?.labels.get(decoder.cols.map((i) => parts[i] ?? '').join('\t'));
+  if (!decoder) return;
+  const { cols, fallback, labels } = decoder;
+  const code = cols.map((i) => parts[i] ?? '').join('\t');
+  return fallback && code === fallback.code ? decode(fallback.decoder, parts) : labels.get(code);
 }
 
 /**
  * Parse a `.series` file into catalog entries, decoding each row's area, item,
- * frequency, and — when the row has no `series_title` — its synthesized title
+ * measure, frequency, and — when the row has no `series_title` — its synthesized title
  * through the survey's code tables (`tables`: table suffix → file text). Two
  * bodies yield no entries, so the survey keeps its indexed rows: one whose
  * header has no `series_id` column (an HTML error page served with a 200), and
@@ -480,11 +835,15 @@ function decode(decoder: Decoder | undefined, parts: string[]): string | undefin
  * rejecting, and parsing it would delete the missing tail and index the
  * fragment of its last line. Missing or structurally unusable declared code
  * tables also keep the survey's prior rows rather than replacing decoded data.
+ * The measure table is the exception for a survey with no indexed rows
+ * (`measureRequired` false): it only labels mirror-served series (#127), so
+ * such a survey indexes without a measure rather than not at all.
  */
 function parseSeries(
   text: string,
   survey: SurveyDefinition,
   tables: ReadonlyMap<string, string>,
+  measureRequired: boolean,
 ): CatalogSeries[] {
   const lines = text.split('\n');
   if (lines.length < 2) return [];
@@ -504,10 +863,7 @@ function parseSeries(
   const startYearCol = header.indexOf('begin_year');
   const endYearCol = header.indexOf('end_year');
   const endPeriodCol = header.indexOf('end_period');
-  const ecUnlabeledFootnote =
-    survey.abbr === 'ec' &&
-    header.join('\t') ===
-      'series_id\tcomp_code\tgroup_code\townership_code\tperiodicity_code\tseasonal\tbegin_year\tbegin_period\tend_year\tend_period';
+  const footnoteUnlabeled = survey.footnoteUnlabeled && !header.includes('footnote_codes');
 
   const parsedTables = new Map<string, CodeLabels | undefined>();
   let incomplete = false;
@@ -536,7 +892,11 @@ function parseSeries(
       if (labels) warn(`${survey.abbr}.series header lacks ${key.join(' + ')}.`);
       return;
     }
-    return { cols, labels };
+    if (!dimension.fallback) return { cols, labels };
+    const fallback = resolve(dimension.fallback.dimension);
+    return (
+      fallback && { cols, labels, fallback: { code: dimension.fallback.code, decoder: fallback } }
+    );
   };
 
   const area = resolve(survey.area);
@@ -544,13 +904,15 @@ function parseSeries(
   const frequencyDecoder = resolve(survey.frequency);
   const titleDecoders = survey.title ? survey.title.map(resolve) : [item, area];
   if (incomplete) return [];
+  const measureDecoder = resolve(survey.measure);
+  if (incomplete && measureRequired) return [];
   const surveyAbbr = survey.abbr.toUpperCase();
 
   const entries: CatalogSeries[] = [];
   for (const line of lines.slice(1)) {
     if (!line.trim()) continue;
     const parts = splitFields(line, false);
-    const coverageOffset = ecUnlabeledFootnote && parts.length === header.length + 1 ? 1 : 0;
+    const coverageOffset = footnoteUnlabeled && parts.length === header.length + 1 ? 1 : 0;
     const startYear = coverageYear(
       startYearCol < 0 ? undefined : parts[startYearCol + coverageOffset],
     );
@@ -561,6 +923,7 @@ function parseSeries(
 
     const areaName = decode(area, parts);
     const itemName = decode(item, parts);
+    const measure = decode(measureDecoder, parts);
     const frequency = decode(frequencyDecoder, parts);
     const title =
       (titleCol >= 0 ? parts[titleCol] : undefined) ||
@@ -579,6 +942,7 @@ function parseSeries(
       surveyAbbr,
       ...(areaName && { areaName }),
       ...(itemName && { itemName }),
+      ...(measure && { measure }),
       ...(frequency && { frequency }),
       ...(startYear !== undefined && { startYear }),
       ...(endYear !== undefined && { endYear }),
@@ -602,6 +966,7 @@ function toRow(s: CatalogSeries): MirrorRow {
     start_year: s.startYear ?? null,
     end_year: s.endYear ?? null,
     end_period: s.endPeriod ?? null,
+    measure: s.measure ?? null,
   };
 }
 
@@ -617,6 +982,7 @@ function toCatalog(row: MirrorRow): CatalogSeries {
     ...(row.start_year != null ? { startYear: row.start_year as number } : {}),
     ...(row.end_year != null ? { endYear: row.end_year as number } : {}),
     ...(row.end_period != null ? { endPeriod: row.end_period as string } : {}),
+    ...(row.measure != null ? { measure: row.measure as string } : {}),
     seasonal: row.seasonal === 1,
   };
 }
@@ -624,17 +990,21 @@ function toCatalog(row: MirrorRow): CatalogSeries {
 /**
  * The index-version migration. It runs after the declarative
  * `CREATE TABLE IF NOT EXISTS`, which never alters an existing table: an index
- * from an earlier release gains every missing frequency/coverage column, while
- * a brand-new database already has them. Then it clears the completion marker
- * so the next `load()` re-harvests.
+ * from an earlier release gains every missing frequency/coverage/measure column,
+ * while a brand-new database already has them. Both gain the OE code-table store.
+ * Then it clears the completion marker so the next `load()` re-harvests.
  */
 function migrateCatalogIndex(db: SqliteHandle): void {
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS ${OEWS_TABLES_TABLE} (name TEXT PRIMARY KEY, body TEXT NOT NULL) WITHOUT ROWID`,
+  );
   const columns = db.prepare<{ name: string }>(`PRAGMA table_info(${CATALOG_TABLE})`).all();
   for (const [name, type] of Object.entries({
     frequency: 'TEXT',
     start_year: 'INTEGER',
     end_year: 'INTEGER',
     end_period: 'TEXT',
+    measure: 'TEXT',
   })) {
     if (!columns.some((c) => c.name === name)) {
       db.exec(`ALTER TABLE ${CATALOG_TABLE} ADD COLUMN ${name} ${type}`);
@@ -668,6 +1038,7 @@ export function createCatalogStore(dbPath: string): MirrorStore {
       start_year: 'INTEGER',
       end_year: 'INTEGER',
       end_period: 'TEXT',
+      measure: 'TEXT',
     },
     fts: ['series_id', 'title', 'area_name', 'item_name'],
     indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
@@ -680,7 +1051,16 @@ export class BlsCatalogService {
   private loadError: string | undefined;
   private cachedTotal = 0;
   private cachedSurveys: readonly string[] = [];
-  private geographicVocabulary: ReadonlySet<string> = new Set();
+  /** Each indexed survey's row count, read with the totals (#121). */
+  private cachedSurveyCounts: ReadonlyMap<string, number> = new Map();
+  /** The stored OE code tables; undefined until a harvest stores a usable set (#119). */
+  private oewsTables: OewsTables | undefined;
+  /** Decoded area-name parts by distinctive word (`indexAreaParts`). */
+  private areaParts: ReadonlyMap<string, readonly AreaPart[]> = new Map();
+  /** Survey code → the latest `end_year` of its rows; the reference for a row's currency. */
+  private newestYears: ReadonlyMap<string, number> = new Map();
+  /** The decoded areas each state and area code of the `area` filter resolves to. */
+  private areaIndex: AreaIndex = { codes: new Map(), states: new Map() };
   /** The surveys this deployment harvests, and their list as the sync state persists it. */
   private readonly surveys: readonly SurveyDefinition[];
   private readonly surveyList: string;
@@ -688,6 +1068,14 @@ export class BlsCatalogService {
   private inFlight: Promise<void> | undefined;
   /** Aborted by `shutdown()`; every fetch, backoff, and write of a harvest observes it. */
   private readonly stopping = new AbortController();
+  /** Checks this process has run: every `load()` that starts a run, not one that joins it. */
+  private checks = 0;
+  /**
+   * Each configured survey's refresh record, by abbreviation, for the life of
+   * the process. Undefined until the first check; a restart starts over, so an
+   * index left incomplete re-harvests every survey.
+   */
+  private schedule: Map<string, SurveyRefresh> | undefined;
 
   constructor(
     private readonly catalogBaseUrl: string,
@@ -703,79 +1091,129 @@ export class BlsCatalogService {
   }
 
   /**
-   * Re-read totals and survey codes and rebuild the geographic vocabulary. Runs
-   * on the first load and after each harvest — the index changes only then —
-   * so search never pays for it. `count()` runs first so the store finishes
-   * opening inside its own call, before `raw()` hands out the handle.
+   * Re-read totals and per-survey counts and rebuild the geographic vocabulary,
+   * the area-filter index, and each survey's newest year. Runs on the first
+   * load and after each harvest — the index changes only then — so neither
+   * search nor bls_list_surveys pays for it. `count()` runs first so the store
+   * finishes opening inside its own call, before `raw()` hands out the handle.
    */
   private async readIndexStats(): Promise<void> {
     this.cachedTotal = await this.store.count();
-    this.cachedSurveys = distinctSurveys(await this.store.raw());
     const db = await this.store.raw();
-    const vocabulary = new Set<string>();
-    db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${GEOGRAPHIC_WORDS}
-      (word TEXT NOT NULL, area TEXT NOT NULL, PRIMARY KEY (word, area)) WITHOUT ROWID`);
-    const insert = db.prepare(`INSERT OR IGNORE INTO ${GEOGRAPHIC_WORDS} VALUES (?, ?)`);
+    this.cachedSurveyCounts = surveyCounts(db);
+    this.cachedSurveys = [...this.cachedSurveyCounts.keys()];
     const areas = db
       .prepare<{ area_name: string }>(
         `SELECT DISTINCT area_name FROM ${CATALOG_TABLE} WHERE area_name IS NOT NULL`,
       )
+      .all()
+      .map((r) => r.area_name);
+    this.areaParts = indexAreaParts(areas);
+    // Each area code a SeriesID carries, with the area it names; `types` are
+    // LAUS area types, the SeriesID's characters 4–5.
+    const coded = AREA_CODE_SOURCES.flatMap(({ survey, types = [], start, length }) =>
+      db
+        .prepare<{ area: string; code: string }>(
+          `SELECT DISTINCT substr(series_id, ?, ?) AS code, area_name AS area FROM ${CATALOG_TABLE}
+           WHERE survey_abbr = ? AND area_name IS NOT NULL
+           ${types.length > 0 ? `AND substr(series_id, 4, 2) IN (${types.map(() => '?').join(',')})` : ''}`,
+        )
+        .all(start, length, survey, ...types),
+    );
+    this.areaIndex = indexAreas(areas, coded);
+    const newest = db
+      .prepare<{ survey_abbr: string; newest: number }>(
+        `SELECT survey_abbr, MAX(end_year) AS newest FROM ${CATALOG_TABLE}
+         WHERE end_year IS NOT NULL GROUP BY survey_abbr`,
+      )
       .all();
-    db.exec('BEGIN');
-    try {
-      db.exec(`DELETE FROM ${GEOGRAPHIC_WORDS}`);
-      for (const { area_name: area } of areas) {
-        for (const word of area.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? []) {
-          if (word.length < 3 || GEOGRAPHIC_STOP_WORDS.has(word)) continue;
-          vocabulary.add(word);
-          insert.run(word, area);
-        }
-      }
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-    this.geographicVocabulary = vocabulary;
+    this.newestYears = new Map(newest.map((r) => [r.survey_abbr, r.newest]));
   }
 
   /**
-   * Ensure the on-disk index is present and fresh. Serves an existing index
-   * immediately (queryable during any refresh); harvests when the store is
-   * empty, the last refresh was incomplete, its completion is older than the
-   * TTL, or it harvested a different survey list than configured.
-   * Retries a fully-empty harvest up to `maxAttempts` times with linear
-   * backoff. Sets `loaded = true` after the final outcome so callers can
-   * distinguish "still loading" from "load failed".
+   * Run one check of the on-disk index, serving an existing index throughout
+   * (queryable during any refresh). An index with no series harvests every
+   * configured survey, retrying a fully empty harvest up to `maxAttempts` times
+   * with linear backoff. Otherwise the check harvests only the surveys due, in
+   * one attempt: a survey whose last success is older than the TTL, and a
+   * failed survey whose backoff ran out — retried at the next check, then
+   * after 2, 4, 8 … checks, the gap capped at the TTL in hours (one check runs
+   * per hour). The first check seeds every survey's last success from the
+   * stored completion only when the store records a complete harvest of the
+   * configured survey list, so an incomplete refresh, a changed list, or an
+   * index-version upgrade makes every survey due. A check with nothing due
+   * does no I/O. The sync state turns `complete` only once every configured
+   * survey has succeeded, with `completedAt` the oldest success.
    *
    * Concurrent calls — the boot load and an hourly refresh tick — share one
    * in-flight run, so a second harvest never starts while one is running. A
-   * run that `shutdown()` stops rejects with the shutdown reason.
+   * run that `shutdown()` stops rejects with the shutdown reason. A rejected
+   * run records its reason, which `readiness` reports while the index holds no
+   * series.
    */
   load(maxAttempts = 3): Promise<void> {
-    this.inFlight ??= this.refresh(maxAttempts).finally(() => {
-      this.inFlight = undefined;
-    });
+    this.inFlight ??= this.refresh(maxAttempts)
+      .catch((error: unknown) => {
+        this.loadError = `Catalog load stopped: ${error instanceof Error ? error.message : String(error)}`;
+        throw error;
+      })
+      .finally(() => {
+        this.inFlight = undefined;
+      });
     return this.inFlight;
   }
 
   private async refresh(maxAttempts: number): Promise<void> {
     const { signal } = this.stopping;
     signal.throwIfAborted();
-    if (!this.loaded) await this.readIndexStats();
+    const check = ++this.checks;
+    if (!this.loaded) {
+      await this.readIndexStats();
+      this.oewsTables ??= await this.readStoredOewsTables();
+    }
     const existing = this.cachedTotal;
+    let due = this.surveys;
+    let tablesDue = true;
     if (existing > 0) {
       this.loaded = true;
       this.loadError = undefined;
-      if (this.isFresh(await this.store.readState())) return; // warm + fresh — nothing to do
+      this.schedule ??= this.scheduleFrom(await this.store.readState());
+      const schedule = this.schedule;
+      const nowMs = Date.now();
+      due = this.surveys.filter((s) => this.isDue(schedule.get(s.abbr), check, nowMs));
+      tablesDue = this.isDue(schedule.get(OEWS_TABLES), check, nowMs);
+      if (due.length === 0 && !tablesDue) return; // warm, nothing due
     }
 
-    let applied = 0;
-    let complete = false;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      ({ applied, complete } = await this.harvest(signal));
-      if (applied > 0) break;
-      if (attempt < maxAttempts) await pause(signal, attempt * 5_000);
+    // Only an index with no series repeats a harvest that applied nothing.
+    const attempts = existing > 0 ? 1 : maxAttempts;
+    let { applied, failed, oeTables } = await this.harvest(due, signal);
+    for (let attempt = 1; attempt < attempts && applied === 0; attempt++) {
+      await pause(signal, attempt * 5_000);
+      ({ applied, failed, oeTables } = await this.harvest(due, signal));
+    }
+    const tablesFailure = tablesDue ? await this.harvestOewsTables(signal, oeTables) : undefined;
+
+    // An index still holding no series retries every survey at the next check.
+    const empty = existing === 0 && applied === 0;
+    if (!empty) {
+      const harvested = [...due.map((s) => s.abbr), ...(tablesDue ? [OEWS_TABLES] : [])];
+      const failedUnits = new Set(failed.keys());
+      if (tablesFailure !== undefined) failedUnits.add(OEWS_TABLES);
+      this.record(check, harvested, failedUnits);
+    }
+    for (const [abbr, failure] of failed) {
+      const retry = this.nextRetry(abbr, check, empty);
+      warn(
+        failure.outcome === 'series_unavailable'
+          ? `${abbr}.series unavailable (${failure.cause}) — its indexed rows are kept; ${retry}.`
+          : `${abbr} not refreshed — its indexed rows are kept; ${retry}.`,
+      );
+    }
+    if (tablesFailure !== undefined) {
+      warn(
+        `OE code tables not refreshed (${tablesFailure}) — the stored tables are kept; ${this.nextRetry(OEWS_TABLES, check, empty)}.`,
+      );
     }
 
     if (applied > 0) {
@@ -783,9 +1221,10 @@ export class BlsCatalogService {
       this.loaded = true;
       this.loadError = undefined;
       signal.throwIfAborted();
+      const completedAtMs = this.oldestSuccess();
       await this.store.writeState({
-        status: complete ? 'complete' : 'error',
-        ...(complete && { completedAt: new Date().toISOString() }),
+        status: completedAtMs === undefined ? 'error' : 'complete',
+        ...(completedAtMs !== undefined && { completedAt: new Date(completedAtMs).toISOString() }),
         total: this.cachedTotal,
         checkpoint: this.surveyList,
       });
@@ -795,64 +1234,223 @@ export class BlsCatalogService {
     if (existing > 0) {
       // Refresh fetched nothing, but a prior index is still queryable — keep
       // serving it and retry on the next hourly check rather than tearing it down.
-      process.stderr.write(
-        '[bls-labor-mcp-server] Catalog refresh fetched no rows — serving the existing index.\n',
-      );
+      // A check that refreshed only the OE code tables fetched what was due.
+      if (due.length > 0) {
+        process.stderr.write(
+          '[bls-labor-mcp-server] Catalog refresh fetched no rows — serving the existing index.\n',
+        );
+      }
       return;
     }
 
-    this.loaded = true; // empty, but "loaded" so search surfaces the empty-catalog error
-    this.loadError = `Catalog load failed after ${maxAttempts} attempts — all LABSTAT downloads returned empty.`;
+    this.loaded = true; // empty, but loaded: `readiness` reports it unavailable with this error
+    this.loadError = `Catalog load failed after ${maxAttempts} ${maxAttempts === 1 ? 'attempt' : 'attempts'} — all LABSTAT downloads returned empty.`;
     signal.throwIfAborted();
     await this.store.writeState({ status: 'error', error: this.loadError });
   }
 
   /**
-   * True when the last refresh completed every survey within the TTL window
-   * and harvested the configured survey list (persisted in `checkpoint`). A
-   * missing list — an index from an earlier release — counts as stale.
+   * The first check's schedule, from the stored sync state: every survey last
+   * succeeded at the stored completion when the state records a complete
+   * harvest of the configured survey list (persisted in `checkpoint`), and so
+   * did the OE code tables, which do not hold the state incomplete. Otherwise —
+   * an incomplete refresh, a missing list (an index from an earlier release), a
+   * different list, or a completion an index-version migration cleared —
+   * nothing has a record, so all is due.
    */
-  private isFresh({ status, completedAt, checkpoint }: SyncState): boolean {
-    if (status !== 'complete' || !completedAt || checkpoint !== this.surveyList) return false;
-    const age = Date.now() - Date.parse(completedAt);
-    return Number.isFinite(age) && age <= this.cacheTtlHours * 3_600_000;
+  private scheduleFrom({ status, completedAt, checkpoint }: SyncState): Map<string, SurveyRefresh> {
+    const succeededAtMs = Date.parse(completedAt ?? '');
+    if (
+      status !== 'complete' ||
+      checkpoint !== this.surveyList ||
+      !Number.isFinite(succeededAtMs)
+    ) {
+      return new Map();
+    }
+    const current = [...this.surveys.map((s) => s.abbr), OEWS_TABLES];
+    return new Map(
+      current.map((unit): [string, SurveyRefresh] => [unit, { state: 'current', succeededAtMs }]),
+    );
+  }
+
+  /** Whether a survey is due at `check`: no record, a lapsed TTL, or a backoff that ran out. */
+  private isDue(record: SurveyRefresh | undefined, check: number, nowMs: number): boolean {
+    if (!record) return true;
+    if (record.state === 'failing') return check >= record.retryCheck;
+    return nowMs - record.succeededAtMs > this.cacheTtlHours * 3_600_000;
   }
 
   /**
-   * Fetch every configured survey with bounded concurrency and upsert the
-   * parsed rows into the store in chunks. After a survey's upserts, its indexed
-   * rows absent from the new `.series` file are deleted; once every survey is
-   * done, so are the rows of surveys no longer configured (OES after its
-   * opt-in turns off). A survey that yields no rows — its `.series` request
-   * failed, returned non-200, carried no `series_id` header, ended mid-line, or
-   * lacked a usable declared decoder — keeps its rows, and a harvest that
-   * applies no rows deletes nothing. Returns the number applied and whether
-   * every configured survey succeeded.
+   * Record a check's outcome for the units it harvested — surveys by
+   * abbreviation, and the OE code tables: a success restarts TTL scheduling
+   * from now; a failure doubles the gap to its next retry (1, 2, 4 … checks),
+   * capped at the TTL in hours.
    */
-  private async harvest(signal: AbortSignal): Promise<{ applied: number; complete: boolean }> {
+  private record(check: number, harvested: readonly string[], failed: ReadonlySet<string>): void {
+    this.schedule ??= new Map();
+    const schedule = this.schedule;
+    const nowMs = Date.now();
+    const maxGap = Math.max(1, this.cacheTtlHours);
+    for (const unit of harvested) {
+      if (!failed.has(unit)) {
+        schedule.set(unit, { state: 'current', succeededAtMs: nowMs });
+        continue;
+      }
+      const prior = schedule.get(unit);
+      const failures = (prior?.state === 'failing' ? prior.failures : 0) + 1;
+      const gap = Math.min(2 ** (failures - 1), maxGap);
+      schedule.set(unit, { state: 'failing', failures, retryCheck: check + gap });
+    }
+  }
+
+  /** When a survey that failed at `check` is tried next, for its stderr line. */
+  private nextRetry(abbr: string, check: number, empty: boolean): string {
+    const record = this.schedule?.get(abbr);
+    const gap = !empty && record?.state === 'failing' ? record.retryCheck - check : 1;
+    return gap === 1 ? 'next retry at the next hourly check' : `next retry in ${gap} hourly checks`;
+  }
+
+  /** The oldest last success across the configured surveys; undefined while any is not current. */
+  private oldestSuccess(): number | undefined {
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const { abbr } of this.surveys) {
+      const record = this.schedule?.get(abbr);
+      if (record?.state !== 'current') return;
+      oldest = Math.min(oldest, record.succeededAtMs);
+    }
+    return oldest;
+  }
+
+  /**
+   * Fetch the OE code tables composition reads and, once all three arrive and
+   * parse, replace the stored set in one transaction and serve it. Returns why
+   * the set was not replaced — each failed request or body read, or an unusable
+   * table — or undefined once it is; the stored set stays in force meanwhile.
+   * Fetched whatever the OES opt-in: the tables are small, and composition runs
+   * whenever the index holds no OE rows. Every request also aborts on `signal`,
+   * and an abort rejects. Tables the OE survey's own harvest already fetched
+   * (`loaded`, by table suffix) are reused rather than requested again.
+   */
+  private async harvestOewsTables(
+    signal: AbortSignal,
+    loaded: ReadonlyMap<string, string>,
+  ): Promise<string | undefined> {
+    const download = async (name: OewsTableName): Promise<string> => {
+      const fetched = loaded.get(name);
+      if (fetched !== undefined) return fetched;
+      const res = await fetch(
+        `${this.catalogBaseUrl}/${OES_SURVEY_ABBR}/${OES_SURVEY_ABBR}.${name}`,
+        {
+          headers: { 'User-Agent': this.userAgent },
+          signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+        },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    };
+    const results = await Promise.allSettled(OEWS_TABLE_NAMES.map(download));
+    signal.throwIfAborted();
+
+    const bodies: Partial<Record<OewsTableName, string>> = {};
+    const failures: string[] = [];
+    for (const [i, name] of OEWS_TABLE_NAMES.entries()) {
+      const result = results[i];
+      if (result?.status === 'fulfilled') {
+        bodies[name] = result.value;
+        continue;
+      }
+      const error: unknown = result?.reason;
+      const cause =
+        error instanceof Error
+          ? error.cause instanceof Error
+            ? `${error.message}: ${error.cause.message}`
+            : error.message
+          : String(error);
+      failures.push(`oe.${name}: ${cause}`);
+    }
+    const { area, occupation, datatype } = bodies;
+    if (area === undefined || occupation === undefined || datatype === undefined) {
+      return failures.join('; ');
+    }
+    const tables = parseOewsTables({ area, occupation, datatype });
+    if (!tables) return 'a table lacks a required column or has no usable rows';
+
+    const db = await this.store.raw();
+    const upsert = db.prepare(
+      `INSERT INTO ${OEWS_TABLES_TABLE} (name, body) VALUES (?, ?)
+       ON CONFLICT(name) DO UPDATE SET body = excluded.body`,
+    );
+    db.transaction(() => {
+      for (const [name, body] of Object.entries({ area, occupation, datatype }))
+        upsert.run(name, body);
+    });
+    this.oewsTables = tables;
+    return;
+  }
+
+  /** The stored OE code tables, parsed; undefined while no usable set is stored. */
+  private async readStoredOewsTables(): Promise<OewsTables | undefined> {
+    const rows = (await this.store.raw())
+      .prepare<{ name: string; body: string }>(`SELECT name, body FROM ${OEWS_TABLES_TABLE}`)
+      .all();
+    const bodies = new Map(rows.map((r) => [r.name, r.body]));
+    const area = bodies.get('area');
+    const occupation = bodies.get('occupation');
+    const datatype = bodies.get('datatype');
+    if (area === undefined || occupation === undefined || datatype === undefined) return;
+    return parseOewsTables({ area, occupation, datatype });
+  }
+
+  /**
+   * Fetch `surveys` with bounded concurrency and upsert the parsed rows into
+   * the store in chunks. After a survey's upserts, its indexed rows absent from
+   * the new `.series` file are deleted; once every survey is done, so are the
+   * rows of surveys no longer configured (OES after its opt-in turns off) —
+   * judged against the whole configured list, so a harvest of some surveys
+   * leaves the others' rows alone. A survey that yields no rows (`SurveyLoad`)
+   * keeps its rows, and a harvest that applies no rows deletes nothing. Returns
+   * the rows applied and each failed survey's outcome, by abbreviation.
+   */
+  private async harvest(
+    surveys: readonly SurveyDefinition[],
+    signal: AbortSignal,
+  ): Promise<{
+    applied: number;
+    failed: Map<string, SurveyFailure>;
+    oeTables: ReadonlyMap<string, string>;
+  }> {
     let applied = 0;
-    let complete = true;
-    for (let i = 0; i < this.surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
-      const batch = this.surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
+    let oeTables: ReadonlyMap<string, string> = new Map();
+    const failed = new Map<string, SurveyFailure>();
+    for (let i = 0; i < surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
+      const batch = surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
       const results = await Promise.allSettled(
         batch.map((survey) => this.loadSurvey(survey, signal)),
       );
-      for (const r of results) {
+      for (const [k, { abbr }] of batch.entries()) {
         signal.throwIfAborted();
-        if (r.status !== 'fulfilled' || r.value.length === 0) {
-          complete = false;
+        const result = results[k];
+        if (result?.status !== 'fulfilled') {
+          warn(`${abbr} harvest failed: ${String(result?.reason)}`);
+          failed.set(abbr, { outcome: 'unusable' });
           continue;
         }
-        for (let j = 0; j < r.value.length; j += HARVEST_CHUNK_SIZE) {
-          const chunk = r.value.slice(j, j + HARVEST_CHUNK_SIZE);
+        if (result.value.outcome !== 'indexed') {
+          failed.set(abbr, result.value);
+          continue;
+        }
+        const { entries, tables } = result.value;
+        if (abbr === OES_SURVEY_ABBR) oeTables = tables;
+        for (let j = 0; j < entries.length; j += HARVEST_CHUNK_SIZE) {
+          const chunk = entries.slice(j, j + HARVEST_CHUNK_SIZE);
           signal.throwIfAborted();
           await this.store.applyBatch(chunk.map(toRow), []);
           applied += chunk.length;
           await pause(signal);
         }
-        const [first] = r.value;
+        const [first] = entries;
         if (first) {
-          await this.deleteRows(first.surveyAbbr, new Set(r.value.map((s) => s.seriesId)), signal);
+          await this.deleteRows(first.surveyAbbr, new Set(entries.map((s) => s.seriesId)), signal);
         }
       }
     }
@@ -863,7 +1461,7 @@ export class BlsCatalogService {
         if (!configured.has(survey)) await this.deleteRows(survey, undefined, signal);
       }
     }
-    return { applied, complete };
+    return { applied, failed, oeTables };
   }
 
   /**
@@ -897,45 +1495,88 @@ export class BlsCatalogService {
 
   /**
    * Fetch a survey's `.series` file and the code tables its dimensions name,
-   * then parse. A missing `.series` file or declared code table yields no rows,
-   * preserving the survey's previous snapshot. Every request
-   * also aborts on `signal`.
+   * then parse. A failed `.series` request or body read returns its cause; a
+   * failed or unusable declared table, or a `.series` body the parser refuses,
+   * reports itself on stderr and returns `unusable`. Either preserves the
+   * survey's previous snapshot. Every request also aborts on `signal`, and an
+   * abort rejects rather than reading as a failed survey.
    */
-  private async loadSurvey(
-    survey: SurveyDefinition,
-    signal: AbortSignal,
-  ): Promise<CatalogSeries[]> {
+  private async loadSurvey(survey: SurveyDefinition, signal: AbortSignal): Promise<SurveyLoad> {
     const { abbr } = survey;
     const url = (file: string) => `${this.catalogBaseUrl}/${abbr}/${abbr}.${file}`;
     const headers = { 'User-Agent': this.userAgent };
-    const dimensions = [survey.area, survey.item, survey.frequency, ...(survey.title ?? [])];
-    const tableNames = [...new Set(dimensions.flatMap((d) => (d ? [d.table] : [])))];
+    const dimensions = [
+      survey.area,
+      survey.item,
+      survey.measure,
+      survey.frequency,
+      ...(survey.title ?? []),
+    ];
+    const tableNames = [...new Set(dimensions.flatMap((d) => (d ? dimensionTables(d) : [])))];
     const request = (file: string, timeoutMs: number) =>
       fetch(url(file), {
         headers,
         signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
       });
 
+    /**
+     * Why a request or body read failed, rethrowing a shutdown's abort. Node's
+     * fetch rejects with a bare "fetch failed" that carries the reason in `cause`.
+     */
+    const failure = (error: unknown): string => {
+      signal.throwIfAborted();
+      if (!(error instanceof Error)) return String(error);
+      return error.cause instanceof Error
+        ? `${error.message}: ${error.cause.message}`
+        : error.message;
+    };
+
     const [seriesRes, ...tableResults] = await Promise.allSettled([
       request('series', 30_000),
       ...tableNames.map((table) => request(table, 15_000)),
     ]);
 
-    if (seriesRes.status !== 'fulfilled' || !seriesRes.value.ok) return [];
-    const seriesText = await seriesRes.value.text();
+    if (seriesRes.status === 'rejected') {
+      return {
+        outcome: 'series_unavailable',
+        cause: `request failed: ${failure(seriesRes.reason)}`,
+      };
+    }
+    if (!seriesRes.value.ok) {
+      return { outcome: 'series_unavailable', cause: `HTTP ${seriesRes.value.status}` };
+    }
+    let seriesText: string;
+    try {
+      seriesText = await seriesRes.value.text();
+    } catch (error) {
+      return { outcome: 'series_unavailable', cause: `body read failed: ${failure(error)}` };
+    }
 
+    const warm = this.cachedSurveyCounts.has(abbr.toUpperCase());
     const tables = new Map<string, string>();
     for (const [i, table] of tableNames.entries()) {
       const res = tableResults[i];
-      if (res?.status === 'fulfilled' && res.value.ok) {
-        tables.set(table, await res.value.text());
-      } else {
-        const cause = res?.status === 'fulfilled' ? `HTTP ${res.value.status}` : 'request failed';
-        warn(`${abbr}.${table} unavailable (${cause}) — its indexed rows are kept.`);
+      let cause: string;
+      if (res?.status !== 'fulfilled') cause = 'request failed';
+      else if (!res.value.ok) cause = `HTTP ${res.value.status}`;
+      else {
+        try {
+          tables.set(table, await res.value.text());
+          continue;
+        } catch (error) {
+          cause = `body read failed: ${failure(error)}`;
+        }
       }
+      // A survey with no indexed rows still indexes without its measure table (see parseSeries).
+      const kept =
+        warm || table !== survey.measure?.table
+          ? 'its indexed rows are kept'
+          : 'its rows index without a measure';
+      warn(`${abbr}.${table} unavailable (${cause}) — ${kept}.`);
     }
 
-    return parseSeries(seriesText, survey, tables);
+    const entries = parseSeries(seriesText, survey, tables, warm);
+    return entries.length > 0 ? { outcome: 'indexed', entries, tables } : { outcome: 'unusable' };
   }
 
   /**
@@ -944,25 +1585,48 @@ export class BlsCatalogService {
    * applies the bespoke relevance score over the small candidate set.
    */
   async search(input: CatalogSearchInput): Promise<CatalogSearchResult> {
-    if (!this.loaded) {
-      throw internalError(
-        `Catalog index not loaded — server startup may have failed. ${this.loadError ?? ''}`.trim(),
-        { reason: 'catalog_unavailable' },
-      );
+    const readiness = this.readiness;
+    if (readiness.status === 'loading') {
+      throw serviceUnavailable('Catalog index is still being built — no series indexed yet.', {
+        reason: 'catalog_loading',
+        retryable: true,
+      });
     }
+    if (readiness.status === 'unavailable') {
+      throw internalError(`Catalog index holds no series. ${readiness.error}`, {
+        reason: 'catalog_unavailable',
+      });
+    }
+
+    // OEWS SeriesIDs composed from the OE code tables while the index holds no OE rows (#119).
+    const oewsTables = this.oewsComposition;
+    const composed = oewsTables && composeOewsSearch(oewsTables, input);
+    if (composed) return composed;
 
     const query = input.query.toLowerCase().trim();
     const queryUpper = query.toUpperCase();
     const surveyFilter = input.survey?.toUpperCase();
     const areaFilter = input.area?.toLowerCase();
+    // A state or area code resolves to decoded area names; any other area is a substring.
+    const resolvedArea = areaFilter ? resolveArea(areaFilter, this.areaIndex) : undefined;
     const seasonFilter = input.seasonal_adjustment;
 
     // Concept/synonym resolution: surveys whose canonical vocabulary the query
     // names but whose series titles never contain (e.g. "inflation" → CU). Their
     // candidates get a relevance boost in the rescore below, as do rows of a
     // publication frequency the query names ("quarterly unemployment rate").
-    const aliasSurveys = conceptAliasSurveys(query);
+    const fired = firedAliases(query);
+    const aliasSurveys = new Set(fired.flatMap((a) => a.surveys));
     const frequencies = queryFrequencies(query);
+    // Each distinct token once, up to MAX_QUERY_TOKENS: a repeat adds nothing
+    // to the match, and the FTS query and the rescore both cost per token.
+    const tokens = [...new Set(query.match(/[a-z0-9]+/g))].slice(0, MAX_QUERY_TOKENS);
+    // The core measures `core` names beside their survey's alias, within the survey filter.
+    const coreMeasures = tokens.includes('core')
+      ? CORE_MEASURES.filter(
+          (m) => aliasSurveys.has(m.survey) && (!surveyFilter || surveyFilter === m.survey),
+        )
+      : [];
 
     // Candidate set: an exact-id lookup (guarantees the precise SeriesID is in
     // play) unioned with the FTS5 matches, deduped by series id.
@@ -970,6 +1634,14 @@ export class BlsCatalogService {
 
     const exact = await this.store.getByIds([input.query.trim().toUpperCase()]);
     for (const row of exact) candidates.set(row.series_id as string, toCatalog(row));
+
+    // The core measures a query names are candidates whatever its other words
+    // match, ahead of the headlines so they keep the ties a core query makes.
+    if (coreMeasures.length > 0) {
+      for (const row of await this.coreRows(coreMeasures)) {
+        candidates.set(row.series_id as string, toCatalog(row));
+      }
+    }
 
     // Headline common series are always candidates, independent of the FTS cap.
     // The bm25 pre-filter (CANDIDATE_LIMIT) can drop a headline series that matches
@@ -981,54 +1653,85 @@ export class BlsCatalogService {
     for (const row of common) candidates.set(row.series_id as string, toCatalog(row));
 
     let ftsCapped = false;
-    // Each distinct token once, up to MAX_QUERY_TOKENS: a repeat adds nothing
-    // to the match, and the FTS query and the rescore both cost per token.
-    const tokens = [...new Set(query.match(/[a-z0-9]+/g))].slice(0, MAX_QUERY_TOKENS);
     const wholeShortTerms = tokens.filter((t) => t.length === 1).length > MAX_SHORT_PREFIXES;
-    const eligibleWords = new Set(
-      areaFilter ? [] : tokens.filter((t) => this.geographicVocabulary.has(t)),
-    );
-    const geographicWords = new Set<string>();
-    if (eligibleWords.size > 0) {
+    // A row matches every query word when it matches each word that is not a
+    // function word, in its own text or through a concept alias its survey
+    // answers to.
+    const required = tokens.filter((t) => !FUNCTION_WORDS.has(t));
+    const covered = aliasWords(fired, required);
+    // Areas the query names, by its whole words: "seattle" in "seattleé" names nothing.
+    const named = new Set<string>();
+    if (!areaFilter) {
+      const tokenSet = new Set(tokens);
+      const words = new Set<string>();
       for (const [word] of query.matchAll(/[\p{L}\p{N}\p{M}]+/gu)) {
-        if (eligibleWords.has(word)) geographicWords.add(word);
+        if (tokenSet.has(word)) words.add(word);
       }
+      for (const area of namedAreas(this.areaParts, words)) named.add(area);
     }
-    const geographicIds = new Set<string>();
     const wholeQueryEnd =
       wholeShortTerms &&
       tokens.some(
         (t) => t.length === 1 && query.endsWith(t) && !/[a-z0-9]/.test(query.at(-2) ?? ''),
       );
-    const areaMatchable = !areaFilter || areaFilter.length <= MAX_AREA_LENGTH;
+    const areaMatchable =
+      !areaFilter ||
+      (resolvedArea
+        ? resolvedArea.areas.size > 0 || resolvedArea.state !== undefined
+        : areaFilter.length <= MAX_AREA_LENGTH);
     if (tokens.length > 0 && areaMatchable) {
-      const match = tokens
-        .map((t) => `"${t}"${wholeShortTerms && t.length === 1 ? '' : '*'}`)
-        .join(' OR ');
-      const rows = await this.candidateRows(match, surveyFilter, seasonFilter, areaFilter, [
-        ...geographicWords,
-      ]);
+      const term = (t: string) => `"${t}"${wholeShortTerms && t.length === 1 ? '' : '*'}`;
+      const every = (words: readonly string[]) => words.map(term).join(' AND ');
+      // The rows that match every word, by the surveys an alias excuses from some of them.
+      const allWords: AllWordsMatch[] = [];
+      if (required.length > 0) {
+        const bySurveys = new Map<string, string[]>();
+        for (const [survey, words] of covered) {
+          const key = every(required.filter((t) => !words.has(t)));
+          bySurveys.set(key, [...(bySurveys.get(key) ?? []), survey]);
+        }
+        for (const [match, surveys] of bySurveys) allWords.push({ surveys, match });
+        allWords.push({ match: every(required) });
+      }
+      const rows = await this.candidateRows(
+        tokens.map(term).join(' OR '),
+        surveyFilter,
+        seasonFilter,
+        resolvedArea ?? areaFilter,
+        allWords,
+        [...named],
+      );
       // If the FTS query returned exactly CANDIDATE_LIMIT rows the full index likely
       // has more matches — total will be a lower bound.
       ftsCapped = rows.length >= CANDIDATE_LIMIT;
-      for (const row of rows) {
-        candidates.set(row.series_id as string, toCatalog(row));
-        if (row.geographic_match) geographicIds.add(row.series_id as string);
-      }
+      for (const row of rows) candidates.set(row.series_id as string, toCatalog(row));
     }
 
     // Score each candidate. Exact series ID match = highest priority.
-    const scored: Array<{ s: CatalogSeries; score: number }> = [];
+    const scored: RankedSeries[] = [];
     for (const s of candidates.values()) {
       if (surveyFilter && s.surveyAbbr.toUpperCase() !== surveyFilter) continue;
       if (typeof seasonFilter === 'boolean' && s.seasonal !== seasonFilter) continue;
 
       if (s.seriesId.toUpperCase() === queryUpper) {
-        scored.push({ s, score: 1000 });
+        scored.push({
+          s,
+          exact: 1,
+          allWords: 0,
+          place: 0,
+          score: 1000,
+          current: 0,
+          national: 0,
+          aggregate: 0,
+        });
         continue;
       }
+      const survey = s.surveyAbbr.toUpperCase();
       const commonText = COMMON_SERIES[s.seriesId];
       const isCommon = commonText !== undefined;
+      const isCore = coreMeasures.some(
+        (m) => m.survey === survey && s.itemName !== undefined && m.items.includes(s.itemName),
+      );
 
       const titleLower = s.title.toLowerCase();
       const areaLower = s.areaName?.toLowerCase() ?? '';
@@ -1038,14 +1741,20 @@ export class BlsCatalogService {
 
       // Area filter as a hard gate. Also check titleLower to cover surveys
       // (e.g. LAUS) where areaName is not decoded from codes but the area
-      // name appears directly in the series title.
+      // name appears directly in the series title. A state or area code
+      // matches its resolved areas, and a state also an area-less row whose
+      // title names it as a comma-separated part — the `candidateRows`
+      // clause, mirrored.
       if (areaFilter) {
-        const areaMatch =
-          areaLower.includes(areaFilter) ||
-          titleLower.includes(areaFilter) ||
-          s.seriesId.toLowerCase().includes(areaFilter);
+        const areaMatch = resolvedArea
+          ? s.areaName !== undefined
+            ? resolvedArea.areas.has(s.areaName)
+            : resolvedArea.state !== undefined &&
+              `, ${titleLower},`.includes(`, ${resolvedArea.state},`)
+          : areaLower.includes(areaFilter) ||
+            titleLower.includes(areaFilter) ||
+            s.seriesId.toLowerCase().includes(areaFilter);
         if (!areaMatch) continue;
-        score += 5;
       }
 
       // Full-query and token matches count where a word starts, so "all" never
@@ -1056,7 +1765,10 @@ export class BlsCatalogService {
       if (commonText !== undefined && startsWord(commonText, query, wholeQueryEnd)) score += 15;
 
       // Token-level match. `matched` counts the tokens the row matches anywhere,
-      // its headline description included, for the headline gate below.
+      // its headline description included, for the headline gate below;
+      // `missing` counts the required words it matches nowhere, its survey's
+      // alias words included. A core measure matches `core` itself.
+      const aliasCovered = covered.get(survey);
       const idLower = s.seriesId.toLowerCase();
       const shortTerms = wholeShortTerms
         ? {
@@ -1068,53 +1780,88 @@ export class BlsCatalogService {
           }
         : undefined;
       let matched = 0;
+      let missing = 0;
       for (const t of tokens) {
         const whole = t.length === 1 ? shortTerms : undefined;
         const inTitle = whole ? whole.title.has(t) : startsWord(titleLower, t);
         const inArea = whole ? whole.area.has(t) : startsWord(areaLower, t);
         const inItem = whole ? whole.item.has(t) : startsWord(itemLower, t);
         const inId = whole ? whole.id.has(t) : idLower.includes(t);
-        if (inTitle) score += 2;
-        if (inArea) score += 1;
-        if (inItem) score += 1;
-        if (inId) score += 3;
+        /**
+         * A function word is never required, so it weighs a quarter of a content
+         * word: it still breaks ties ("per" in "Bacon, sliced, per lb."), but "of"
+         * in a long EI title never outweighs an item match ("price of eggs").
+         */
+        const weight = FUNCTION_WORDS.has(t) ? 0.25 : 1;
+        if (inTitle) score += 2 * weight;
+        if (inArea) score += weight;
+        if (inItem) score += weight;
+        if (inId) score += 3 * weight;
         if (
           inTitle ||
           inArea ||
           inItem ||
           inId ||
-          (whole ? whole.common?.has(t) : commonText && startsWord(commonText, t))
+          (whole ? whole.common?.has(t) : commonText && startsWord(commonText, t)) ||
+          (isCore && t === 'core')
         ) {
           matched++;
+        } else if (!FUNCTION_WORDS.has(t) && !aliasCovered?.has(t)) {
+          missing++;
         }
       }
 
-      const aliasHit = aliasSurveys.has(s.surveyAbbr.toUpperCase());
+      const aliasHit = aliasSurveys.has(survey);
       if (aliasHit) score += ALIAS_SURVEY_BOOST;
 
       if (score === 0) continue;
+      // The area bonus, after the zero-score gate: an in-area row the query does
+      // not match (an always-unioned headline) never qualifies on its area alone.
+      if (areaFilter) score += 5;
       // The item-match weight, after the zero-score gate: a frequency word
       // qualifies a match but never makes one on its own.
       if (s.frequency && frequencies.has(frequencyKey(s.frequency))) score += 1;
       // A headline earns its boost only when the query names it: through its
       // survey's alias, or by matching most of the distinct tokens scored. One shared
       // word ("all" in "All employees") does not make CES the answer to
-      // "annual average all items".
-      if (isCommon && (aliasHit || matched * 2 > tokens.length)) score += 8;
-      scored.push({ s, score });
+      // "annual average all items". A core measure is the headline its core query
+      // names, its alias always among them: it outscores rows matching `core`
+      // inside another word ("Fiber cores and tubes").
+      if ((isCommon || isCore) && (aliasHit || matched * 2 > tokens.length)) score += 8;
+      const allWords = Number(required.length > 0 && missing === 0);
+      // A place the query names counts only on a row that matches every other word.
+      const place = Number(allWords === 1 && s.areaName !== undefined && named.has(s.areaName));
+      // A row is current when its data runs to within a year of its survey's
+      // newest row, so JT state rows and MP industries a year behind stay
+      // current; unknown coverage counts as current.
+      const newest = this.newestYears.get(survey);
+      const current = Number(
+        s.endYear === undefined || newest === undefined || s.endYear >= newest - 1,
+      );
+      const national = areaFilter ? 0 : Number(!s.areaName || NATIONAL_AREAS.has(s.areaName));
+      // The JOLTS all-industry, all-size row its breakdowns tie.
+      const aggregate = Number(
+        survey === 'JT' &&
+          s.title.includes(' - Total nonfarm - ') &&
+          s.title.includes(' - All size classes - '),
+      );
+      scored.push({ s, exact: 0, allWords, place, score, current, national, aggregate });
     }
 
-    // Exact IDs lead, followed by decoded places named in the query. National
-    // rows win equal-score ties within either group unless area is explicit.
-    const national = (s: CatalogSeries) => Number(!s.areaName || NATIONAL_AREAS.has(s.areaName));
+    // Exact IDs lead, then rows matching every query word — the place rows
+    // the query names first among them — then score. At equal score, current
+    // rows lead the rest, then national rows lead unless area is explicit,
+    // then the JOLTS aggregate leads its breakdowns; remaining ties keep
+    // candidate order.
     scored.sort(
       (a, b) =>
-        (geographicIds.size > 0 &&
-          (Number(b.s.seriesId.toUpperCase() === queryUpper) -
-            Number(a.s.seriesId.toUpperCase() === queryUpper) ||
-            Number(geographicIds.has(b.s.seriesId)) - Number(geographicIds.has(a.s.seriesId)))) ||
+        b.exact - a.exact ||
+        b.allWords - a.allWords ||
+        b.place - a.place ||
         b.score - a.score ||
-        (areaFilter ? 0 : national(b.s) - national(a.s)),
+        b.current - a.current ||
+        b.national - a.national ||
+        b.aggregate - a.aggregate,
     );
     const total = scored.length;
     const offset = input.offset ?? 0;
@@ -1123,21 +1870,45 @@ export class BlsCatalogService {
   }
 
   /**
-   * The FTS candidate query: up to `CANDIDATE_LIMIT` rows matching `match`, in
-   * geographic-preference then bm25 order, with structured filters applied so
-   * the cap bounds only rows that pass them. The area is a case-insensitive
-   * substring of `area_name`, `title`, or `series_id` — the rescore's area gate,
-   * pushed down as bound `LIKE` parameters. `MirrorStore.query` has no
-   * substring operator, hence the raw handle; the SELECT keeps the store's own
-   * relevance form (FTS JOIN, `MATCH`, `ORDER BY bm25()`).
+   * The FTS candidate query: up to `CANDIDATE_LIMIT` rows matching `match`,
+   * with structured filters applied so the cap bounds only rows that pass
+   * them. Rows matching every required word (`allWords`) are admitted first,
+   * those in an area the query names (`named`) leading them, then the rest in
+   * bm25 order — rows with no decoded area included. The area is a
+   * case-insensitive substring of `area_name`, `title`, or `series_id` — the
+   * rescore's area gate, pushed down as bound `LIKE` parameters. A resolved
+   * state or area code instead keeps rows whose `area_name` is one of its
+   * areas (one JSON-array parameter) and, for a state, rows with no decoded
+   * area whose title names it as a comma-separated part.
+   * `MirrorStore.query` has no substring operator, hence the raw handle; the
+   * SELECT keeps the store's own relevance form (FTS JOIN, `MATCH`, `bm25()`).
    */
   private async candidateRows(
     match: string,
     survey: string | undefined,
     seasonal: boolean | undefined,
-    area: string | undefined,
-    geographicWords: readonly string[],
+    area: string | ResolvedArea | undefined,
+    allWords: readonly AllWordsMatch[],
+    named: readonly string[],
   ): Promise<MirrorRow[]> {
+    const allWordsParams: SqlValue[] = [];
+    const condition = ({ match }: AllWordsMatch) => {
+      if (!match) return '1';
+      allWordsParams.push(match);
+      return `${CATALOG_TABLE}.rowid IN (SELECT rowid FROM ${CATALOG_FTS} WHERE ${CATALOG_FTS} MATCH ?)`;
+    };
+    let allWordsSql = '0';
+    const fallback = allWords.find((m) => !m.surveys);
+    if (fallback) {
+      const branches = allWords.flatMap((m) => {
+        if (!m.surveys) return [];
+        allWordsParams.push(...m.surveys);
+        return `WHEN ${CATALOG_TABLE}.survey_abbr IN (${m.surveys.map(() => '?').join(',')}) THEN ${condition(m)}`;
+      });
+      const otherwise = condition(fallback);
+      allWordsSql =
+        branches.length > 0 ? `CASE ${branches.join(' ')} ELSE ${otherwise} END` : otherwise;
+    }
     const where = [`${CATALOG_FTS} MATCH ?`];
     const params: SqlValue[] = [match];
     if (survey) {
@@ -1148,32 +1919,60 @@ export class BlsCatalogService {
       where.push(`${CATALOG_TABLE}.seasonal = ?`);
       params.push(seasonal ? 1 : 0);
     }
-    if (area) {
+    if (typeof area === 'string') {
       const pattern = `%${escapeLike(area)}%`;
       where.push(
         `(${AREA_MATCH_COLUMNS.map((c) => `${CATALOG_TABLE}.${c} LIKE ? ESCAPE '\\'`).join(' OR ')})`,
       );
       params.push(...AREA_MATCH_COLUMNS.map(() => pattern));
+    } else if (area) {
+      const inAreas = `${CATALOG_TABLE}.area_name IN (SELECT value FROM json_each(?))`;
+      params.push(JSON.stringify([...area.areas]));
+      if (area.state === undefined) where.push(inAreas);
+      else {
+        where.push(
+          `(${inAreas} OR (${CATALOG_TABLE}.area_name IS NULL AND (', ' || ${CATALOG_TABLE}.title || ',') LIKE ? ESCAPE '\\'))`,
+        );
+        params.push(`%, ${escapeLike(area.state)},%`);
+      }
     }
     const db = await this.store.raw();
-    const geographic =
-      geographicWords.length > 0
-        ? `, ${CATALOG_TABLE}.area_name IN (SELECT area FROM ${GEOGRAPHIC_WORDS}
-          WHERE word IN (${geographicWords.map(() => '?').join(',')})) AS geographic_match`
+    // `area_name IN (…)` is NULL for a row with no decoded area; the IS NOT NULL
+    // guard keeps such rows at 0, so they keep their bm25 place.
+    const place =
+      named.length > 0
+        ? `(all_words AND area_name IS NOT NULL AND area_name IN (${named.map(() => '?').join(',')})) DESC, `
         : '';
     return db
       .prepare<MirrorRow>(
-        `SELECT ${CATALOG_TABLE}.*${geographic} FROM ${CATALOG_TABLE}
-         JOIN ${CATALOG_FTS} ON ${CATALOG_TABLE}.rowid = ${CATALOG_FTS}.rowid
-         WHERE ${where.join(' AND ')}
-         ORDER BY ${geographic ? 'geographic_match DESC, ' : ''}bm25(${CATALOG_FTS}) ASC LIMIT ?`,
+        `SELECT * FROM (
+           SELECT ${CATALOG_TABLE}.*, ${allWordsSql} AS all_words, bm25(${CATALOG_FTS}) AS relevance
+           FROM ${CATALOG_TABLE}
+           JOIN ${CATALOG_FTS} ON ${CATALOG_TABLE}.rowid = ${CATALOG_FTS}.rowid
+           WHERE ${where.join(' AND ')}
+         )
+         ORDER BY all_words DESC, ${place}relevance ASC LIMIT ?`,
       )
-      .all(...geographicWords, ...params, CANDIDATE_LIMIT);
+      .all(...allWordsParams, ...params, ...named, CANDIDATE_LIMIT);
+  }
+
+  /**
+   * Every row of the given core measures (`CORE_MEASURES`), by survey and
+   * decoded item, in SeriesID order. At most a few hundred rows (117 CU rows
+   * and 4 WP rows on the 2026-11-01 files), found through the `survey_abbr` index.
+   */
+  private async coreRows(measures: readonly CoreMeasure[]): Promise<MirrorRow[]> {
+    const where = measures
+      .map((m) => `(survey_abbr = ? AND item_name IN (${m.items.map(() => '?').join(',')}))`)
+      .join(' OR ');
+    return (await this.store.raw())
+      .prepare<MirrorRow>(`SELECT * FROM ${CATALOG_TABLE} WHERE ${where} ORDER BY series_id`)
+      .all(...measures.flatMap((m) => [m.survey, ...m.items]));
   }
 
   /**
    * Look up catalog metadata for a set of SeriesIDs in one query. Used to hydrate
-   * titles/area/item onto mirror-sourced observations. Returns a map keyed by
+   * titles/area/item/measure onto mirror-sourced observations. Returns a map keyed by
    * SeriesID; ids absent from the catalog are simply omitted.
    */
   async lookupByIds(ids: string[]): Promise<Map<string, CatalogSeries>> {
@@ -1214,8 +2013,42 @@ export class BlsCatalogService {
     return this.cachedSurveys;
   }
 
-  get catalogLoadError(): string | undefined {
-    return this.loadError;
+  /** The stored OE code tables, whether or not search composes from them. */
+  get storedOewsTables(): OewsTables | undefined {
+    return this.oewsTables;
+  }
+
+  /** The OE code tables while search composes OEWS SeriesIDs: stored, and no OE rows indexed. */
+  private get oewsComposition(): OewsTables | undefined {
+    return this.cachedSurveyCounts.has(OES_SURVEY_ABBR.toUpperCase()) ? undefined : this.oewsTables;
+  }
+
+  /**
+   * How bls_search_series reaches survey `abbr` (#121), from the counts cached
+   * at load and after each harvest — no catalog query. Undefined until the
+   * first load completes. A survey whose refresh failed stays `indexed` while
+   * its earlier rows remain; OE reads `composed` while its code tables are
+   * stored, the index holds none of its rows, and search can answer.
+   */
+  searchCoverage(abbr: string): SurveySearchCoverage | undefined {
+    if (!this.loaded) return;
+    const code = abbr.toUpperCase();
+    const seriesIndexed = this.cachedSurveyCounts.get(code);
+    if (seriesIndexed !== undefined) return { searchCoverage: 'indexed', seriesIndexed };
+    const composed =
+      code === OES_SURVEY_ABBR.toUpperCase() && this.cachedTotal > 0 && this.oewsComposition;
+    return { searchCoverage: composed ? 'composed' : 'none' };
+  }
+
+  /**
+   * Whether search can answer, from the indexed row total, the in-flight run,
+   * and the last load's outcome. An index holding series stays `ready` through
+   * every refresh, failed or not.
+   */
+  get readiness(): CatalogReadiness {
+    if (this.cachedTotal > 0) return { status: 'ready' };
+    if (this.inFlight) return { status: 'loading' };
+    return { status: 'unavailable', error: this.loadError ?? 'No catalog load has run yet.' };
   }
 }
 
@@ -1240,14 +2073,33 @@ export function getBlsCatalogService(): BlsCatalogService {
   return _service;
 }
 
+/**
+ * Where to go instead of an OEWS SeriesID BLS reports nonexistent: its state
+ * and national rows (`oewsFallbacks`), through the stored OE code tables when
+ * the catalog has them — the national row alone otherwise. Undefined for a
+ * national OEWS ID and for any other survey's ID. Shared by bls_get_series and
+ * bls_get_latest, so both name the same rows in the same words.
+ */
+export function unpublishedOewsHint(seriesId: string): string | undefined {
+  const fallbacks = oewsFallbacks(seriesId, _service?.storedOewsTables);
+  if (fallbacks.length === 0) return;
+  const rows = fallbacks
+    .map((id) => `the ${id[3] === 'S' ? 'state' : 'national'} row ${id}`)
+    .join(' or ');
+  return `BLS leaves many OEWS occupation–area cells unpublished; request ${rows} for the same occupation and data type.`;
+}
+
 let refreshScheduled = false;
 
 /**
  * Register and start the hourly catalog refresh on the framework scheduler,
- * on every transport. Each tick calls `load()`, which re-harvests only once
- * the index's TTL has lapsed, its survey list no longer matches, or its last
- * refresh was incomplete; a complete, fresh index with the same survey list
- * returns after one sync-state read. An hourly check rather than a
+ * on every transport. Each tick calls `load()`, one check: an index with no
+ * series re-harvests every survey; otherwise only the surveys due — those
+ * whose last success is older than the TTL, and failed surveys whose backoff
+ * ran out (retried at the next check, then 2, 4, 8 … checks later, capped at
+ * the TTL). A process's first check makes every survey due when the stored
+ * harvest was incomplete or its survey list or index version changed. A check
+ * with nothing due does no I/O. An hourly check rather than a
  * `setTimeout(ttl)`: timers clamp delays above 2^31−1 ms (~596 h), and
  * `BLS_CATALOG_CACHE_TTL_HOURS` has no upper bound. The scheduler skips a tick
  * while the previous one runs, and `load()` shares its in-flight run with the
@@ -1258,7 +2110,7 @@ export async function scheduleBlsCatalogRefresh(): Promise<void> {
     CATALOG_REFRESH_JOB_ID,
     CATALOG_REFRESH_CRON,
     () => getBlsCatalogService().load(),
-    'Hourly check that re-harvests the LABSTAT catalog index once its TTL lapses.',
+    'Hourly check that re-harvests the LABSTAT surveys whose TTL lapsed or whose failure backoff ran out, and every survey of an empty index.',
   );
   schedulerService.start(CATALOG_REFRESH_JOB_ID);
   refreshScheduled = true;

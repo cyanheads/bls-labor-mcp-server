@@ -77,7 +77,7 @@ const dropTool = !canvasEnabled
 const canvasInstructions = canvasEnabled
   ? 'Large results spill to a DataCanvas dataframe: describe dataset.name with bls_dataframe_describe before using the table in bls_dataframe_query SQL.'
   : 'DataCanvas is disabled; full results return inline.';
-const instructions = `Use bls_* for published US labor, price, and employment statistics. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Surveys use two-letter codes; series use opaque SeriesIDs. Discover surveys with bls_list_surveys when needed, resolve concepts through bls_search_series (offline, no quota), then use bls_get_series for history or bls_get_latest for a current observation. Fetch series outside the offline index using a known BLS SeriesID. IDs are trimmed, uppercased, and deduplicated; batch history is more quota-efficient than per-series latest requests. ${canvasInstructions}`;
+const instructions = `Use bls_* for published US labor, price, and employment statistics. A free BLS_API_KEY is optional (25 requests/day without, 500 with). Surveys use two-letter codes; series use opaque SeriesIDs. Discover surveys with bls_list_surveys when needed (its searchCoverage marks the surveys bls_search_series reaches), resolve concepts through bls_search_series (offline, no quota), then use bls_get_series for history or bls_get_latest for a current observation. Under survey OE, bls_search_series composes OEWS SeriesIDs from code tables, marked composed and unconfirmed until bls_get_series returns them. Fetch series outside the offline index using a known BLS SeriesID. IDs are trimmed, uppercased, and deduplicated; batch history is more quota-efficient than per-series latest requests. ${canvasInstructions}`;
 
 await createApp({
   name: 'bls-labor-mcp-server',
@@ -106,10 +106,11 @@ await createApp({
     initBlsObservationsService();
     initCanvasBridge(core.canvas);
 
-    // Load catalog in background — non-blocking. bls_search_series throws
-    // catalog_unavailable if called before loading completes. The hourly job
-    // re-harvests once the index outlives BLS_CATALOG_CACHE_TTL_HOURS, on
-    // every transport; teardown removes it.
+    // Load catalog in background — non-blocking. Until the index holds series,
+    // bls_search_series throws catalog_loading while a harvest runs and
+    // catalog_unavailable once one ends empty or stops. The hourly job, on
+    // every transport, retries an empty index and re-harvests surveys whose
+    // TTL lapsed or whose retry came due; teardown removes it.
     getBlsCatalogService()
       .load()
       .catch((err: unknown) => {

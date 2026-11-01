@@ -59,6 +59,7 @@ const DIMENSION_KEYS = [
   'ratelevel_code',
   'occupation_code',
   'periodicity_code',
+  'datatype_code',
 ];
 const CODE_TABLE = `${DIMENSION_KEYS.join('\t')}\tlabel_text\n${DIMENSION_KEYS.map(() => 'x').join('\t')}\tDecoded label\n`;
 /** A `.series` file listing `ids`, with the upstream `series_title` column. */

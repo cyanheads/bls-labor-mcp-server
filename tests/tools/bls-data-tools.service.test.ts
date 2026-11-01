@@ -39,7 +39,8 @@ vi.mock('@/services/bls-observations/bls-observations-service.js', () => ({
   isBlsObservationsServiceReady: () => state.config.observationsMirrorEnabled,
   getBlsObservationsService: () => state.mirror,
 }));
-vi.mock('@/services/bls-catalog/bls-catalog-service.js', () => ({
+vi.mock('@/services/bls-catalog/bls-catalog-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/bls-catalog/bls-catalog-service.js')>()),
   getBlsCatalogService: () => state.catalog,
 }));
 
@@ -56,7 +57,14 @@ function okJson(payload: unknown): Response {
 }
 
 function mirrorRow(series_id: string, year: string, period: string, value: string) {
-  return { row_key: `${series_id}|${year}|${period}`, series_id, year, period, value };
+  return {
+    row_key: `${series_id}|${year}|${period}`,
+    series_id,
+    year,
+    period,
+    value,
+    footnote_codes: '',
+  };
 }
 
 /** Every text block `content[]` carries, joined — what a content-only client reads. */
@@ -682,7 +690,7 @@ describe('bls_get_series — failed live fallback keeps the mirrored series (#80
 
     const text = contentText(result);
     expect(text).toContain('### LNU00000002');
-    expect(text).toContain('| 2025 | M03 | 4.4 |');
+    expect(text).toContain('| March 2025 | M03 | 4.4 |');
     expect(text).toContain('quota_exceeded');
     expect(text).toContain('UTC midnight');
     // The quota wall says nothing about the SeriesID, on this surface either.
@@ -1037,5 +1045,235 @@ describe('bls_get_series — calculations and the observations mirror (#96)', ()
 
     expect(result.structuredContent).toMatchObject({ calculationsApplied: false });
     expect(result.structuredContent).not.toHaveProperty('notice');
+  });
+});
+
+describe('live-path measure beside the catalog index (#127)', () => {
+  /** The index row for LNS14000000, decoding `ln.tdat` as BLS's `measure_data_type` does. */
+  const LN_CATALOG = {
+    seriesId: 'LNS14000000',
+    surveyAbbr: 'LN',
+    title: '(Seas) Unemployment Rate',
+    measure: 'Percent or rate',
+    seasonal: true,
+  };
+
+  it.each([
+    ['series', blsGetSeriesTool, 'series'],
+    ['latest', blsGetLatestTool, 'results'],
+  ] as const)(
+    '%s keeps the measure_data_type BLS answered over the index measure (characterization)',
+    async (_name, tool, key) => {
+      state.catalog.lookupByIds.mockResolvedValue(
+        new Map([['LNS14000000', { ...LN_CATALOG, measure: 'Index measure' }]]),
+      );
+      vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+        Promise.resolve(
+          okJson({
+            status: 'REQUEST_SUCCEEDED',
+            responseTime: 1,
+            Results: {
+              series: [
+                {
+                  seriesID: 'LNS14000000',
+                  catalog: { measure_data_type: 'Percent or rate' },
+                  data: [{ year: '2025', period: 'M01', value: '4.0' }],
+                },
+              ],
+            },
+          }),
+        ),
+      );
+
+      const result = await runToolContract(
+        tool,
+        { series_ids: ['LNS14000000'] },
+        { context: { errors: tool.errors } },
+      );
+
+      expect((result.structuredContent as Record<string, unknown>)[key]).toMatchObject([
+        { seriesId: 'LNS14000000', measure: 'Percent or rate' },
+      ]);
+      const text = contentText(result);
+      expect(text).toContain('Measure: Percent or rate');
+      expect(text).not.toContain('Index measure');
+    },
+  );
+
+  it('fills a re-issued series’ measure from the index, on both surfaces (#81)', async () => {
+    state.catalog.lookupByIds.mockResolvedValue(new Map([['LNS14000000', LN_CATALOG]]));
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okJson(GENERIC_REJECTION))
+      .mockResolvedValueOnce(okJson(MIXED_INVALID_WITHOUT_CATALOG));
+
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000', 'BOGUS123'], start_year: 2025, end_year: 2025 },
+      seriesContext,
+    );
+
+    const [valid, invalid] = (result.structuredContent as { series: object[] }).series;
+    expect(valid).toMatchObject({ seriesId: 'LNS14000000', measure: 'Percent or rate' });
+    expect(invalid).not.toHaveProperty('measure');
+    expect(contentText(result)).toContain('Measure: Percent or rate');
+  });
+});
+
+/**
+ * An OEWS SeriesID BLS reports nonexistent is usually an occupation–area cell it
+ * does not publish (#119). The catalog singleton is never initialized here, so
+ * the stored OE code tables are absent and the hint names the national row.
+ */
+describe('unpublished OEWS SeriesIDs point at their national row (#119)', () => {
+  const METRO = 'OEUM004766000000029114103';
+  const NATIONAL = 'OEUN000000000000029114103';
+  const HINT = `BLS leaves many OEWS occupation–area cells unpublished; request the national row ${NATIONAL} for the same occupation and data type.`;
+
+  /** BLS's answer naming every ID in `invalid` nonexistent, with one observation per `valid` ID. */
+  function answer(invalid: string[], valid: string[] = []): Response {
+    return okJson({
+      status: 'REQUEST_SUCCEEDED',
+      responseTime: 1,
+      message: invalid.map((id) => `Series does not exist for Series ${id}`),
+      Results: {
+        series: [
+          ...valid.map((id) => ({
+            seriesID: id,
+            data: [{ year: '2025', period: 'A01', value: '60.76' }],
+          })),
+          ...invalid.map((id) => ({ seriesID: id, data: [] })),
+        ],
+      },
+    });
+  }
+
+  beforeEach(() => {
+    state.catalog.isLoaded = false;
+  });
+
+  it('bls_get_series recovers a lone unpublished OEWS ID through its national row, not search', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(answer([METRO]));
+    const result = await runToolContract(blsGetSeriesTool, { series_ids: [METRO] }, seriesContext);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'series_not_found', recovery: { hint: `${METRO}: ${HINT}` } } },
+    });
+    expect(contentText(result)).toContain(`${METRO}: ${HINT}`);
+    expect(contentText(result)).not.toContain('bls_search_series');
+  });
+
+  it('bls_get_series keeps the search recovery for other IDs, beside the OEWS row', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(answer(['BOGUS123']));
+    const plain = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['BOGUS123'] },
+      seriesContext,
+    );
+    expect(plain.structuredContent).toMatchObject({
+      error: {
+        data: {
+          recovery: {
+            hint: 'Use bls_search_series to find valid SeriesIDs before calling bls_get_series.',
+          },
+        },
+      },
+    });
+
+    vi.mocked(globalThis.fetch).mockResolvedValue(answer(['BOGUS123', METRO]));
+    const mixed = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['BOGUS123', METRO] },
+      seriesContext,
+    );
+    expect(mixed.structuredContent).toMatchObject({
+      error: {
+        data: {
+          recovery: {
+            hint: `Use bls_search_series to find valid SeriesIDs before calling bls_get_series. ${METRO}: ${HINT}`,
+          },
+        },
+      },
+    });
+  });
+
+  it('bls_get_series keeps the year-range move beside an OEWS row when another ID has no data for the period', async () => {
+    const uncovered = (invalid: string) =>
+      okJson({
+        status: 'REQUEST_SUCCEEDED',
+        responseTime: 1,
+        message: [
+          `Series does not exist for Series ${invalid}`,
+          'No Data Available for Series WPUFD49104 Year: 2005',
+        ],
+        Results: {
+          series: [
+            { seriesID: 'WPUFD49104', data: [] },
+            { seriesID: invalid, data: [] },
+          ],
+        },
+      });
+    const run = (invalid: string) =>
+      runToolContract(
+        blsGetSeriesTool,
+        { series_ids: ['WPUFD49104', invalid], start_year: 2005, end_year: 2006 },
+        seriesContext,
+      );
+
+    vi.mocked(globalThis.fetch).mockResolvedValue(uncovered('BOGUS123'));
+    expect((await run('BOGUS123')).structuredContent).toMatchObject({
+      error: {
+        data: {
+          recovery: {
+            hint: 'Replace BOGUS123 with a valid SeriesID from bls_search_series, and adjust start_year/end_year to a range WPUFD49104 covers.',
+          },
+        },
+      },
+    });
+
+    vi.mocked(globalThis.fetch).mockResolvedValue(uncovered(METRO));
+    const oews = await run(METRO);
+    expect(oews.structuredContent).toMatchObject({
+      error: {
+        data: {
+          recovery: {
+            hint: `Adjust start_year/end_year to a range WPUFD49104 covers. ${METRO}: ${HINT}`,
+          },
+        },
+      },
+    });
+    expect(contentText(oews)).toContain(`${METRO}: ${HINT}`);
+  });
+
+  it('bls_get_series names the OEWS row in the per-ID notice when another series returned data', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(answer([METRO, 'BOGUS123'], [NATIONAL]));
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: [NATIONAL, METRO, 'BOGUS123'] },
+      seriesContext,
+    );
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain(`BLS reports ${METRO} is invalid or does not exist. ${HINT}`);
+    expect(notice).toContain(
+      'BLS reports BOGUS123 is invalid or does not exist. Use bls_search_series to find a valid SeriesID.',
+    );
+    expect(contentText(result)).toContain(NATIONAL);
+    expect(contentText(result)).toContain('request the national row');
+  });
+
+  it('bls_get_latest names the OEWS row for an unpublished OEWS ID, on both surfaces', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation((url) =>
+      Promise.resolve(String(url).includes(METRO) ? answer([METRO]) : answer(['BOGUS123'])),
+    );
+    const result = await runToolContract(
+      blsGetLatestTool,
+      { series_ids: [METRO, 'BOGUS123'] },
+      latestContext,
+    );
+    expect(result.structuredContent).toMatchObject({
+      succeeded: 0,
+      failed: [{ seriesId: METRO }, { seriesId: 'BOGUS123' }],
+      notice: `BOGUS123 failed. Use bls_search_series to verify that SeriesID. BLS reports ${METRO} is invalid or does not exist. ${HINT}`,
+    });
+    expect(contentText(result)).toContain('request the national row');
   });
 });

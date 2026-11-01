@@ -147,6 +147,13 @@ describe.each(['node', 'bun'])('server registration on %s', (runtime) => {
       BLS_DATAFRAME_DROP_ENABLED: 'true',
     });
     expect(surface.names).toEqual([...canvasTools, 'bls_dataframe_drop']);
+    // Search reach per survey and composed OEWS IDs (#119, #121).
+    expect(surface.instructions).toContain(
+      'Discover surveys with bls_list_surveys when needed (its searchCoverage marks the surveys bls_search_series reaches)',
+    );
+    expect(surface.instructions).toContain(
+      'Under survey OE, bls_search_series composes OEWS SeriesIDs from code tables, marked composed and unconfirmed until bls_get_series returns them.',
+    );
   });
 
   it.each([undefined, '', '  ', `\${CANVAS_PROVIDER_TYPE}`])(

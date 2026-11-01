@@ -37,13 +37,13 @@ const ServerConfigSchema = z.object({
     .positive()
     .default(168)
     .describe(
-      'Catalog freshness window in hours — re-harvest into the SQLite index once its last completion is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). Checked at startup and hourly while the server runs, so a long-running process refreshes without a restart. The existing index stays queryable throughout a refresh.',
+      'Catalog freshness window in hours, per survey — a survey re-harvests into the SQLite index once its last successful harvest is older (default 168 h / 7 days; the LABSTAT catalog changes slowly). A failed survey retries at the next hourly check, then after 2, 4, 8 … checks, the gap capped at this many hours. Checked at startup and hourly while the server runs, so a long-running process refreshes without a restart. The existing index stays queryable throughout a refresh.',
     ),
   catalogIncludeOes: z
     .stringbool()
     .default(false)
     .describe(
-      'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.2 GB (32× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index. OES series stay fetchable by ID via bls_get_series when off.',
+      'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.26 GB (over 20× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index, and only the Bun runtime can read oe.series into one string (Node caps a string at 536,870,888 characters). Without indexed OE rows, bls_search_series under survey OE composes OEWS SeriesIDs from the small OE code tables every harvest stores, and OES series stay fetchable by ID via bls_get_series.',
     ),
   userAgent: z
     .string()

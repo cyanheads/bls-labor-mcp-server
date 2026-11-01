@@ -1,13 +1,15 @@
 /**
- * @fileoverview List BLS survey programs with their codes, descriptions, and
- * calculation-support metadata. Backed by the BLS /surveys API with 30-day process-local
- * caching; does not consume meaningful API quota.
+ * @fileoverview List BLS survey programs with their codes, descriptions,
+ * calculation-support metadata, and how bls_search_series reaches each one.
+ * Backed by the BLS /surveys API with 30-day process-local caching; does not
+ * consume meaningful API quota.
  * @module mcp-server/tools/definitions/bls-list-surveys
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
+import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
 
 /**
  * Survey category tags used to group BLS programs for filtering. Codes are the
@@ -113,7 +115,7 @@ export const CATEGORY_MAP: Record<string, string[]> = {
 export const blsListSurveysTool = tool('bls_list_surveys', {
   title: 'List BLS Surveys',
   description:
-    'List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series; bls_search_series covers only the surveys in its offline index, and series in the others are fetched by SeriesID with bls_get_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.',
+    "List BLS survey programs with their abbreviation codes, full names, and metadata about calculation support and annual averages. Use to discover which survey covers a topic before calling bls_search_series; each row's searchCoverage says whether bls_search_series reaches the survey through its offline index, composes its SeriesIDs from code tables, or cannot search it, in which case its series are fetched by SeriesID with bls_get_series. Optional category filter narrows results to prices, employment, wages, productivity, injuries, or time_use surveys.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
 
   errors: [
@@ -184,6 +186,19 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
               .describe(
                 'True when BLS reports that the survey publishes annual average observations. Advisory only: it does not predict whether a given series returns annual-average rows for bls_get_series with annual_average=true — LN, CE, LA and SM report true yet return none. Read annualAverageRows on that response for what actually came back.',
               ),
+            searchCoverage: z
+              .enum(['indexed', 'composed', 'none'])
+              .optional()
+              .describe(
+                'How bls_search_series reaches this survey: "indexed" when its offline index holds the survey\'s series (seriesIndexed counts them), "composed" when it builds the survey\'s SeriesIDs from code tables instead (OE without indexed OE rows), "none" when it cannot search the survey — fetch those series by SeriesID with bls_get_series. Absent while the catalog index is still loading at startup.',
+              ),
+            seriesIndexed: z
+              .number()
+              .int()
+              .optional()
+              .describe(
+                'Series of this survey in the offline index. Present only when searchCoverage is "indexed".',
+              ),
           })
           .describe('A BLS survey program entry.'),
       )
@@ -212,6 +227,8 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
 
     if (input.category !== undefined) ctx.enrich({ categoryFilter: input.category });
 
+    // Counts the catalog cached at its last load or harvest — no catalog query (#121).
+    const catalog = getBlsCatalogService();
     return {
       surveys: filtered.map((s) => ({
         abbreviation: s.surveyAbbreviation,
@@ -219,6 +236,7 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
         allowsNetChange: s.allowsNetChange,
         allowsPercentChange: s.allowsPercentChange,
         hasAnnualAverages: s.hasAnnualAverages,
+        ...catalog.searchCoverage(s.surveyAbbreviation),
       })),
       total: filtered.length,
     };
@@ -235,7 +253,12 @@ export const blsListSurveysTool = tool('bls_list_surveys', {
       if (s.allowsPercentChange) caps.push('% change');
       if (s.hasAnnualAverages) caps.push('annual avg');
       const capStr = caps.length > 0 ? ` · ${caps.join(', ')}` : '';
-      lines.push(`**${s.abbreviation}** — ${s.name}${capStr}`);
+      const coverage = [
+        ...(s.searchCoverage ? [`search: ${s.searchCoverage}`] : []),
+        ...(s.seriesIndexed !== undefined ? [`${s.seriesIndexed} series indexed`] : []),
+      ];
+      const coverageStr = coverage.length > 0 ? ` · ${coverage.join(', ')}` : '';
+      lines.push(`**${s.abbreviation}** — ${s.name}${capStr}${coverageStr}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

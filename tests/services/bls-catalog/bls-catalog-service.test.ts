@@ -12,18 +12,27 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { type MirrorRow, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
+import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetServerConfig } from '@/config/server-config.js';
 import {
   BlsCatalogService,
   catalogSurveyList,
   conceptAliasSurveys,
   createCatalogStore,
   escapeLike,
+  getBlsCatalogService,
+  initBlsCatalogService,
   queryFrequencies,
+  shutdownBlsCatalogService,
   startsWord,
+  unpublishedOewsHint,
 } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
+import { OE_TABLE_FILES, tsv } from './oews-fixtures.js';
 
 let tmpDir: string;
 let dbCounter = 0;
@@ -415,8 +424,8 @@ describe('BlsCatalogService.search', () => {
   it('ranks the on-topic survey above wrong-domain token matches (producer price index, #36)', async () => {
     const svc = await seedAndLoad([
       {
-        seriesId: 'WPUFD49104',
-        title: 'PPI Commodity data for final demand - finished goods, not seasonally adjusted',
+        seriesId: 'WPUFD4',
+        title: 'PPI Commodity data for Final demand, not seasonally adjusted',
         surveyAbbr: 'WP',
         seasonal: false,
       },
@@ -434,7 +443,7 @@ describe('BlsCatalogService.search', () => {
       seasonal_adjustment: undefined,
       limit: 10,
     });
-    expect(result.series[0]!.seriesId).toBe('WPUFD49104');
+    expect(result.series[0]!.seriesId).toBe('WPUFD4');
   });
 });
 
@@ -452,9 +461,9 @@ describe('BlsCatalogService state', () => {
     expect(svc.totalSeries).toBe(FIXTURES.length);
   });
 
-  it('catalogLoadError is undefined when loaded successfully', async () => {
+  it('readiness is ready when loaded successfully', async () => {
     const svc = await seedAndLoad(FIXTURES);
-    expect(svc.catalogLoadError).toBeUndefined();
+    expect(svc.readiness).toEqual({ status: 'ready' });
   });
 
   it('lookupByIds hydrates metadata for the given series ids', async () => {
@@ -463,6 +472,109 @@ describe('BlsCatalogService state', () => {
     expect(map.get('TEST_CPI_003')?.title).toBe('CPI-U All Items Urban Average');
     expect(map.get('TEST_UNEMP_001')?.areaName).toBe('United States');
     expect(map.has('NOPE')).toBe(false);
+  });
+});
+
+describe('BlsCatalogService.readiness (#112)', () => {
+  const surveyCount = catalogSurveyList(false).split(',').length;
+
+  /** Hold every download until the returned release runs or its request aborts, then serve `files`. */
+  function holdDownloads(files: Record<string, string>): () => void {
+    serveLabstat(files);
+    const serveNow = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(globalThis.fetch).mockImplementation(async (url, init) => {
+      await new Promise<void>((resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+        void gate.then(resolve);
+      });
+      return serveNow(url, init);
+    });
+    return release;
+  }
+
+  it('is loading through a cold harvest, between its attempts too, and unavailable naming the stop once it rejects', async () => {
+    const { requested } = serveLabstat({});
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', join(tmpDir, 'cold-attempts.db'));
+    const loading = svc.load(2);
+    const settled = loading.then(
+      () => 'resolved',
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+
+    // Every survey failed on the first attempt; the second waits out its backoff.
+    await vi.waitFor(() =>
+      expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(surveyCount),
+    );
+    expect(svc.readiness).toEqual({ status: 'loading' });
+    await expect(svc.search(searchInput('unemployment'))).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'catalog_loading', retryable: true },
+    });
+    // Hydration for the data tools is unchanged: off until a load finishes.
+    expect(svc.isLoaded).toBe(false);
+    expect((await svc.lookupByIds(['LNS14000000'])).size).toBe(0);
+
+    await svc.shutdown();
+    expect(await settled).toMatch(/stopped by shutdown/);
+    expect(svc.readiness).toEqual({
+      status: 'unavailable',
+      error: 'Catalog load stopped: Catalog harvest stopped by shutdown.',
+    });
+    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(surveyCount);
+  });
+
+  it('is unavailable after an empty cold load, loading while the next check retries, and ready once series land', async () => {
+    serveLabstat({});
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', join(tmpDir, 'empty-retry.db'));
+    await svc.load(1);
+
+    const emptyError =
+      'Catalog load failed after 1 attempt — all LABSTAT downloads returned empty.';
+    expect(svc.readiness).toEqual({ status: 'unavailable', error: emptyError });
+    expect(svc.isLoaded).toBe(true);
+    await expect(svc.search(searchInput('unemployment'))).rejects.toMatchObject({
+      code: JsonRpcErrorCode.InternalError,
+      message: expect.stringContaining(emptyError),
+      data: { reason: 'catalog_unavailable' },
+    });
+
+    const release = holdDownloads(JT_FILES);
+    const retry = svc.load(1);
+    expect(svc.readiness).toEqual({ status: 'loading' });
+    release();
+    await retry;
+    expect(svc.readiness).toEqual({ status: 'ready' });
+    expect((await svc.search(searchInput('JTS000000000000000QUR'))).series[0]?.seriesId).toBe(
+      'JTS000000000000000QUR',
+    );
+    await svc.shutdown();
+  });
+
+  it('stays ready while a stale index refreshes and after a refresh that fetches nothing', async () => {
+    const dbPath = join(tmpDir, 'stale-ready.db');
+    const store = createCatalogStore(dbPath);
+    await store.applyBatch(FIXTURES.map(toMirrorRow), []);
+    await store.writeState({
+      status: 'complete',
+      completedAt: new Date(Date.now() - 1_000 * 3_600_000).toISOString(),
+      checkpoint: catalogSurveyList(false),
+    });
+    await store.close();
+
+    const release = holdDownloads({});
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+    const refreshing = svc.load(1);
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    expect(svc.readiness).toEqual({ status: 'ready' });
+    release();
+    await refreshing;
+    expect(svc.readiness).toEqual({ status: 'ready' });
+    expect(svc.totalSeries).toBe(FIXTURES.length);
+    await svc.shutdown();
   });
 });
 
@@ -486,11 +598,17 @@ describe('BlsCatalogService.load (cold harvest)', () => {
     'sector_code',
     'duration_code',
     'estimate_code',
+    'data_type_code',
+    'tdat_code',
+    'datatype_code',
+    'fips_code',
   ];
   const SERIES_TEXT = `series_id\tseries_title\tseasonal\t${keys.join('\t')}\nLNS14000000\tUnemployment Rate\tS\t${keys.map(() => 'x').join('\t')}\n`;
   const TABLE_TEXT = `${keys.join('\t')}\tlabel_text\n${keys.map(() => 'x').join('\t')}\tDecoded label\n`;
   const fixtureBody = (url: unknown) =>
-    String(url).endsWith('.series') ? SERIES_TEXT : TABLE_TEXT;
+    String(url).endsWith('.series')
+      ? SERIES_TEXT
+      : (OE_TABLE_FILES[String(url).slice(String(url).lastIndexOf('/') + 1)] ?? TABLE_TEXT);
 
   // Complete declared tables keep these tests focused on transport and persistence.
   beforeEach(() => {
@@ -546,7 +664,7 @@ describe('BlsCatalogService.load (cold harvest)', () => {
 
     const offSvc = new BlsCatalogService(BASE_URL, 'ua/1.0', join(tmpDir, 'off.db'), 168, false);
     await offSvc.load(1);
-    expect(urls.some((u) => u.includes('/oe/'))).toBe(false);
+    expect(urls.some((u) => u.includes('/oe/oe.series'))).toBe(false);
 
     urls.length = 0;
     const onSvc = new BlsCatalogService(BASE_URL, 'ua/1.0', join(tmpDir, 'on.db'), 168, true);
@@ -647,11 +765,6 @@ describe('BlsCatalogService.load (cold harvest)', () => {
 // ---------------------------------------------------------------------------
 
 const LABSTAT_URL = 'https://download.bls.gov/pub/time.series';
-
-/** Render rows as a LABSTAT flat file: tab-delimited, CRLF line endings. */
-function tsv(...rows: string[][]): string {
-  return `${rows.map((r) => r.join('\t')).join('\r\n')}\r\n`;
-}
 
 /**
  * Serve `files` (keyed by file name, e.g. `jt.series`) at their LABSTAT URLs;
@@ -870,6 +983,31 @@ const EC_FILES: Record<string, string> = {
   ),
 };
 
+/**
+ * Real measure tables (2026-11-01): the tables whose labels BLS's API returns
+ * verbatim as `catalog.measure_data_type` (#127).
+ */
+const CE_DATATYPE = tsv(
+  ['data_type_code', 'data_type_text'],
+  ['01', 'ALL EMPLOYEES, THOUSANDS'],
+  ['03', 'AVERAGE HOURLY EARNINGS OF ALL EMPLOYEES'],
+);
+const LN_TDAT = tsv(
+  ['tdat_code', 'tdat_text'],
+  ['00', 'Number in thousands'],
+  ['01', 'Percent or rate'],
+);
+const MP_MEASURE = tsv(
+  ['measure_code', 'measure_text', 'display_level', 'selectable', 'sort_sequence'],
+  ['01', 'Total factor productivity', '0', 'T', '1'],
+  ['03', 'Combined inputs', '0', 'T', '5'],
+);
+const CM_DATATYPE = tsv(
+  ['datatype_code', 'datatype_text', 'display_level', 'selectable', 'sort_sequence'],
+  ['D', 'Cost of compensation (Cost per hour worked)', '0', 'T', '39'],
+  ['P', 'Percent of total compensation', '0', 'T', '40'],
+);
+
 /** Distinct `title|seasonal` pairs across `ids`. */
 async function distinctTitleSeasonal(svc: BlsCatalogService, ids: string[]): Promise<number> {
   const rows = await svc.lookupByIds(ids);
@@ -930,6 +1068,7 @@ describe('BlsCatalogService.load — LABSTAT decoding (characterization)', () =>
       surveyAbbr: 'CU',
       areaName: 'U.S. city average',
       itemName: 'All items',
+      measure: 'All items',
       seasonal: true,
       frequency: 'Monthly',
       startYear: 1947,
@@ -969,6 +1108,7 @@ describe('BlsCatalogService.load — LABSTAT decoding (characterization)', () =>
         ],
       ),
       'ce.industry': tsv(['industry_code', 'industry_name'], ['20000000', 'Construction']),
+      'ce.datatype': CE_DATATYPE,
     });
     const row = (await svc.lookupByIds(['CES2000000001'])).get('CES2000000001');
     expect(row?.title).toBe('All employees, thousands, construction, seasonally adjusted');
@@ -1005,12 +1145,21 @@ describe('BlsCatalogService.load — coverage (#90)', () => {
   it('omits each invalid or missing coverage value independently', async () => {
     const { svc } = await harvestFrom({
       'ln.series': tsv(
-        ['series_id', 'series_title', 'periodicity_code', 'end_period', 'end_year', 'begin_year'],
-        ['SPARSE1', 'Sparse coverage', 'M', 'M08', '2026', ''],
-        ['SPARSE2', 'Sparse coverage', 'M', '', '20x6', '1948'],
-        ['SPARSE3', 'Sparse coverage', 'M', 'Q02', '2026.0', '0000'],
+        [
+          'series_id',
+          'series_title',
+          'periodicity_code',
+          'tdat_code',
+          'end_period',
+          'end_year',
+          'begin_year',
+        ],
+        ['SPARSE1', 'Sparse coverage', 'M', '01', 'M08', '2026', ''],
+        ['SPARSE2', 'Sparse coverage', 'M', '01', '', '20x6', '1948'],
+        ['SPARSE3', 'Sparse coverage', 'M', '01', 'Q02', '2026.0', '0000'],
       ),
       'ln.periodicity': tsv(['periodicity_code', 'periodicity_text'], ['M', 'Monthly']),
+      'ln.tdat': LN_TDAT,
     });
     const rows = await svc.lookupByIds(['SPARSE1', 'SPARSE2', 'SPARSE3']);
     expect(rows.get('SPARSE1')).toMatchObject({ endYear: 2026, endPeriod: 'M08' });
@@ -1085,6 +1234,11 @@ describe('BlsCatalogService.load — declared table failures (#94)', () => {
       await stateStore.close();
       await svc.load(1);
       expect(requested.length).toBeGreaterThan(attempts);
+      // The retry requests the failed survey's files only, never EC's, which succeeded (#104).
+      const retried = requested.slice(attempts);
+      expect(retried).toContain('jt.series');
+      expect(retried).toContain('jt.dataelement');
+      expect(retried.filter((f) => f.startsWith('ec.'))).toEqual([]);
       await svc.shutdown();
       serveLabstat({ ...JT_FILES, ...EC_FILES });
       const recovered = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
@@ -1096,6 +1250,341 @@ describe('BlsCatalogService.load — declared table failures (#94)', () => {
       await recovered.shutdown();
     },
   );
+});
+
+describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
+  const HOUR = 3_600_000;
+  const T0 = Date.parse('2026-10-01T00:00:00Z');
+  const surveys = catalogSurveyList(false).split(',');
+  const healthySeries = surveys.filter((a) => a !== 'jt').map((a) => `${a}.series`);
+  /** Key columns of the composite declared keys; every other key is `{table}_code`. */
+  const COMPOSITE_KEYS = [
+    'industry_code',
+    'product_code',
+    'group_code',
+    'item_code',
+    'comp_code',
+    'data_type_code',
+  ];
+
+  type Served = (init: RequestInit | undefined) => Promise<Response>;
+  const unavailable: Served = () => Promise.resolve(new Response('busy', { status: 503 }));
+  /** Hangs until the request aborts, as a stalled download does. */
+  const hang: Served = (init) =>
+    new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+  const storeOf = (svc: BlsCatalogService) =>
+    (svc as unknown as { store: ReturnType<typeof createCatalogStore> }).store;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Serve every survey one fresh row (`{ABBR}NEW`) and every declared table a
+   * decoding row, except the files `failing` answers — mutable between checks.
+   * A `.series` body is built a microtask after its request, by which time its
+   * survey's table requests (issued alongside it) have named every key column.
+   */
+  function serveSurveys(): {
+    requested: string[];
+    lines: string[];
+    failing: Record<string, Served>;
+  } {
+    const requested: string[] = [];
+    const lines: string[] = [];
+    const failing: Record<string, Served> = {};
+    const keys = new Set(COMPOSITE_KEYS);
+    const row = (columns: string[]) => columns.map(() => 'x').join('\t');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      const file = String(url).slice(String(url).lastIndexOf('/') + 1);
+      requested.push(file);
+      const [abbr = '', table = ''] = file.split('.');
+      const failure = failing[file];
+      if (failure) return failure(init);
+      const oe = OE_TABLE_FILES[file];
+      if (oe !== undefined) return new Response(oe);
+      if (table !== 'series') {
+        keys.add(`${table}_code`);
+        const header = [...COMPOSITE_KEYS, `${table}_code`];
+        return new Response(`${header.join('\t')}\tlabel_text\n${row(header)}\tDecoded\n`);
+      }
+      await Promise.resolve();
+      const header = [...keys];
+      return new Response(
+        `series_id\tseries_title\tseasonal\t${header.join('\t')}\n${abbr.toUpperCase()}NEW\tSeries ${abbr}\tS\t${row(header)}\n`,
+      );
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    return { requested, lines, failing };
+  }
+
+  /** Persist a complete index holding `{ABBR}OLD` for every configured survey, completed `ageHours` ago. */
+  async function seedComplete(path: string, ageHours: number): Promise<void> {
+    const store = createCatalogStore(path);
+    await store.applyBatch(
+      surveys.map((abbr) =>
+        toMirrorRow({
+          seriesId: `${abbr.toUpperCase()}OLD`,
+          title: `Old ${abbr}`,
+          surveyAbbr: abbr.toUpperCase(),
+          seasonal: true,
+        }),
+      ),
+      [],
+    );
+    await store.writeState({
+      status: 'complete',
+      completedAt: new Date(Date.now() - ageHours * HOUR).toISOString(),
+      total: surveys.length,
+      checkpoint: catalogSurveyList(false),
+    });
+    await store.close();
+  }
+
+  /**
+   * A service over a stale complete index whose first check harvests every
+   * survey and fails JT's `.series` (HTTP 503) — JT's first failure.
+   */
+  async function afterJtFails(ttlHours = 168) {
+    const path = join(tmpDir, `retry-${dbCounter++}.db`);
+    await seedComplete(path, 200);
+    const served = serveSurveys();
+    served.failing['jt.series'] = unavailable;
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, ttlHours, false);
+    await svc.load(1);
+    return { ...served, svc, path };
+  }
+
+  /** The files one more check requests. */
+  async function nextCheck(svc: BlsCatalogService, requested: string[]): Promise<string[]> {
+    const before = requested.length;
+    await svc.load(1);
+    return requested.slice(before);
+  }
+
+  async function has(svc: BlsCatalogService, id: string): Promise<boolean> {
+    return (await svc.lookupByIds([id])).has(id);
+  }
+
+  it('retries only the failed survey and its declared tables on the next check of a warm index', async () => {
+    const { svc, requested } = await afterJtFails();
+    expect(await has(svc, 'JTOLD')).toBe(true);
+    expect(await has(svc, 'CUOLD')).toBe(false);
+    expect(await has(svc, 'CUNEW')).toBe(true);
+
+    const retry = await nextCheck(svc, requested);
+    expect(retry).toContain('jt.series');
+    expect(retry.length).toBeGreaterThan(1);
+    expect(retry.filter((f) => !f.startsWith('jt.'))).toEqual([]);
+    await svc.shutdown();
+  });
+
+  /** A body the runtime cannot read, as Node's string limit refuses a `.series` file over ~512 MiB. */
+  const unreadable: Served = () => {
+    const response = new Response('');
+    vi.spyOn(response, 'text').mockRejectedValue(
+      new RangeError('Cannot create a string longer than 0x1fffffe8 characters'),
+    );
+    return Promise.resolve(response);
+  };
+
+  it.each([
+    ['an unreadable body', 168, [1, 3, 7, 15], unreadable],
+    ['HTTP 503', 4, [1, 3, 7, 11, 15], unavailable],
+  ])(
+    'backs off a survey whose .series keeps failing (%s, TTL %i h): one download at checks %j after its first failure',
+    async (_, ttlHours, retries, failure) => {
+      const { svc, requested, failing } = await afterJtFails(ttlHours);
+      failing['jt.series'] = failure;
+      const hits: number[] = [];
+      for (let check = 1; check <= 16; check++) {
+        const files = await nextCheck(svc, requested);
+        expect(files.filter((f) => !f.startsWith('jt.'))).toEqual([]);
+        const downloads = files.filter((f) => f === 'jt.series').length;
+        expect(downloads).toBeLessThanOrEqual(1);
+        if (downloads > 0) hits.push(check);
+      }
+      expect(hits).toEqual(retries);
+      await svc.shutdown();
+    },
+  );
+
+  it('returns a recovered survey to TTL scheduling', async () => {
+    const { svc, requested, failing } = await afterJtFails();
+    for (let check = 1; check < 7; check++) await nextCheck(svc, requested);
+    delete failing['jt.series'];
+    expect(await nextCheck(svc, requested)).toContain('jt.series'); // check 7 succeeds
+    expect(await has(svc, 'JTNEW')).toBe(true);
+
+    for (let check = 8; check <= 30; check++) expect(await nextCheck(svc, requested)).toEqual([]);
+    vi.setSystemTime(T0 + 169 * HOUR);
+    expect(await nextCheck(svc, requested)).toContain('jt.series');
+    await svc.shutdown();
+  });
+
+  it('re-harvests the healthy surveys once when their TTL lapses while another still fails', async () => {
+    const { svc, requested } = await afterJtFails();
+    await nextCheck(svc, requested); // check 1: JT retries and fails again; next JT retry at check 3
+
+    vi.setSystemTime(T0 + 169 * HOUR);
+    const lapsed = await nextCheck(svc, requested); // check 2
+    expect(lapsed.filter((f) => f.endsWith('.series')).sort()).toEqual(healthySeries.sort());
+
+    vi.setSystemTime(T0 + 170 * HOUR);
+    const next = await nextCheck(svc, requested); // check 3: JT's retry only
+    expect(next.filter((f) => f.endsWith('.series'))).toEqual(['jt.series']);
+    await svc.shutdown();
+  });
+
+  it('makes one attempt per survey on a warm index when every .series fails, and keeps serving', async () => {
+    const path = join(tmpDir, `outage-${dbCounter++}.db`);
+    await seedComplete(path, 200);
+    const { requested, failing } = serveSurveys();
+    for (const abbr of surveys) failing[`${abbr}.series`] = unavailable;
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+
+    await svc.load(); // the default three attempts apply only to an index with no series
+    for (const abbr of surveys) {
+      expect(requested.filter((f) => f === `${abbr}.series`)).toHaveLength(1);
+    }
+    expect(svc.readiness).toEqual({ status: 'ready' });
+    expect(svc.totalSeries).toBe(surveys.length);
+    expect(await has(svc, 'CUOLD')).toBe(true);
+    await svc.shutdown();
+  });
+
+  it('retries an index with no series at every check and omits a survey that keeps failing', async () => {
+    const { requested, failing } = serveSurveys();
+    for (const abbr of surveys) failing[`${abbr}.series`] = unavailable;
+    const svc = new BlsCatalogService(
+      LABSTAT_URL,
+      'ua/1.0',
+      join(tmpDir, `cold-${dbCounter++}.db`),
+    );
+    for (let check = 1; check <= 3; check++) {
+      const files = await nextCheck(svc, requested);
+      expect(files.filter((f) => f.endsWith('.series')).sort()).toEqual(
+        surveys.map((a) => `${a}.series`).sort(),
+      );
+    }
+
+    for (const abbr of surveys) if (abbr !== 'jt') delete failing[`${abbr}.series`];
+    await nextCheck(svc, requested);
+    expect(await has(svc, 'CUNEW')).toBe(true);
+    expect(svc.indexedSurveys).not.toContain('JT');
+    expect((await nextCheck(svc, requested)).filter((f) => f.endsWith('.series'))).toEqual([
+      'jt.series',
+    ]);
+    expect(svc.indexedSurveys).not.toContain('JT');
+    await svc.shutdown();
+  });
+
+  it('deletes no row of a configured survey outside a retry, and still removes unconfigured surveys', async () => {
+    const { svc, requested, failing } = await afterJtFails();
+    await storeOf(svc).applyBatch(
+      [
+        toMirrorRow({ seriesId: 'OEUN1', title: 'OES', surveyAbbr: 'OE', seasonal: false }),
+        toMirrorRow({ seriesId: 'CUEXTRA', title: 'Extra', surveyAbbr: 'CU', seasonal: false }),
+      ],
+      [],
+    );
+    delete failing['jt.series'];
+
+    expect((await nextCheck(svc, requested)).filter((f) => f.endsWith('.series'))).toEqual([
+      'jt.series',
+    ]);
+    expect(await has(svc, 'JTNEW')).toBe(true);
+    expect(await has(svc, 'JTOLD')).toBe(false);
+    expect(await has(svc, 'CUNEW')).toBe(true);
+    expect(await has(svc, 'CUEXTRA')).toBe(true);
+    expect(await has(svc, 'OEUN1')).toBe(false);
+    await svc.shutdown();
+  });
+
+  it('writes complete only once every survey succeeded, with completedAt the oldest success', async () => {
+    const { svc, requested, failing, path } = await afterJtFails();
+    const stateOf = async () => {
+      const store = createCatalogStore(path);
+      const state = await store.readState();
+      await store.close();
+      return state;
+    };
+    const seeded = new Date(T0 - 200 * HOUR).toISOString();
+    expect(await stateOf()).toMatchObject({ status: 'error', completedAt: seeded });
+
+    delete failing['jt.series'];
+    vi.setSystemTime(T0 + HOUR);
+    await nextCheck(svc, requested);
+    expect(await stateOf()).toMatchObject({
+      status: 'complete',
+      completedAt: new Date(T0).toISOString(),
+      checkpoint: catalogSurveyList(false),
+    });
+    await svc.shutdown();
+  });
+
+  it('reports a failed .series request or body read on one stderr line with the file, cause, and next retry', async () => {
+    const { svc, requested, lines, failing } = await afterJtFails();
+    const jtLines = (from: number) => lines.slice(from).filter((l) => l.includes('jt.series'));
+    const prefix = '[bls-labor-mcp-server] Catalog: jt.series unavailable';
+    expect(jtLines(0)).toEqual([
+      `${prefix} (HTTP 503) — its indexed rows are kept; next retry at the next hourly check.\n`,
+    ]);
+
+    failing['jt.series'] = () => {
+      const response = new Response('');
+      vi.spyOn(response, 'text').mockRejectedValue(new Error('body failure'));
+      return Promise.resolve(response);
+    };
+    let from = lines.length;
+    await nextCheck(svc, requested); // check 1
+    expect(jtLines(from)).toEqual([
+      `${prefix} (body read failed: body failure) — its indexed rows are kept; next retry in 2 hourly checks.\n`,
+    ]);
+
+    failing['jt.series'] = () => Promise.reject(new Error('network down'));
+    await nextCheck(svc, requested); // check 2: not due
+    from = lines.length;
+    await nextCheck(svc, requested); // check 3
+    expect(jtLines(from)).toEqual([
+      `${prefix} (request failed: network down) — its indexed rows are kept; next retry in 4 hourly checks.\n`,
+    ]);
+    await svc.shutdown();
+  });
+
+  it('harvests every survey after a restart over an incomplete index', async () => {
+    const { svc, requested, path } = await afterJtFails();
+    await svc.shutdown();
+    const restarted = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    const files = await nextCheck(restarted, requested);
+    expect(files.filter((f) => f.endsWith('.series')).sort()).toEqual(
+      surveys.map((a) => `${a}.series`).sort(),
+    );
+    await restarted.shutdown();
+  });
+
+  it('stops an in-flight retry on shutdown without a later write', async () => {
+    const { svc, requested, failing } = await afterJtFails();
+    failing['jt.series'] = hang;
+    const writeState = vi.spyOn(storeOf(svc), 'writeState');
+    const retry = svc.load(1).then(
+      () => 'resolved',
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+    await vi.waitFor(() => expect(requested.at(-1)?.startsWith('jt.')).toBe(true));
+    await svc.shutdown();
+    expect(await retry).toMatch(/stopped by shutdown/);
+    expect(writeState).not.toHaveBeenCalled();
+  });
 });
 
 describe('BlsCatalogService.load — title synthesis for title-less surveys (#63)', () => {
@@ -1193,6 +1682,426 @@ describe('BlsCatalogService.load — title synthesis for title-less surveys (#63
       'JTS000000060000000JOR',
       'JTS300000000000000JOR',
     ]);
+  });
+});
+
+/** Space-separated LABSTAT fields: a header, or a run of codes that hold no spaces. */
+function fields(text: string): string[] {
+  return text.split(' ');
+}
+
+/**
+ * A real SM row: its code columns (state, area, supersector, industry, data
+ * type) as one space-separated string, its seasonal flag, and its first year;
+ * every row here closes on the 2025 benchmark and 2026 M09.
+ */
+function smRow(id: string, codes: string, seasonal: string, beginYear = '1990'): string[] {
+  return [id, ...fields(codes), seasonal, '2025', '', beginYear, 'M01', '2026', 'M09'];
+}
+
+/**
+ * Real rows of the catalog-only surveys (2026-11-01), with the code tables each
+ * declares. SM and EE ship no `series_title`; EE's rows carry a footnote field
+ * (`n`) its header does not name.
+ */
+const CATALOG_ONLY_FILES: Record<string, string> = {
+  'sm.series': tsv(
+    fields(
+      'series_id state_code area_code supersector_code industry_code data_type_code seasonal benchmark_year footnote_codes begin_year begin_period end_year end_period',
+    ),
+    smRow('SMS00000000000000021', '00 00000 00 00000000 21', 'S', '1991'),
+    smRow('SMS11477640000000001', '11 47764 00 00000000 01', 'S'),
+    smRow('SMS48000000000000001', '48 00000 00 00000000 01', 'S'),
+    smRow('SMS53000000000000001', '53 00000 00 00000000 01', 'S'),
+    smRow('SMS53426600000000001', '53 42660 00 00000000 01', 'S'),
+    smRow('SMU48000000500000003', '48 00000 05 05000000 03', 'U', '2007'),
+    smRow('SMU53000000000000001', '53 00000 00 00000000 01', 'U', '1939'),
+    smRow('SMU53426600000000001', '53 42660 00 00000000 01', 'U'),
+  ),
+  'sm.state': tsv(
+    ['state_code', 'state_name'],
+    ['00', 'All States'],
+    ['11', 'District of Columbia'],
+    ['48', 'Texas'],
+    ['53', 'Washington'],
+  ),
+  'sm.area': tsv(
+    ['area_code', 'area_name'],
+    ['00000', 'Statewide'],
+    ['42660', 'Seattle-Tacoma-Bellevue, WA'],
+    ['47764', 'Washington, DC-MD Metropolitan Division'],
+  ),
+  'sm.data_type': tsv(
+    ['data_type_code', 'data_type_text'],
+    ['01', 'All Employees, In Thousands'],
+    ['03', 'Average Hourly Earnings of All Employees, In Dollars'],
+    ['21', 'Diffusion Indexes, 1-month span, seasonally adjusted, total nonfarm'],
+  ),
+  'sm.industry': tsv(
+    ['industry_code', 'industry_name'],
+    ['00000000', 'Total Nonfarm'],
+    ['05000000', 'Total Private'],
+  ),
+  'ee.series': tsv(
+    fields(
+      'series_id industry_code data_type_code seasonal begin_year begin_period end_year end_period',
+    ),
+    fields('EES00000001 000000 01 S n 1939 M01 2003 M04'),
+    fields('EEU00000001 000000 01 U n 1919 M13 2003 M04'),
+    fields('EES00500001 005000 01 S n 1939 M01 2003 M04'),
+    fields('EES20000003 200000 03 S n 1947 M01 2003 M04'),
+  ),
+  // A blank second line, and industry rows wider than their header, as upstream ships them.
+  'ee.datatype': tsv(
+    ['data_type_code', 'data_type_text'],
+    [''],
+    ['01', 'ALL EMPLOYEES, THOUSANDS'],
+    ['03', 'PRODUCTION WORKERS, THOUSANDS'],
+  ),
+  'ee.industry': tsv(
+    ['industry_code', 'SIC_code', 'publishing_status', 'industry_name'],
+    [''],
+    ['000000', 'N/A', 'B', 'Total nonfarm', '1 ', 'T', '1    '],
+    ['005000', 'N/A', 'A', 'Total private', '1 ', 'T', '2    '],
+    ['200000', '15-17', 'A', 'Construction', '2 ', 'T', '17   '],
+  ),
+  'bd.series': tsv(
+    fields(
+      'series_id seasonal msa_code state_code county_code industry_code unitanalysis_code dataelement_code sizeclass_code dataclass_code ratelevel_code periodicity_code ownership_code series_title footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('BDS0000000000000000110001LQ5 S 00000 00 000 000000 1 1 00 01 L Q 5'),
+      'Quarterly gross job gains for the total private sector in the U.S. (rounded to the nearest thousands)',
+      ...fields('1 1992 Q03 2026 Q01'),
+    ],
+    [
+      ...fields('BDU0000000000000000110001RA5 U 00000 00 000 000000 1 1 00 01 R A 5'),
+      'Percent of gross job gains for the total private sector in the U.S. (as a percentage of employment in this sector)',
+      ...fields('1 1994 Q01 2026 Q01'),
+    ],
+    [
+      ...fields('BDU0000000000000000110001RQ5 U 00000 00 000 000000 1 1 00 01 R Q 5'),
+      'Percent of gross job gains for the total private sector in the U.S. (as a percentage of employment in this sector)',
+      ...fields('1 1992 Q03 2026 Q01'),
+    ],
+    [
+      ...fields('BDS0000053000000000110001LQ5 S 00000 53 000 000000 1 1 00 01 L Q 5'),
+      'Gross job gains',
+      ...fields('1 1992 Q03 2026 Q01'),
+    ],
+  ),
+  'bd.state': tsv(['state_code', 'state_name'], ['00', 'U.S. totals'], ['53', 'Washington']),
+  'bd.industry': tsv(
+    ['industry_code', 'industry_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['000000', 'Total private', '0', 'T', '1'],
+  ),
+  'bd.periodicity': tsv(
+    ['periodicity_code', 'periodicity_name'],
+    ['A', 'Annual'],
+    ['Q', 'Quarterly'],
+  ),
+  'ip.series': tsv(
+    fields(
+      'series_id seasonal sector_code industry_code measure_code duration_code base_year type_code area_code series_title footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('IPUAN1111__L011000000 U A N1111__ L01 1 - R 000000'),
+      'Annual percent change of hours worked for NAICS 1111, oilseed and grain farming, U.S. total',
+      ...fields('A 1988 A01 2024 A01'),
+    ],
+    [
+      ...fields('IPUAN1111__L201000000 U A N1111__ L20 1 - R 000000'),
+      'Annual percent change of hours worked for NAICS 1111, oilseed and grain farming, U.S. total',
+      ...fields('A 1988 A01 2024 A01'),
+    ],
+    [
+      ...fields('IPUZN______L000010000 U Z N______ L00 0 2017 I 010000'),
+      'Annual labor productivity (index, 2017=100) for private nonfarm, Alabama',
+      '',
+      ...fields('2007 A01 2025 A01'),
+    ],
+  ),
+  'ip.area': tsv(
+    ['area_code', 'area_text', 'display_level', 'selectable', 'sort_sequence'],
+    ['000000', 'U.S. Total', '1', 'T', '1'],
+    ['010000', 'Alabama', '3', 'T', '2'],
+  ),
+  'ip.measure': tsv(
+    ['measure_code', 'measure_text', 'display_level', 'selectable', 'sort_sequence'],
+    ['L00', 'Labor productivity (Index, 2017=100)', '0', 'T', '2'],
+    ['L01', 'Hours worked (Index, 2017=100)', '0', 'T', '7'],
+    ['L20', 'Hours worked (Millions of hours)', '0', 'T', '31'],
+  ),
+  'le.series': tsv(
+    fields(
+      'series_id lfst_code fips_code series_title tdata_code pcts_code earn_code cert_code class_code unin_code indy_code occupation_code education_code ages_code race_code orig_code sexs_code born_code seasonal footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('LEU0252881500 25 00'),
+      '(unadj)- Median usual weekly earnings (second quartile), Employed full time, Wage and salary workers',
+      ...fields('00 00 01 00 16 0 0000 0000 00 00 00 00 0 00 U'),
+      '',
+      ...fields('1979 Q01 2026 Q03'),
+    ],
+    [
+      ...fields('LEU0252881553 25 53'),
+      '(unadj)- Median weekly earnings, Full-time wage and salary workers, Washington',
+      ...fields('00 00 01 00 16 0 0000 0000 00 00 00 00 0 00 U'),
+      '',
+      ...fields('2012 A01 2025 A01'),
+    ],
+  ),
+  'le.fips': tsv(['fips_code', 'fips_text'], ['00', 'U.S. Total'], ['53', 'Washington']),
+  'lu.series': tsv(
+    fields(
+      'series_id lfst_code fips_code series_title tdata_code pcts_code earn_code class_code unin_code indy_code occupation_code education_code ages_code race_code orig_code sexs_code seasonal footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('LUU0201CEBE00 20 00'),
+      '(unadj)- Percent of employed, Private wage and salary workers, Represented by unions, Broadcasting and content providers',
+      ...fields('01 05 00 17 2 6671 0000 00 00 00 00 0 U'),
+      '',
+      ...fields('2025 A01 2025 A01'),
+    ],
+    [
+      ...fields('LUU0203161853 20 53'),
+      '(unadj)- Employed wage and salary workers, Members of unions, (WA) Washington',
+      ...fields('00 00 00 16 1 0000 0000 00 00 00 00 0 U'),
+      '',
+      ...fields('2000 A01 2025 A01'),
+    ],
+  ),
+  'lu.fips': tsv(['fips_code', 'fips_text'], ['00', 'U.S. Total'], ['53', 'Washington']),
+  'su.series': tsv(
+    fields(
+      'series_id area_code item_code seasonal periodicity_code base_code base_period series_title footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('SUUR0000SA0 0000 SA0 U R S'),
+      'DECEMBER 1999=100',
+      'All items in U.S. city average, all urban consumers, chained, not seasonally adjusted',
+      '',
+      ...fields('1999 M12 2026 M09'),
+    ],
+  ),
+  'su.area': tsv(
+    ['area_code', 'area_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['0000', 'U.S. city average', '0', 'T', '1'],
+  ),
+  'su.item': tsv(
+    ['item_code', 'item_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['SA0', 'All items', '0', 'T', '1'],
+  ),
+  'ei.series': tsv(
+    fields(
+      'series_id seasonal index_code series_name base_period series_title footnote_codes begin_year begin_period end_year end_period',
+    ),
+    [
+      ...fields('EIUCDCANMANU U CD Canada-Manufacturing'),
+      'December 2020=100',
+      'Monthly export price index by destination for NAICS, Manufacturing, Canada, not seasonally adjusted',
+      '',
+      ...fields('2020 M12 2026 M09'),
+    ],
+  ),
+};
+
+const CATALOG_ONLY_SURVEYS = ['SM', 'LE', 'EI', 'SU', 'IP', 'BD', 'LU', 'EE'];
+
+describe('BlsCatalogService.load — catalog-only surveys (#120)', () => {
+  it('harvests all eight and returns each one under its survey filter', async () => {
+    const { svc, requested } = await harvestFrom(CATALOG_ONLY_FILES);
+    for (const abbr of CATALOG_ONLY_SURVEYS) {
+      expect(requested).toContain(`${abbr.toLowerCase()}.series`);
+    }
+    expect(svc.indexedSurveys).toEqual([...CATALOG_ONLY_SURVEYS].sort());
+    expect(svc.totalSeries).toBe(25);
+    for (const survey of CATALOG_ONLY_SURVEYS) {
+      const result = await svc.search(searchInput(survey, { survey, limit: 50 }));
+      const ids = [...CATALOG_ONLY_FILES[`${survey.toLowerCase()}.series`]!.matchAll(/^(\w+)/gm)]
+        .map((m) => m[1]!)
+        .slice(1);
+      expect(result.series.map((s) => s.seriesId).sort()).toEqual(ids.sort());
+    }
+  });
+
+  it('titles SM rows from the data type, industry, and area; a statewide row takes its state as the area', async () => {
+    const { svc } = await harvestFrom(CATALOG_ONLY_FILES);
+    const ids = [...CATALOG_ONLY_FILES['sm.series']!.matchAll(/^(SM\w+)/gm)].map((m) => m[1]!);
+    const rows = await svc.lookupByIds(ids);
+    expect(rows.get('SMS53000000000000001')).toEqual({
+      seriesId: 'SMS53000000000000001',
+      title:
+        'SAE - State and Area Employment, Hours, and Earnings - All Employees, In Thousands - Total Nonfarm - Washington',
+      surveyAbbr: 'SM',
+      areaName: 'Washington',
+      itemName: 'Total Nonfarm',
+      seasonal: true,
+      startYear: 1990,
+      endYear: 2026,
+      endPeriod: 'M09',
+    });
+    expect(rows.get('SMU53426600000000001')).toMatchObject({
+      title:
+        'SAE - State and Area Employment, Hours, and Earnings - All Employees, In Thousands - Total Nonfarm - Seattle-Tacoma-Bellevue, WA',
+      areaName: 'Seattle-Tacoma-Bellevue, WA',
+      seasonal: false,
+    });
+    expect(rows.get('SMS11477640000000001')?.areaName).toBe(
+      'Washington, DC-MD Metropolitan Division',
+    );
+    expect(rows.get('SMU48000000500000003')).toMatchObject({
+      title:
+        'SAE - State and Area Employment, Hours, and Earnings - Average Hourly Earnings of All Employees, In Dollars - Total Private - Texas',
+      areaName: 'Texas',
+      itemName: 'Total Private',
+    });
+    expect(rows.get('SMS00000000000000021')?.areaName).toBe('All States');
+    for (const s of rows.values()) expect(s.areaName).not.toBe('Statewide');
+    expect(await distinctTitleSeasonal(svc, ids)).toBe(ids.length);
+  });
+
+  it('titles EE rows from ee.datatype and ee.industry and reads coverage past the unlabeled footnote', async () => {
+    const { svc } = await harvestFrom(CATALOG_ONLY_FILES);
+    const rows = await svc.lookupByIds(['EES00000001', 'EEU00000001', 'EES20000003']);
+    expect(rows.get('EES00000001')).toEqual({
+      seriesId: 'EES00000001',
+      title: 'CES (SIC basis, ended 2003) - ALL EMPLOYEES, THOUSANDS - Total nonfarm',
+      surveyAbbr: 'EE',
+      seasonal: true,
+      startYear: 1939,
+      endYear: 2003,
+      endPeriod: 'M04',
+    });
+    expect(rows.get('EEU00000001')).toMatchObject({ startYear: 1919, endPeriod: 'M04' });
+    expect(rows.get('EES20000003')?.title).toBe(
+      'CES (SIC basis, ended 2003) - PRODUCTION WORKERS, THOUSANDS - Construction',
+    );
+  });
+
+  it('decodes the BD area, industry, and frequency, separating twins that share a title', async () => {
+    const { svc } = await harvestFrom(CATALOG_ONLY_FILES);
+    const rows = await svc.lookupByIds([
+      'BDU0000000000000000110001RA5',
+      'BDU0000000000000000110001RQ5',
+      'BDS0000053000000000110001LQ5',
+    ]);
+    const annual = rows.get('BDU0000000000000000110001RA5');
+    const quarterly = rows.get('BDU0000000000000000110001RQ5');
+    expect(annual).toMatchObject({
+      areaName: 'U.S. totals',
+      itemName: 'Total private',
+      frequency: 'Annual',
+      startYear: 1994,
+    });
+    expect(quarterly).toMatchObject({ areaName: 'U.S. totals', frequency: 'Quarterly' });
+    expect(annual?.title).toBe(quarterly?.title);
+    expect(rows.get('BDS0000053000000000110001LQ5')).toMatchObject({
+      title: 'Gross job gains',
+      areaName: 'Washington',
+      frequency: 'Quarterly',
+    });
+  });
+
+  it('decodes the IP area and measure, separating rows that share a title', async () => {
+    const { svc } = await harvestFrom(CATALOG_ONLY_FILES);
+    const rows = await svc.lookupByIds([
+      'IPUAN1111__L011000000',
+      'IPUAN1111__L201000000',
+      'IPUZN______L000010000',
+    ]);
+    const index = rows.get('IPUAN1111__L011000000');
+    const hours = rows.get('IPUAN1111__L201000000');
+    expect(index).toMatchObject({
+      areaName: 'U.S. Total',
+      itemName: 'Hours worked (Index, 2017=100)',
+      startYear: 1988,
+      endYear: 2024,
+      endPeriod: 'A01',
+    });
+    expect(hours).toMatchObject({
+      areaName: 'U.S. Total',
+      itemName: 'Hours worked (Millions of hours)',
+    });
+    expect(index?.title).toBe(hours?.title);
+    expect(rows.get('IPUZN______L000010000')?.areaName).toBe('Alabama');
+  });
+
+  it('keeps series_title for LE, LU, SU, and EI, decoding LE and LU areas from their fips tables', async () => {
+    const { svc } = await harvestFrom(CATALOG_ONLY_FILES);
+    const rows = await svc.lookupByIds([
+      'LEU0252881500',
+      'LEU0252881553',
+      'LUU0201CEBE00',
+      'LUU0203161853',
+      'SUUR0000SA0',
+      'EIUCDCANMANU',
+    ]);
+    expect(rows.get('LEU0252881500')).toEqual({
+      seriesId: 'LEU0252881500',
+      title:
+        '(unadj)- Median usual weekly earnings (second quartile), Employed full time, Wage and salary workers',
+      surveyAbbr: 'LE',
+      areaName: 'U.S. Total',
+      seasonal: false,
+      startYear: 1979,
+      endYear: 2026,
+      endPeriod: 'Q03',
+    });
+    expect(rows.get('LEU0252881553')?.areaName).toBe('Washington');
+    expect(rows.get('LUU0201CEBE00')).toMatchObject({ surveyAbbr: 'LU', areaName: 'U.S. Total' });
+    expect(rows.get('LUU0203161853')).toMatchObject({
+      title: '(unadj)- Employed wage and salary workers, Members of unions, (WA) Washington',
+      areaName: 'Washington',
+    });
+    expect(rows.get('SUUR0000SA0')).toEqual({
+      seriesId: 'SUUR0000SA0',
+      title:
+        'All items in U.S. city average, all urban consumers, chained, not seasonally adjusted',
+      surveyAbbr: 'SU',
+      areaName: 'U.S. city average',
+      itemName: 'All items',
+      seasonal: false,
+      startYear: 1999,
+      endYear: 2026,
+      endPeriod: 'M09',
+    });
+    expect(rows.get('EIUCDCANMANU')).toEqual({
+      seriesId: 'EIUCDCANMANU',
+      title:
+        'Monthly export price index by destination for NAICS, Manufacturing, Canada, not seasonally adjusted',
+      surveyAbbr: 'EI',
+      seasonal: false,
+      startYear: 2020,
+      endYear: 2026,
+      endPeriod: 'M09',
+    });
+  });
+
+  it.each([
+    ['LE', 'U.S. Total'],
+    ['BD', 'U.S. totals'],
+    ['SM', 'All States'],
+  ])('ranks the national %s row (%s) above a state row that ties it', async (survey, national) => {
+    // The one-word state area keeps its title shorter in tokens, so bm25 puts it first.
+    const svc = await seedAndLoad([
+      {
+        seriesId: `${survey}STATE`,
+        title: 'Median weekly earnings, Washington',
+        surveyAbbr: survey,
+        seasonal: false,
+        areaName: 'Washington',
+      },
+      {
+        seriesId: `${survey}NATIONAL`,
+        title: `Median weekly earnings, ${national}`,
+        surveyAbbr: survey,
+        seasonal: false,
+        areaName: national,
+      },
+    ]);
+    const result = await svc.search(searchInput('median weekly earnings'));
+    expect(result.series.map((s) => s.seriesId)).toEqual([`${survey}NATIONAL`, `${survey}STATE`]);
   });
 });
 
@@ -1457,6 +2366,7 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
         ['05000000', '-', 'A', 'Total private', '1', 'T', '2'],
         ['20000000', '23', 'A', 'Construction', '2', 'T', '28'],
       ),
+      'ce.datatype': CE_DATATYPE,
     });
     const rows = await svc.lookupByIds(['CES2000000001', 'CES0500000001']);
     expect(rows.get('CES2000000001')?.itemName).toBe('Construction');
@@ -1497,6 +2407,7 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
         ['sector_code', 'sector_name', 'display_level', 'selectable', 'sort_sequence'],
         ['0011', 'Agriculture, forestry, fishing, and hunting (NAICS 11)', '1', 'T', '3'],
       ),
+      'mp.measure': MP_MEASURE,
     });
     const row = (await svc.lookupByIds(['MPU0011012'])).get('MPU0011012');
     expect(row?.itemName).toBe('Agriculture, forestry, fishing, and hunting (NAICS 11)');
@@ -1520,6 +2431,15 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
       pc: 'industry period product seasonal series',
       pr: 'class duration measure period seasonal sector series',
       wp: 'group item period seasonal series',
+      // The catalog-only surveys, listed 2026-11-01 (#120).
+      bd: 'contacts county dataclass dataelement footnote industry msa ownership periodicity ratelevel seasonal series sizeclass state unitanalysis',
+      ee: 'contacts datatype footnote industry period seasonal series',
+      ei: 'contacts footnote index period seasonal series',
+      ip: 'area contacts duration footnote industry measure seasonal sector series type',
+      le: 'ages born cert class contacts earn education fips footnote indy lfst occupation orig pcts race seasonal series sexs tdata unin',
+      lu: 'ages class contacts earn education fips footnote indy lfst occupation orig pcts periodicity race seasonal series sexs tdata unin',
+      sm: 'area contacts data_type footnote industry period seasonal series state supersector',
+      su: 'area base footnote item periodicity seasonal series',
     };
     const listed = new Set(
       Object.entries(LISTED).flatMap(([abbr, names]) =>
@@ -1529,7 +2449,7 @@ describe('BlsCatalogService.load — header-keyed code-table joins (#83)', () =>
     const files = Object.fromEntries([...listed].map((f) => [f, 'header_only\r\n']));
 
     const { requested } = await harvestFrom(files, { includeOes: true });
-    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(15);
+    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(23);
     expect(requested.filter((f) => !listed.has(f))).toEqual([]);
   });
 
@@ -1657,7 +2577,7 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
     await svc.load(1);
     expect(fetchSpy).toHaveBeenCalled();
     expect(svc.isLoaded).toBe(true);
-    expect(svc.catalogLoadError).toBeUndefined();
+    expect(svc.readiness).toEqual({ status: 'ready' });
     const kept = (await svc.lookupByIds(['JTS000000000000000QUR'])).get('JTS000000000000000QUR');
     expect(kept?.title).toBe(LEGACY_TITLE);
     await svc.shutdown();
@@ -1781,6 +2701,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'begin_period',
       'end_year',
       'end_period',
+      'tdat_code',
     ],
     [
       'LNS14000000      ',
@@ -1793,6 +2714,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'M01',
       '2026',
       'M08',
+      '01',
     ],
     [
       'LNS14000000Q     ',
@@ -1805,6 +2727,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'Q01',
       '2026',
       'Q02',
+      '01',
     ],
     [
       'LNU04000000      ',
@@ -1817,6 +2740,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'M01',
       '2026',
       'M08',
+      '01',
     ],
     [
       'LNU04000000Q     ',
@@ -1829,6 +2753,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'Q01',
       '2026',
       'Q02',
+      '01',
     ],
     [
       'LNU04079823      ',
@@ -1841,6 +2766,7 @@ const FREQUENCY_FILES: Record<string, string> = {
       'A01',
       '2025',
       'A01',
+      '01',
     ],
   ),
   'ln.periodicity': tsv(
@@ -1849,6 +2775,7 @@ const FREQUENCY_FILES: Record<string, string> = {
     ['M', 'Monthly'],
     ['Q', 'Quarterly'],
   ),
+  'ln.tdat': LN_TDAT,
 };
 
 describe('BlsCatalogService.load — publication frequency (#85)', () => {
@@ -2130,7 +3057,7 @@ describe('BlsCatalogService.load — index version 4 adds frequency and coverage
     expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
     for (const name of ['start_year', 'end_year', 'end_period'])
       expect(columns.filter((c) => c === name)).toHaveLength(1);
-    expect(version).toBe(4);
+    expect(version).toBe(5);
 
     fetchSpy.mockClear();
     const next = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
@@ -2145,7 +3072,7 @@ describe('BlsCatalogService.load — index version 4 adds frequency and coverage
     expect(columns.filter((c) => c === 'frequency')).toHaveLength(1);
     for (const name of ['start_year', 'end_year', 'end_period'])
       expect(columns.filter((c) => c === name)).toHaveLength(1);
-    expect(version).toBe(4);
+    expect(version).toBe(5);
 
     const store = createCatalogStore(dbPath);
     const completedAt = new Date().toISOString();
@@ -2188,7 +3115,76 @@ describe('BlsCatalogService.load — index version 4 adds frequency and coverage
       const { columns, version } = await columnsOf(dbPath);
       for (const name of ['frequency', 'start_year', 'end_year', 'end_period'])
         expect(columns.filter((c) => c === name)).toHaveLength(1);
-      expect(version).toBe(4);
+      expect(version).toBe(5);
+    }
+  });
+});
+
+describe('BlsCatalogService.load — index version 5 adds the measure column (#127)', () => {
+  it('adds the column to a fresh v4 index once and re-harvests it with the measure decoded', async () => {
+    const dbPath = join(tmpDir, 'v4.db');
+    const v4 = sqliteMirrorStore({
+      path: dbPath,
+      version: 4,
+      table: 'bls_catalog',
+      primaryKey: 'series_id',
+      columns: {
+        series_id: 'TEXT',
+        title: 'TEXT',
+        survey_abbr: 'TEXT',
+        area_name: 'TEXT',
+        item_name: 'TEXT',
+        seasonal: 'INTEGER',
+        frequency: 'TEXT',
+        start_year: 'INTEGER',
+        end_year: 'INTEGER',
+        end_period: 'TEXT',
+      },
+      fts: ['series_id', 'title', 'area_name', 'item_name'],
+      indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
+    });
+    await v4.applyBatch(
+      [
+        {
+          series_id: 'CES0000000001',
+          title: 'All employees, thousands, total nonfarm, seasonally adjusted',
+          survey_abbr: 'CE',
+          area_name: null,
+          item_name: 'Total nonfarm',
+          seasonal: 1,
+        },
+      ],
+      [],
+    );
+    await v4.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      total: 1,
+      checkpoint: catalogSurveyList(false),
+    });
+    await v4.close();
+
+    serveLabstat(MEASURE_FILES);
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+    await svc.load(1);
+    expect((await svc.lookupByIds(['CES0000000001'])).get('CES0000000001')?.measure).toBe(
+      'ALL EMPLOYEES, THOUSANDS',
+    );
+    await svc.shutdown();
+
+    for (let open = 0; open < 2; open++) {
+      const store = createCatalogStore(dbPath);
+      const db = await store.raw();
+      const columns = db
+        .prepare<{ name: string }>('PRAGMA table_info(bls_catalog)')
+        .all()
+        .map((c) => c.name);
+      const version = db
+        .prepare<{ v: number }>('SELECT MAX(version) AS v FROM schema_version')
+        .get()?.v;
+      await store.close();
+      expect(columns.filter((c) => c === 'measure')).toHaveLength(1);
+      expect(version).toBe(5);
     }
   });
 });
@@ -2404,6 +3400,235 @@ describe('BlsCatalogService.search — area before the candidate cap (#69)', () 
   });
 });
 
+// ---------------------------------------------------------------------------
+// Area codes and states (#110)
+// ---------------------------------------------------------------------------
+
+/**
+ * Catalog rows of the 2026-11-01 files, as `[SeriesID, title, survey, area]`,
+ * that an area code or state selects or a substring would wrongly reach.
+ */
+const AREA_GRAMMAR_ROWS: CatalogSeries[] = (
+  [
+    ['LASST480000000000003', 'Unemployment Rate: Texas (S)', 'LA', 'Texas'],
+    [
+      'LAUCN480010000000003',
+      'Unemployment Rate: Anderson County, TX (U)',
+      'LA',
+      'Anderson County, TX',
+    ],
+    ['LAUCN292150000000003', 'Unemployment Rate: Texas County, MO (U)', 'LA', 'Texas County, MO'],
+    ['LNU0404952648', '(Unadj) Unemployment Rate - Veterans, 18 years and over, Texas', 'LN'],
+    ['LNU0404960148', '(Unadj) Unemployment Rate - Nonveterans, 18 years and over, Texas', 'LN'],
+    ['LNS14000048', '(Seas) Unemployment Rate - 25 yrs. & over', 'LN'],
+    ['LNS14024887', '(Seas) Unemployment Rate - 16-24 yrs.', 'LN'],
+    ['LNS14000000', 'Unemployment Rate', 'LN'],
+    ['LNU04050008', '(Unadj) Unemployment Rate - Veterans, Gulf War Era, 25 to 34 years', 'LN'],
+    ['LNU04096935', '(unadj) Unemployment rate - Experienced, Dishwashers', 'LN'],
+    ['LNU04083444', '(unadj) Unemployment rate - Dominican', 'LN'],
+    ['LNU04027990', '(unadj) Unemployment rate - Never married', 'LN'],
+    [
+      'JTS000000480000000QUR',
+      'JOLTS - Quits - Total nonfarm - Texas - All size classes - Rate',
+      'JT',
+      'Texas',
+    ],
+    [
+      'JTS000000060000000QUR',
+      'JOLTS - Quits - Total nonfarm - California - All size classes - Rate',
+      'JT',
+      'California',
+    ],
+    [
+      'JTS000000000000000QUR',
+      'JOLTS - Quits - Total nonfarm - Total US - All size classes - Rate',
+      'JT',
+      'Total US',
+    ],
+    [
+      'JTS000000NE0000000QUR',
+      'JOLTS - Quits - Total nonfarm - Northeast region - All size classes - Rate',
+      'JT',
+      'Northeast region',
+    ],
+    ['LASST530000000000003', 'Unemployment Rate: Washington (S)', 'LA', 'Washington'],
+    ['LASST060000000000003', 'Unemployment Rate: California (S)', 'LA', 'California'],
+    ['LAUCT536300000000003', 'Unemployment Rate: Seattle city, WA (U)', 'LA', 'Seattle city, WA'],
+    [
+      'LAUCS253630000000003',
+      'Unemployment Rate: Longmeadow town, MA (U)',
+      'LA',
+      'Longmeadow town, MA',
+    ],
+    [
+      'LAUMT534266000000003',
+      'Unemployment Rate: Seattle-Tacoma-Bellevue, WA Metropolitan Statistical Area (U)',
+      'LA',
+      'Seattle-Tacoma-Bellevue, WA Metropolitan Statistical Area',
+    ],
+    ['LAUCS234266000000003', 'Unemployment Rate: Madison town, ME (U)', 'LA', 'Madison town, ME'],
+    [
+      'LAUCA535000000000003',
+      'Unemployment Rate: Seattle-Tacoma, WA Combined Statistical Area (U)',
+      'LA',
+      'Seattle-Tacoma, WA Combined Statistical Area',
+    ],
+    ['LAUCN530330000000003', 'Unemployment Rate: King County, WA (U)', 'LA', 'King County, WA'],
+    [
+      'CIU20100000000LLA',
+      'Total compensation for private industry workers in the Seattle-Tacoma, WA CSA, 12-month percent change, current dollars',
+      'CI',
+      'Seattle-Tacoma, WA CSA',
+    ],
+    [
+      'CUURS49DSA0',
+      'All items in Seattle-Tacoma-Bellevue, WA, all urban consumers, not seasonally adjusted',
+      'CU',
+      'Seattle-Tacoma-Bellevue WA',
+    ],
+    [
+      'CUUR0000SA0',
+      'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+      'CU',
+      'U.S. city average',
+    ],
+    [
+      'CUUR0100SA0',
+      'All items in Northeast urban, all urban consumers, not seasonally adjusted',
+      'CU',
+      'Northeast',
+    ],
+  ] as const
+).map(([seriesId, title, surveyAbbr, areaName]) => ({
+  seriesId,
+  title,
+  surveyAbbr,
+  seasonal: seriesId[2] === 'S',
+  ...(areaName !== undefined && { areaName }),
+}));
+
+describe('BlsCatalogService.search — area codes and states (#110)', () => {
+  const idsFor = async (svc: BlsCatalogService, query: string, area: string) =>
+    (await svc.search(search(query, { area, limit: 50 }))).series.map((s) => s.seriesId).sort();
+
+  it.each(['48', 'TX', 'tx'])(
+    'area %j is Texas: its statewide row, the areas in it, and titles naming it',
+    async (area) => {
+      const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+      // Not the CPS rows whose IDs hold 48, nor Texas County, MO.
+      expect(await idsFor(svc, 'unemployment rate', area)).toEqual([
+        'JTS000000480000000QUR',
+        'LASST480000000000003',
+        'LAUCN480010000000003',
+        'LNU0404952648',
+        'LNU0404960148',
+      ]);
+      const quits = await svc.search(search('quits rate', { area }));
+      expect(quits.series[0]?.seriesId).toBe('JTS000000480000000QUR');
+    },
+  );
+
+  it('reads a USPS code as the state, never as letters inside a word', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    expect(await idsFor(svc, 'unemployment rate', 'WA')).toEqual([
+      'LASST530000000000003',
+      'LAUCA535000000000003',
+      'LAUCN530330000000003',
+      'LAUCT536300000000003',
+      'LAUMT534266000000003',
+    ]);
+    // CPI names a metro with its state after a space, not a comma.
+    expect(await idsFor(svc, 'all items', 'Wa')).toEqual(['CUURS49DSA0']);
+    expect(await idsFor(svc, 'unemployment rate', 'CA')).toEqual([
+      'JTS000000060000000QUR',
+      'LASST060000000000003',
+    ]);
+  });
+
+  it('resolves 5- and 7-digit codes to the area they name, in every survey that decodes it', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    // 42660 sits inside Madison town's county-subdivision code; 5363000 inside Longmeadow's.
+    expect(await idsFor(svc, 'unemployment rate', '42660')).toEqual(['LAUMT534266000000003']);
+    expect(await idsFor(svc, 'all items', '42660')).toEqual(['CUURS49DSA0']);
+    expect(await idsFor(svc, 'unemployment rate', '5363000')).toEqual(['LAUCT536300000000003']);
+    expect(await idsFor(svc, 'unemployment rate', '53033')).toEqual(['LAUCN530330000000003']);
+  });
+
+  it('resolves a 3-digit CSA and a 4-digit CPI area code across surveys', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    expect(await idsFor(svc, 'unemployment rate', '500')).toEqual(['LAUCA535000000000003']);
+    expect(await idsFor(svc, 'total compensation', '500')).toEqual(['CIU20100000000LLA']);
+    expect(await idsFor(svc, 'all items', '0000')).toEqual(['CUUR0000SA0']);
+    // Not the national CPS headline, whose SeriesID holds 0000.
+    expect(await idsFor(svc, 'unemployment rate', '0000')).not.toContain('LNS14000000');
+    // The CPI Northeast region is the JOLTS Northeast region ("All size classes" matches "all").
+    expect(await idsFor(svc, 'all items', '0100')).toEqual([
+      'CUUR0100SA0',
+      'JTS000000NE0000000QUR',
+    ]);
+    expect(await idsFor(svc, 'quits rate', '0100')).toEqual(['JTS000000NE0000000QUR']);
+  });
+
+  it.each(['99', '000', '00000', '0000000'])(
+    'returns no rows for %j, a well-formed code naming no indexed area; an exact SeriesID still wins',
+    async (area) => {
+      const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+      const result = await svc.search(search('unemployment rate', { area }));
+      expect(result.series).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(await idsFor(svc, 'LNS14000000', area)).toEqual(['LNS14000000']);
+    },
+  );
+
+  it('admits no in-area headline that matches no query word (#129)', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    expect(await idsFor(svc, 'unemployment rate', '0000')).toEqual([]);
+    expect(await idsFor(svc, 'breweries', 'U.S. city average')).toEqual([]);
+    expect(await idsFor(svc, 'all items', '0000')).toEqual(['CUUR0000SA0']);
+  });
+
+  it('keeps an exact SeriesID first under a state code (characterization)', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    const result = await svc.search(search('LNS14000000', { area: '48' }));
+    expect(result.series[0]?.seriesId).toBe('LNS14000000');
+  });
+
+  it('matches any other all-digit value and any text as a substring (characterization)', async () => {
+    const svc = await seedAndLoad(AREA_GRAMMAR_ROWS);
+    expect(await idsFor(svc, 'unemployment rate', '9')).toEqual([
+      'LAUCN292150000000003',
+      'LNU04027990',
+      'LNU0404952648',
+      'LNU0404960148',
+      'LNU04096935',
+    ]);
+    expect(await idsFor(svc, 'unemployment rate', '123456')).toEqual([]);
+    expect(await idsFor(svc, 'unemployment rate', 'Texas')).toEqual([
+      'JTS000000480000000QUR',
+      'LASST480000000000003',
+      'LAUCN292150000000003',
+      'LNU0404952648',
+      'LNU0404960148',
+    ]);
+    expect(await idsFor(svc, 'all items', 's49d')).toEqual(['CUURS49DSA0']);
+    expect(await idsFor(svc, 'unemployment rate', 'ST48')).toEqual(['LASST480000000000003']);
+  });
+
+  it('filters a state before the candidate cap: 1,001 outranking decoys holding 48 stay out', async () => {
+    const svc = await seedAndLoad([...AREA_DECOYS, ...AREA_GRAMMAR_ROWS]);
+    const result = await svc.search(search('unemployment rate', { area: '48', limit: 50 }));
+    expect(result.series.map((s) => s.seriesId).sort()).toEqual([
+      'JTS000000480000000QUR',
+      'LASST480000000000003',
+      'LAUCN480010000000003',
+      'LNU0404952648',
+      'LNU0404960148',
+    ]);
+    expect(result.total).toBe(5);
+    expect(result.capped).toBe(false);
+  });
+});
+
 /**
  * Assert that `run` takes linear time in its input's length. Times 10-call
  * batches of `run` on the 5K, 20K, and 80K-character `text` in five
@@ -2527,14 +3752,22 @@ describe('BlsCatalogService.search — geographic preference (#98)', () => {
     'national',
     'average',
   ])('does not infer geography from %s', async (word) => {
+    // The place rows match every query word (#122), so an outscoring row that
+    // does too is what they must stay behind: a named place would lead it.
+    const everyWord = {
+      ...national,
+      seriesId: 'LN_EVERY_WORD',
+      title: `Unemployment Rate ${word}`,
+    };
     const svc = await seedAndLoad([
       national,
+      everyWord,
       place('Allentown Dallas Seattle city, WA'),
       ...(word === 'seatt' ? [] : [place(`${word} county`, 1)]),
       place('United States (National)', 2),
     ]);
     expect((await svc.search(search(`${word} unemployment rate`))).series[0]?.seriesId).toBe(
-      national.seriesId,
+      everyWord.seriesId,
     );
   });
 
@@ -2571,9 +3804,15 @@ describe('BlsCatalogService.search — geographic preference (#98)', () => {
   it.each(['seattleé', 'éSeattle', 'seattle𐐀', '𐐀Seattle'])(
     'requires whole query words: %s',
     async (word) => {
-      const svc = await seedAndLoad([national, place('Seattle')]);
+      // Seattle's row matches every query token, so it must stay behind an outscoring row that does too.
+      const everyWord = {
+        ...national,
+        seriesId: 'LN_EVERY_WORD',
+        title: 'Unemployment Rate Seattle',
+      };
+      const svc = await seedAndLoad([national, everyWord, place('Seattle')]);
       expect((await svc.search(search(`${word} unemployment rate`))).series[0]?.seriesId).toBe(
-        national.seriesId,
+        everyWord.seriesId,
       );
     },
   );
@@ -2602,15 +3841,17 @@ describe('BlsCatalogService.search — geographic preference (#98)', () => {
   it('rebuilds vocabulary when refreshed decoded areas change', async () => {
     const files: Record<string, string> = {
       'la.series': tsv(
-        ['series_id', 'area_code', 'seasonal', 'series_title'],
-        ['LA_PLACE', '01', 'U', 'Unemployment Rate'],
+        ['series_id', 'area_code', 'measure_code', 'seasonal', 'series_title'],
+        ['LA_PLACE', '01', '03', 'U', 'Unemployment Rate'],
       ),
       'la.area': tsv(['area_code', 'area_text'], ['01', 'Seattle']),
+      'la.measure': tsv(['measure_code', 'measure_text'], ['03', 'unemployment rate']),
       'ln.series': tsv(
-        ['series_id', 'periodicity_code', 'seasonal', 'series_title'],
-        ['LNS14000000', 'M', 'S', 'Unemployment Rate'],
+        ['series_id', 'periodicity_code', 'seasonal', 'series_title', 'tdat_code'],
+        ['LNS14000000', 'M', 'S', 'Unemployment Rate', '01'],
       ),
       'ln.periodicity': tsv(['periodicity_code', 'periodicity_text'], ['M', 'Monthly']),
+      'ln.tdat': LN_TDAT,
     };
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
       const file = String(url).split('/').at(-1) ?? '';
@@ -2635,6 +3876,133 @@ describe('BlsCatalogService.search — geographic preference (#98)', () => {
       'LA_PLACE',
     );
     await svc.shutdown();
+  });
+});
+
+describe('BlsCatalogService.search — place words need every other query word (#105)', () => {
+  const US = 'U.S. city average';
+  const laus = (seriesId: string, measure: string, areaName: string): CatalogSeries => ({
+    seriesId,
+    title: `${measure}: ${areaName} (U)`,
+    surveyAbbr: 'LA',
+    seasonal: false,
+    areaName,
+  });
+  const cps = (seriesId: string, label: string): CatalogSeries => ({
+    seriesId,
+    title: `(Seas) Unemployment Rate${label ? ` - ${label}` : ''}`,
+    surveyAbbr: 'LN',
+    seasonal: true,
+  });
+  /** Real 2026-11-01 titles: each query's answer beside the place rows whose names share a query word. */
+  const ROWS: CatalogSeries[] = [
+    {
+      seriesId: 'CUUR0000SA0',
+      title: 'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+      surveyAbbr: 'CU',
+      seasonal: false,
+      areaName: US,
+      itemName: 'All items',
+    },
+    {
+      seriesId: 'CUSR0000SA0',
+      title: 'All items in U.S. city average, all urban consumers, seasonally adjusted',
+      surveyAbbr: 'CU',
+      seasonal: true,
+      areaName: US,
+      itemName: 'All items',
+    },
+    {
+      seriesId: 'CUUR0000SA0L1E',
+      title:
+        'All items less food and energy in U.S. city average, all urban consumers, not seasonally adjusted',
+      surveyAbbr: 'CU',
+      seasonal: false,
+      areaName: US,
+      itemName: 'All items less food and energy',
+    },
+    {
+      seriesId: 'APU0000708111',
+      title:
+        'Eggs, grade A, large, per doz. in U.S. city average, average price, not seasonally adjusted',
+      surveyAbbr: 'AP',
+      seasonal: false,
+      areaName: US,
+      itemName: 'Eggs, grade A, large, per doz.',
+    },
+    {
+      seriesId: 'CIS1020000000000I',
+      title: 'Wages and salaries for all civilian workers, current dollar index',
+      surveyAbbr: 'CI',
+      seasonal: true,
+      areaName: 'United States (National)',
+      itemName: 'Wages and salaries',
+    },
+    cps('LNS14000000', ''),
+    cps('LNS14000003', 'White'),
+    cps('LNS14000006', 'Black or African American'),
+    laus('LAUCN550990000000003', 'Unemployment Rate', 'Price County, WI'),
+    laus('LAUCN550990000000004', 'Unemployment', 'Price County, WI'),
+    laus('LAUCN190130000000003', 'Unemployment Rate', 'Black Hawk County, IA'),
+    laus('LAUCN051450000000003', 'Unemployment Rate', 'White County, AR'),
+    laus('LAUCN021640000000005', 'Employment', 'Lake and Peninsula Borough, AK'),
+    laus('LASBS390000000000004', 'Unemployment', 'Balance of Ohio, state less Cleveland MSA'),
+  ];
+  const firstFor = async (svc: BlsCatalogService, query: string) =>
+    (await svc.search(search(query))).series[0]?.seriesId;
+
+  it.each([
+    ['consumer price index all items', ['CUUR0000SA0', 'CUSR0000SA0']],
+    ['price of eggs', ['APU0000708111']],
+    ['black unemployment rate', ['LNS14000006']],
+    ['employment cost index wages and salaries', ['CIS1020000000000I']],
+    ['all items less food and energy', ['CUUR0000SA0L1E']],
+  ])('%j leads with its answer, not a place sharing one word', async (query, answers) => {
+    const svc = await seedAndLoad(ROWS);
+    expect(answers).toContain(await firstFor(svc, query));
+  });
+
+  it('weighs a function word below a content word, so "price of eggs" keeps the AP row over an EI title holding "of"', async () => {
+    // Real 2026-11-01 EI title: it matches `price` and `eggs` too, and `of` only in "products of animal".
+    const ei: CatalogSeries = {
+      seriesId: 'EIUID04',
+      title:
+        'Monthly export price index for Harmonized 04, Dairy produce; birds eggs; natural honey; edible products of animal origin, not elsewhere specified or included, not seasonally adjusted',
+      surveyAbbr: 'EI',
+      seasonal: false,
+    };
+    const svc = await seedAndLoad([...ROWS, ei]);
+    expect(await firstFor(svc, 'price of eggs')).toBe('APU0000708111');
+  });
+
+  it('never reads a CPS demographic label alone as a place', async () => {
+    const svc = await seedAndLoad(ROWS);
+    // White County's rows match every word of the query, yet `white` names the CPS group.
+    expect(await firstFor(svc, 'white unemployment rate')).toBe('LNS14000003');
+  });
+
+  it('names a place only by every distinctive word of one part of its name', async () => {
+    const svc = await seedAndLoad(ROWS);
+    expect(await firstFor(svc, 'black hawk county unemployment rate')).toBe('LAUCN190130000000003');
+    expect(await firstFor(svc, 'price county unemployment rate')).toBe('LAUCN550990000000003');
+  });
+
+  it('admits a row with no decoded area on bm25 when the query holds a place word', async () => {
+    // 1,001 area-bearing rows that hold "producer price" fill the pool ahead of area-less rows.
+    const decoys = Array.from({ length: 1001 }, (_, i) =>
+      laus(`LADECOYPRICE${String(i).padStart(5, '0')}`, 'Producer price decoy', `Decoy ${i}, WI`),
+    );
+    const target: CatalogSeries = {
+      seriesId: 'WPUSI012011',
+      title:
+        'PPI Commodity data for Special indexes-Construction materials, not seasonally adjusted',
+      surveyAbbr: 'WP',
+      seasonal: false,
+    };
+    const svc = await seedAndLoad([...decoys, ...ROWS, target]);
+    const result = await svc.search(search('construction materials producer price'));
+    expect(result.capped).toBe(true);
+    expect(result.series[0]?.seriesId).toBe('WPUSI012011');
   });
 });
 
@@ -2850,6 +4218,277 @@ describe('BlsCatalogService.search — national rows first at equal score', () =
   });
 });
 
+describe('BlsCatalogService.search — currency, the JOLTS aggregate, and core measures (#122)', () => {
+  const ids = async (svc: BlsCatalogService, input: Parameters<BlsCatalogService['search']>[0]) =>
+    (await svc.search(input)).series.map((s) => s.seriesId);
+  const jt = (seriesId: string, element: string, industry: string, area = 'Total US') => ({
+    seriesId,
+    title: `JOLTS - ${element} - ${industry} - ${area} - All size classes - Rate`,
+    surveyAbbr: 'JT',
+    seasonal: true,
+    areaName: area,
+    endYear: area === 'Total US' ? 2026 : 2025,
+  });
+  /** Real 2026-11-01 JT rows; the breakdowns seed first, so they lead on candidate order alone. */
+  const JOLTS: CatalogSeries[] = [
+    jt('JTS230000000000000QUR', 'Quits', 'Construction'),
+    jt('JTS300000000000000QUR', 'Quits', 'Manufacturing'),
+    jt('JTS000000010000000QUR', 'Quits', 'Total nonfarm', 'Alabama'),
+    jt('JTS000000000000000QUR', 'Quits', 'Total nonfarm'),
+    jt('JTS230000000000000JOR', 'Job openings', 'Construction'),
+    jt('JTS000000000000000JOR', 'Job openings', 'Total nonfarm'),
+    {
+      seriesId: 'JTS000000000000000JOL',
+      title:
+        'JOLTS - Job openings - Total nonfarm - Total US - All size classes - Level - In Thousands',
+      surveyAbbr: 'JT',
+      seasonal: true,
+      areaName: 'Total US',
+      endYear: 2026,
+    },
+  ];
+
+  it.each<[string, string | undefined]>([
+    ['quits rate', 'JT'],
+    ['quits rate', undefined],
+    ['job openings rate', 'JT'],
+    ['job openings rate', undefined],
+  ])('ranks the Total nonfarm row first for %j (survey %j)', async (query, survey) => {
+    const svc = await seedAndLoad(JOLTS);
+    const element = query.startsWith('quits') ? 'QUR' : 'JOR';
+    const result = await ids(svc, search(query, survey ? { survey } : {}));
+    expect(result[0]).toBe(`JTS000000000000000${element}`);
+    // The breakdown stays in the list, behind the aggregate.
+    expect(result.indexOf(`JTS230000000000000${element}`)).toBeGreaterThan(0);
+  });
+
+  it('never lifts the aggregate over a better-scoring breakdown', async () => {
+    const svc = await seedAndLoad(JOLTS);
+    expect((await ids(svc, search('quits rate construction')))[0]).toBe('JTS230000000000000QUR');
+  });
+
+  it('ranks a series that ended more than a year before its survey below current ties, hiding none', async () => {
+    const egg = (seriesId: string, seasonal: boolean, startYear: number, endYear: number) => ({
+      seriesId,
+      title: `PPI Commodity data for Farm products-Chicken eggs, ${seasonal ? '' : 'not '}seasonally adjusted`,
+      surveyAbbr: 'WP',
+      seasonal,
+      itemName: 'Chicken eggs',
+      startYear,
+      endYear,
+    });
+    // Real rows: the seasonally adjusted pair ended in 2012 and leads on bm25 (shorter titles).
+    const svc = await seedAndLoad([
+      egg('WPS017', true, 1967, 2012),
+      egg('WPS0171', true, 1991, 2012),
+      egg('WPU017', false, 1926, 2026),
+    ]);
+    const result = await svc.search(search('eggs'));
+    expect(result.series.map((s) => s.seriesId)).toEqual(['WPU017', 'WPS017', 'WPS0171']);
+    expect(result.total).toBe(3);
+  });
+
+  it('applies currency only at equal score: a better-scoring ended row still leads', async () => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'ENDED',
+        title: 'Chicken eggs',
+        surveyAbbr: 'WP',
+        seasonal: false,
+        itemName: 'Chicken eggs',
+        endYear: 2012,
+      },
+      {
+        seriesId: 'CURRENT',
+        title: 'Chicken eggs',
+        surveyAbbr: 'WP',
+        seasonal: false,
+        endYear: 2026,
+      },
+    ]);
+    expect(await ids(svc, search('eggs'))).toEqual(['ENDED', 'CURRENT']);
+  });
+
+  it.each<[string, number]>([
+    ['MP', 2025],
+    ['JT', 2026],
+    ['LN', 2026],
+  ])(
+    'counts a %s row ending a year before its survey newest (%i) as current',
+    async (survey, newest) => {
+      // Identical titles tie on score and bm25, so candidate order is seed order.
+      const row = (seriesId: string, endYear?: number): CatalogSeries => ({
+        seriesId,
+        title: 'Currency probe',
+        surveyAbbr: survey,
+        seasonal: false,
+        ...(endYear !== undefined && { endYear }),
+      });
+      const svc = await seedAndLoad([
+        row('ENDED', newest - 2),
+        row('BEHIND', newest - 1),
+        row('NEWEST', newest),
+        row('UNKNOWN'),
+      ]);
+      expect(await ids(svc, search('currency probe'))).toEqual([
+        'BEHIND',
+        'NEWEST',
+        'UNKNOWN',
+        'ENDED',
+      ]);
+    },
+  );
+
+  it('measures currency against each survey separately', async () => {
+    // Every EC row ends in 2005, so they are current against EC, not against CU's 2026.
+    const row = (seriesId: string, surveyAbbr: string, endYear: number): CatalogSeries => ({
+      seriesId,
+      title: 'Survey probe',
+      surveyAbbr,
+      seasonal: false,
+      endYear,
+    });
+    const svc = await seedAndLoad([
+      row('CU_OLD', 'CU', 2017),
+      row('EC_ROW', 'EC', 2005),
+      row('CU_ROW', 'CU', 2026),
+    ]);
+    expect(await ids(svc, search('survey probe'))).toEqual(['EC_ROW', 'CU_ROW', 'CU_OLD']);
+  });
+
+  it.each([
+    ['black unemployment rate', 'LNS14000006'],
+    ['labor force participation rate women', 'LNS11300002'],
+  ])('leads %j within LN with the demographic row (characterization)', async (query, answer) => {
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNS14000000',
+        title: '(Seas) Unemployment Rate',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+      {
+        seriesId: 'LNS11300000',
+        title: '(Seas) Labor Force Participation Rate',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+      {
+        seriesId: 'LNS12000000',
+        title: '(Seas) Employment Level',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+      {
+        seriesId: 'LNS14000006',
+        title: '(Seas) Unemployment Rate - Black or African American',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+      {
+        seriesId: 'LNS11300002',
+        title: '(Seas) Labor Force Participation Rate - Women',
+        surveyAbbr: 'LN',
+        seasonal: true,
+      },
+    ]);
+    expect((await ids(svc, search(query, { survey: 'LN' })))[0]).toBe(answer);
+  });
+
+  const cpi = (seriesId: string, item: string, area = 'U.S. city average') => ({
+    seriesId,
+    title: `${item} in ${area}, all urban consumers, ${seriesId[2] === 'S' ? '' : 'not '}seasonally adjusted`,
+    surveyAbbr: 'CU',
+    seasonal: seriesId[2] === 'S',
+    areaName: area,
+    itemName: item,
+  });
+  const ppi = (seriesId: string, item: string) => ({
+    seriesId,
+    title: `PPI Commodity data for ${item}, ${seriesId[2] === 'S' ? '' : 'not '}seasonally adjusted`,
+    surveyAbbr: 'WP',
+    seasonal: seriesId[2] === 'S',
+    itemName: item,
+  });
+  /** Real 2026-11-01 rows: the headlines, the core measures, and the "Fiber cores" rows `core` also matches. */
+  const CORE: CatalogSeries[] = [
+    {
+      seriesId: 'PCU32221932221982',
+      title:
+        'PPI industry data for Other paperboard container manufacturing-Fiber cores and tubes, not seasonally adjusted',
+      surveyAbbr: 'PC',
+      seasonal: false,
+      itemName: 'Fiber cores and tubes',
+    },
+    {
+      seriesId: 'WPU09150732',
+      title:
+        'PPI Commodity data for Pulp, paper, and allied products-Fiber cores and tubes, not seasonally adjusted',
+      surveyAbbr: 'WP',
+      seasonal: false,
+      itemName: 'Fiber cores and tubes',
+    },
+    cpi('CUUR0000SA0', 'All items'),
+    cpi('CUSR0000SA0', 'All items'),
+    cpi('CUUR0100SA0L1E', 'All items less food and energy', 'Northeast'),
+    cpi('CUUR0000SA0L1E', 'All items less food and energy'),
+    cpi('CUSR0000SA0L1E', 'All items less food and energy'),
+    cpi('CUUR0000SA0L12E', 'All items less food, shelter, and energy'),
+    ppi('WPUFD4', 'Final demand'),
+    ppi('WPUFD49104', 'Final demand less foods and energy'),
+    ppi('WPSFD49104', 'Final demand less foods and energy'),
+    ppi('WPUFD49116', 'Final demand less foods, energy, and trade services'),
+    ppi('WPUFD413', 'Final demand goods less foods and energy'),
+  ];
+  /** Each survey's national core rows (the leaders), then every core row of it. */
+  const CU_CORE = [['CUSR0000SA0L1E', 'CUUR0000SA0L1E'], ['CUUR0100SA0L1E']];
+  const WP_CORE = [['WPSFD49104', 'WPUFD49104', 'WPUFD49116'], []];
+
+  it.each<[string, string | undefined, string[][]]>([
+    ['core inflation', 'CU', CU_CORE],
+    ['core inflation', undefined, CU_CORE],
+    ['core cpi', undefined, CU_CORE],
+    ['CPI core', undefined, CU_CORE],
+    ['core ppi', undefined, WP_CORE],
+    ['core producer prices', undefined, WP_CORE],
+  ])(
+    'leads %j (survey %j) with its core measure',
+    async (query, survey, [leaders = [], rest = []]) => {
+      const svc = await seedAndLoad(CORE);
+      const result = await ids(svc, search(query, { ...(survey && { survey }), limit: 50 }));
+      expect(new Set(result.slice(0, leaders.length))).toEqual(new Set(leaders));
+      // Every core row of the survey joins; a near-miss item ("less food, shelter, and energy") never does.
+      expect(result).toEqual(expect.arrayContaining(rest));
+      expect(result).not.toContain('CUUR0000SA0L12E');
+    },
+  );
+
+  it('keeps the survey, seasonal, and area filters on the core rows', async () => {
+    const svc = await seedAndLoad(CORE);
+    expect(
+      await ids(svc, { ...search('core inflation'), seasonal_adjustment: false }),
+    ).not.toContain('CUSR0000SA0L1E');
+    expect(await ids(svc, search('core inflation', { area: 'Northeast' }))).toEqual([
+      'CUUR0100SA0L1E',
+    ]);
+    expect(
+      (await ids(svc, search('core inflation', { survey: 'WP' }))).some((id) =>
+        id.startsWith('CU'),
+      ),
+    ).toBe(false);
+  });
+
+  it.each(['core', 'cores ppi'])(
+    'leaves %j to its own words: no alias, or no whole word "core" (characterization)',
+    async (query) => {
+      const svc = await seedAndLoad(CORE);
+      const result = await ids(svc, search(query, { limit: 50 }));
+      expect(new Set(result.slice(0, 2))).toEqual(new Set(['PCU32221932221982', 'WPU09150732']));
+      if (query === 'core') expect(result).toHaveLength(2);
+    },
+  );
+});
+
 describe('BlsCatalogService.load racing shutdown', () => {
   it('finishes a first load that a shutdown interrupts without a closed-handle error', async () => {
     const dbPath = join(tmpDir, 'race.db');
@@ -2986,6 +4625,7 @@ const CM_CI_FILES: Record<string, string> = {
   ),
   'cm.area': COMP_AREA,
   'cm.estimate': COMP_ESTIMATE,
+  'cm.datatype': CM_DATATYPE,
   'ci.series': tsv(
     COMP_HEADER('periodicity_code'),
     compRow(
@@ -3069,6 +4709,7 @@ describe('BlsCatalogService — ECEC (CM) and ECI (CI) (#86)', () => {
       'ci.estimate',
       'ci.series',
       'cm.area',
+      'cm.datatype',
       'cm.estimate',
       'cm.series',
     ]);
@@ -3172,6 +4813,646 @@ describe('BlsCatalogService — ECEC (CM) and ECI (CI) (#86)', () => {
       'CMU1010000000000D',
       'CMU20100000000LLD',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Measure (#127)
+// ---------------------------------------------------------------------------
+
+/**
+ * One survey per code table BLS's `catalog.measure_data_type` reproduces,
+ * shaped like the real files, with two codes each so a constant cannot pass.
+ * Labels are the real table text (2026-11-01).
+ */
+const MEASURE_FILES: Record<string, string> = {
+  'ce.series': tsv(
+    [
+      'series_id        ',
+      'supersector_code',
+      'industry_code',
+      'data_type_code',
+      'seasonal',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'CES0000000001    ',
+      '00',
+      '00000000',
+      '01',
+      'S',
+      'All employees, thousands, total nonfarm, seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+    [
+      'CES0500000003    ',
+      '05',
+      '05000000',
+      '03',
+      'S',
+      'Average hourly earnings of all employees, total private, seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+    // A code ce.datatype does not list: the row is indexed without a measure.
+    [
+      'CES0500000099    ',
+      '05',
+      '05000000',
+      '99',
+      'S',
+      'Unlisted data type',
+      '',
+      ...PERIODS.slice(1),
+    ],
+  ),
+  'ce.industry': tsv(
+    ['industry_code', 'naics_code', 'publishing_status', 'industry_name'],
+    ['00000000', '-', 'B', 'Total nonfarm'],
+    ['05000000', '-', 'A', 'Total private'],
+  ),
+  'ce.datatype': CE_DATATYPE,
+  'ln.series': tsv(
+    [
+      'series_id        ',
+      'lfst_code',
+      'periodicity_code',
+      'series_title',
+      'tdat_code',
+      'seasonal',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'LNS11000000      ',
+      '10',
+      'M',
+      '(Seas) Civilian Labor Force Level',
+      '00',
+      'S',
+      ...PERIODS.slice(1),
+    ],
+    ['LNS14000000      ', '40', 'M', '(Seas) Unemployment Rate', '01', 'S', ...PERIODS.slice(1)],
+  ),
+  'ln.periodicity': tsv(['periodicity_code', 'periodicity_text'], ['M', 'Monthly']),
+  'ln.tdat': LN_TDAT,
+  'mp.series': tsv(
+    [
+      'series_id        ',
+      'sector_code',
+      'measure_code',
+      'duration_code',
+      'base_year',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'MPU0011012       ',
+      '0011',
+      '01',
+      '2',
+      '2017',
+      'Total factor productivity, NAICS 11',
+      '04',
+      '1987',
+      'A01',
+      '2024',
+      'A01',
+    ],
+    [
+      'MPU0011032       ',
+      '0011',
+      '03',
+      '2',
+      '2017',
+      'Combined inputs, NAICS 11',
+      '04',
+      '1987',
+      'A01',
+      '2024',
+      'A01',
+    ],
+  ),
+  'mp.sector': tsv(
+    ['sector_code', 'sector_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['0011', 'Agriculture, forestry, fishing, and hunting (NAICS 11)', '1', 'T', '3'],
+  ),
+  'mp.measure': MP_MEASURE,
+  'cm.series': tsv(
+    COMP_HEADER('datatype_code'),
+    compRow('CMU1010000000000D', 'U', '1', '99999', 'D', '01', 'Total compensation cost per hour'),
+    compRow(
+      'CMU1020000000000P',
+      'U',
+      '1',
+      '99999',
+      'P',
+      '02',
+      'Wages as a percent of compensation',
+    ),
+  ),
+  'cm.area': COMP_AREA,
+  'cm.estimate': COMP_ESTIMATE,
+  'cm.datatype': CM_DATATYPE,
+  'cu.series': tsv(
+    CU_HEADER,
+    cpiRow('CUUR0000SA0      ', '0000', 'U', 'R', US_NSA),
+    cpiRow('CUUR0000SAF1     ', '0000', 'U', 'R', 'Food in U.S. city average').with(2, 'SAF1'),
+  ),
+  'cu.area': CPI_AREA,
+  'cu.periodicity': CPI_PERIODICITY,
+  'cu.item': tsv(
+    ['item_code', 'item_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['SA0', 'All items', '0', 'T', '1'],
+    ['SAF1', 'Food', '1', 'T', '2'],
+  ),
+  'oe.series': tsv(
+    [
+      'series_id                     ',
+      'seasonal',
+      'areatype_code',
+      'industry_code',
+      'occupation_code',
+      'datatype_code',
+      'state_code',
+      'area_code',
+      'sector_code',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    ...['01', '03'].map((datatype) => [
+      `OEUM0042660000000291141${datatype}`,
+      'U',
+      'M',
+      '000000',
+      '291141',
+      datatype,
+      '53',
+      '0042660',
+      '-',
+      `Registered Nurses in Seattle-Tacoma-Bellevue, WA (${datatype})`,
+      '',
+      '2025',
+      'A01',
+      '2025',
+      'A01',
+    ]),
+  ),
+  'oe.area': tsv(
+    ['state_code', 'area_code', 'areatype_code', 'area_name'],
+    ['53', '0042660', 'M', 'Seattle-Tacoma-Bellevue, WA'],
+  ),
+  'oe.occupation': tsv(['occupation_code', 'occupation_name'], ['291141', 'Registered Nurses']),
+  'oe.datatype': tsv(
+    ['datatype_code', 'datatype_name'],
+    ['01', 'Employment'],
+    ['03', 'Hourly mean wage'],
+  ),
+};
+
+/**
+ * The surveys whose item label BLS's API returns verbatim as
+ * `catalog.measure_data_type` (AP, CW, PC, WP), with the real table text
+ * (2026-11-01). The PC and WP tables each hold a real row that shares half of
+ * a series' composite key, so a join on one key column alone mislabels.
+ */
+const ITEM_MEASURE_FILES: Record<string, string> = {
+  'ap.series': tsv(
+    [
+      'series_id        ',
+      'area_code',
+      'item_code',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'APU0000702111    ',
+      '0000',
+      '702111',
+      'Bread, white, pan, per lb. (453.6 gm) in U.S. city average, average price, not seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+    [
+      'APU0000708111    ',
+      '0000',
+      '708111',
+      'Eggs, grade A, large, per doz. in U.S. city average, average price, not seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+  ),
+  'ap.area': tsv(['area_code', 'area_name'], ['0000', 'U.S. city average']),
+  'ap.item': tsv(
+    ['item_code', 'item_name'],
+    ['702111', 'Bread, white, pan, per lb. (453.6 gm)'],
+    ['708111', 'Eggs, grade A, large, per doz.'],
+  ),
+  'cw.series': tsv(
+    CU_HEADER,
+    cpiRow('CWUR0000SA0      ', '0000', 'U', 'R', CW_NSA),
+    cpiRow(
+      'CWSR0000SAF1     ',
+      '0000',
+      'S',
+      'R',
+      'Food in U.S. city average, urban wage earners and clerical workers, seasonally adjusted',
+    ).with(2, 'SAF1'),
+  ),
+  'cw.area': CPI_AREA,
+  'cw.periodicity': CPI_PERIODICITY,
+  'cw.item': tsv(
+    ['item_code', 'item_name', 'display_level', 'selectable', 'sort_sequence'],
+    ['SA0', 'All items', '0', 'T', '1'],
+    ['SAF1', 'Food', '1', 'T', '4'],
+  ),
+  'pc.series': tsv(
+    [
+      'series_id                     ',
+      'industry_code',
+      'product_code',
+      'seasonal',
+      'base_date',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    ...[
+      ['PCU325412325412', '325412', '325412', 'Pharmaceutical preparation manufacturing'],
+      [
+        'PCU325412325412P',
+        '325412',
+        '325412P',
+        'Pharmaceutical preparation manufacturing-Primary products',
+      ],
+      [
+        'PCU3339213339211',
+        '333921',
+        '3339211',
+        'Elevator and moving stairway mfg-Elevators and moving stairways',
+      ],
+    ].map(([id = '', industry = '', product = '', name = '']) => [
+      id.padEnd(30),
+      industry,
+      product,
+      'U',
+      '198112',
+      `PPI industry data for ${name}, not seasonally adjusted`,
+      '',
+      ...PERIODS.slice(1),
+    ]),
+  ),
+  'pc.product': tsv(
+    ['industry_code', 'product_code', 'product_name'],
+    ['325412', '325412', 'Pharmaceutical preparation manufacturing'],
+    ['325412', '325412P', 'Primary products'],
+    ['333921', '3339211', 'Elevators and moving stairways'],
+  ),
+  'wp.series': tsv(
+    [
+      'series_id                     ',
+      'group_code',
+      'item_code',
+      'seasonal',
+      'base_date',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'WPU01                         ',
+      '01',
+      '-',
+      'U',
+      '198200',
+      'PPI Commodity data for Farm products, not seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+    [
+      'WPUFD49207                    ',
+      'FD',
+      '49207',
+      'U',
+      '198200',
+      'PPI Commodity data for Final demand-Finished goods, not seasonally adjusted',
+      '',
+      ...PERIODS.slice(1),
+    ],
+  ),
+  'wp.item': tsv(
+    ['group_code', 'item_code', 'item_name'],
+    ['01', '-', 'Farm products'],
+    ['02', '-', 'Processed foods and feeds'],
+    ['FD', '49207', 'Finished goods'],
+  ),
+};
+
+/** Real la.* rows and the whole `la.measure` table (2026-11-01). */
+const LA_MEASURE_FILES: Record<string, string> = {
+  'la.series': tsv(
+    [
+      'series_id                     ',
+      'area_type_code',
+      'area_code',
+      'measure_code',
+      'seasonal',
+      'srd_code',
+      'series_title',
+      'footnote_codes',
+      'begin_year',
+      'begin_period',
+      'end_year',
+      'end_period',
+    ],
+    [
+      'LASST530000000000003          ',
+      'A',
+      'ST5300000000000',
+      '03',
+      'S',
+      '53',
+      'Unemployment Rate: Washington (S)',
+      '',
+      '1976',
+      'M01',
+      '2026',
+      'M09',
+    ],
+    [
+      'LASST530000000000008          ',
+      'A',
+      'ST5300000000000',
+      '08',
+      'S',
+      '53',
+      'Labor Force Participation Rate: Washington (S)',
+      '',
+      '1976',
+      'M01',
+      '2026',
+      'M09',
+    ],
+    [
+      'LAUCN530330000000003          ',
+      'F',
+      'CN5303300000000',
+      '03',
+      'U',
+      '53',
+      'Unemployment Rate: King County, WA (U)',
+      '',
+      '1990',
+      'M01',
+      '2026',
+      'M09',
+    ],
+  ),
+  'la.area': tsv(
+    ['area_type_code', 'area_code', 'area_text', 'display_level', 'selectable', 'sort_sequence'],
+    ['A', 'ST5300000000000', 'Washington', '0', 'T', '7845'],
+    ['F', 'CN5303300000000', 'King County, WA', '0', 'T', '7891'],
+  ),
+  'la.measure': tsv(
+    ['measure_code', 'measure_text'],
+    ['03', 'unemployment rate'],
+    ['04', 'unemployment'],
+    ['05', 'employment'],
+    ['06', 'labor force'],
+    ['07', 'employment-population ratio'],
+    ['08', 'labor force participation rate'],
+    ['09', 'civilian noninstitutional population'],
+  ),
+};
+
+describe('BlsCatalogService.load — measure (#127)', () => {
+  it('decodes each mapped survey’s measure from the table BLS reads measure_data_type from', async () => {
+    const { svc, requested } = await harvestFrom(
+      {
+        ...MEASURE_FILES,
+        ...PR_FILES,
+        'ci.series': CM_CI_FILES['ci.series']!,
+        'ci.area': COMP_AREA,
+        'ci.estimate': COMP_ESTIMATE,
+      },
+      { includeOes: true },
+    );
+    const rows = await svc.lookupByIds([
+      'CES0000000001',
+      'CES0500000003',
+      'LNS11000000',
+      'LNS14000000',
+      'MPU0011012',
+      'MPU0011032',
+      'CMU1010000000000D',
+      'CMU1020000000000P',
+      'CIU1010000000000A',
+      'CIU1020000000000A',
+      'PRS85006092',
+      'PRS85006112',
+      'CUUR0000SA0',
+      'CUUR0000SAF1',
+      'OEUM004266000000029114101',
+      'OEUM004266000000029114103',
+    ]);
+    expect(Object.fromEntries([...rows].map(([id, s]) => [id, s.measure]))).toEqual({
+      CES0000000001: 'ALL EMPLOYEES, THOUSANDS',
+      CES0500000003: 'AVERAGE HOURLY EARNINGS OF ALL EMPLOYEES',
+      LNS11000000: 'Number in thousands',
+      LNS14000000: 'Percent or rate',
+      MPU0011012: 'Total factor productivity',
+      MPU0011032: 'Combined inputs',
+      CMU1010000000000D: 'Cost of compensation (Cost per hour worked)',
+      CMU1020000000000P: 'Percent of total compensation',
+      CIU1010000000000A: 'Total compensation',
+      CIU1020000000000A: 'Wages and salaries',
+      PRS85006092: 'Labor productivity (output per hour)',
+      PRS85006112: 'Unit labor costs',
+      CUUR0000SA0: 'All items',
+      CUUR0000SAF1: 'Food',
+      OEUM004266000000029114101: 'Employment',
+      OEUM004266000000029114103: 'Hourly mean wage',
+    });
+    expect(requested).toEqual(
+      expect.arrayContaining([
+        'ce.datatype',
+        'ln.tdat',
+        'mp.measure',
+        'cm.datatype',
+        'oe.datatype',
+      ]),
+    );
+    // CI and CU decode the measure from the item's table, which is fetched once.
+    expect(requested.filter((f) => f === 'ci.estimate')).toHaveLength(1);
+    expect(requested.filter((f) => f === 'cu.item')).toHaveLength(1);
+    await svc.shutdown();
+  });
+
+  it('indexes a row whose code its measure table does not list, without a measure', async () => {
+    const { svc } = await harvestFrom(MEASURE_FILES);
+    const rows = await svc.lookupByIds(['CES0000000001', 'CES0500000099']);
+    expect(rows.get('CES0000000001')?.measure).toBe('ALL EMPLOYEES, THOUSANDS');
+    expect(rows.get('CES0500000099')).toMatchObject({ itemName: 'Total private' });
+    expect(rows.get('CES0500000099')).not.toHaveProperty('measure');
+    await svc.shutdown();
+  });
+
+  it('decodes AP, CW, PC, and WP measures from the item table, fetched once', async () => {
+    const { svc, requested } = await harvestFrom(ITEM_MEASURE_FILES);
+    const ids = [
+      'APU0000702111',
+      'APU0000708111',
+      'CWUR0000SA0',
+      'CWSR0000SAF1',
+      'PCU325412325412',
+      'PCU325412325412P',
+      'PCU3339213339211',
+      'WPU01',
+      'WPUFD49207',
+    ];
+    const rows = await svc.lookupByIds(ids);
+    // The strings BLS's API returns as measure_data_type for these series.
+    expect(Object.fromEntries([...rows].map(([id, s]) => [id, s.measure]))).toEqual({
+      APU0000702111: 'Bread, white, pan, per lb. (453.6 gm)',
+      APU0000708111: 'Eggs, grade A, large, per doz.',
+      CWUR0000SA0: 'All items',
+      CWSR0000SAF1: 'Food',
+      PCU325412325412: 'Pharmaceutical preparation manufacturing',
+      PCU325412325412P: 'Primary products',
+      PCU3339213339211: 'Elevators and moving stairways',
+      WPU01: 'Farm products',
+      WPUFD49207: 'Finished goods',
+    });
+    for (const id of ids) expect(rows.get(id)?.itemName).toBe(rows.get(id)?.measure);
+    // No table beyond the ones the item and area already read.
+    expect(requested.filter((f) => /^(ap|cw|pc|wp)\./.test(f)).sort()).toEqual([
+      'ap.area',
+      'ap.item',
+      'ap.series',
+      'cw.area',
+      'cw.item',
+      'cw.periodicity',
+      'cw.series',
+      'pc.product',
+      'pc.series',
+      'wp.item',
+      'wp.series',
+    ]);
+    await svc.shutdown();
+  });
+
+  it('decodes the LAUS measure from la.measure on the series measure_code', async () => {
+    const { svc, requested } = await harvestFrom(LA_MEASURE_FILES);
+    const rows = await svc.lookupByIds([
+      'LASST530000000000003',
+      'LASST530000000000008',
+      'LAUCN530330000000003',
+    ]);
+    expect(Object.fromEntries([...rows].map(([id, s]) => [id, s.measure]))).toEqual({
+      LASST530000000000003: 'unemployment rate',
+      LASST530000000000008: 'labor force participation rate',
+      LAUCN530330000000003: 'unemployment rate',
+    });
+    expect(rows.get('LASST530000000000008')).toMatchObject({
+      title: 'Labor Force Participation Rate: Washington (S)',
+      areaName: 'Washington',
+    });
+    expect(rows.get('LAUCN530330000000003')?.areaName).toBe('King County, WA');
+    // The measure is not repeated as the item.
+    for (const s of rows.values()) expect(s).not.toHaveProperty('itemName');
+    expect(requested.filter((f) => f.startsWith('la.')).sort()).toEqual([
+      'la.area',
+      'la.measure',
+      'la.series',
+    ]);
+    await svc.shutdown();
+  });
+
+  it('decodes none where BLS’s API catalog carries no measure (JT, EC)', async () => {
+    const { svc, requested } = await harvestFrom({ ...JT_FILES, ...EC_FILES });
+    const rows = await svc.lookupByIds(['JTS000000000000000JOL', 'ECS10001I']);
+    expect(rows.size).toBe(2);
+    for (const s of rows.values()) expect(s).not.toHaveProperty('measure');
+    // No measure table is fetched for them.
+    expect(requested.filter((f) => /^(jt|ec)\./.test(f) && !f.endsWith('.series')).sort()).toEqual([
+      'ec.compensation',
+      'ec.group',
+      'ec.ownership',
+      'ec.periodicity',
+      'jt.dataelement',
+      'jt.industry',
+      'jt.ratelevel',
+      'jt.sizeclass',
+      'jt.state',
+    ]);
+    await svc.shutdown();
+  });
+
+  it('indexes a cold survey without a measure when its measure table is unavailable', async () => {
+    const { 'ce.datatype': _dropped, ...withoutDatatype } = MEASURE_FILES;
+    const { svc, warnings } = await harvestFrom(withoutDatatype);
+    const rows = await svc.lookupByIds(['CES0000000001', 'LNS14000000']);
+    expect(rows.get('CES0000000001')).toMatchObject({
+      title: 'All employees, thousands, total nonfarm, seasonally adjusted',
+      itemName: 'Total nonfarm',
+    });
+    expect(rows.get('CES0000000001')).not.toHaveProperty('measure');
+    expect(rows.get('LNS14000000')?.measure).toBe('Percent or rate');
+    expect(warnings.filter((w) => w.includes('ce.datatype'))).toEqual([
+      '[bls-labor-mcp-server] Catalog: ce.datatype unavailable (HTTP 404) — its rows index without a measure.\n',
+    ]);
+    await svc.shutdown();
+  });
+
+  it('keeps a warm survey’s rows, measure included, when its measure table is unavailable', async () => {
+    const dbPath = join(tmpDir, 'measure-warm.db');
+    const old = createCatalogStore(dbPath);
+    const prior: CatalogSeries = {
+      seriesId: 'CES0000000001',
+      title: 'Old title',
+      surveyAbbr: 'CE',
+      seasonal: true,
+      measure: 'ALL EMPLOYEES, THOUSANDS',
+    };
+    await old.applyBatch([{ ...toMirrorRow(prior), measure: prior.measure ?? null }], []);
+    await old.writeState({
+      status: 'complete',
+      completedAt: '2020-01-01T00:00:00.000Z',
+      checkpoint: catalogSurveyList(false),
+    });
+    await old.close();
+    const { 'ce.datatype': _dropped, ...withoutDatatype } = MEASURE_FILES;
+    serveLabstat(withoutDatatype);
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
+    await svc.load(1);
+    expect((await svc.lookupByIds([prior.seriesId])).get(prior.seriesId)).toEqual(prior);
+    await svc.shutdown();
   });
 });
 
@@ -3333,11 +5614,11 @@ describe('BlsCatalogService.search — tokens score at word starts (#91)', () =>
       itemName: 'Total nonfarm',
     },
     {
-      seriesId: 'WPUFD49104',
-      title: 'PPI Commodity data for Final demand less foods and energy, not seasonally adjusted',
+      seriesId: 'WPUFD4',
+      title: 'PPI Commodity data for Final demand, not seasonally adjusted',
       surveyAbbr: 'WP',
       seasonal: false,
-      itemName: 'Final demand less foods and energy',
+      itemName: 'Final demand',
     },
     {
       seriesId: 'JTS000000000000000JOL',
@@ -3389,8 +5670,8 @@ describe('BlsCatalogService.search — tokens score at word starts (#91)', () =>
 
   it('never counts a token found only inside another word', async () => {
     const svc = await seedAndLoad(HEADLINES);
-    // "all" sits inside "seasonally"; WPUFD49104 has no other match.
-    expect(await idsFor(svc, 'all', 50)).not.toContain('WPUFD49104');
+    // "all" sits inside "seasonally"; WPUFD4 has no other match.
+    expect(await idsFor(svc, 'all', 50)).not.toContain('WPUFD4');
     // "employ" starts "employees" but sits inside "unemployment".
     const employ = await idsFor(svc, 'employ', 50);
     expect(employ).toContain('CES0000000001');
@@ -3478,6 +5759,44 @@ describe('BlsCatalogService.search — tokens score at word starts (#91)', () =>
     const svc = await seedAndLoad(HEADLINES);
     expect((await idsFor(svc, 'jobs'))[0]).toBe('CES0000000001');
     expect((await idsFor(svc, 'inflation')).slice(0, 2)).toEqual(['CUUR0000SA0', 'CUSR0000SA0']);
+  });
+});
+
+describe('BlsCatalogService.search — the PPI headline is Final demand (#125)', () => {
+  const ppi = (seriesId: string, subject: string, item: string): CatalogSeries => ({
+    seriesId,
+    title: `PPI Commodity data for ${subject}, ${seriesId[2] === 'S' ? '' : 'not '}seasonally adjusted`,
+    surveyAbbr: 'WP',
+    seasonal: seriesId[2] === 'S',
+    itemName: item,
+  });
+  const CORE_PPI = 'Final demand less foods and energy';
+  /** Real 2026-11-01 rows: core PPI seeds first, then finished goods, the final-demand index, and a PC row. */
+  const ROWS: CatalogSeries[] = [
+    ppi('WPUFD49104', CORE_PPI, CORE_PPI),
+    ppi('WPSFD49104', CORE_PPI, CORE_PPI),
+    ppi('WPSFD49207', 'Final demand-Finished goods', 'Finished goods'),
+    ppi('WPUFD49207', 'Final demand-Finished goods', 'Finished goods'),
+    ppi('WPSFD4', 'Final demand', 'Final demand'),
+    ppi('WPUFD4', 'Final demand', 'Final demand'),
+    {
+      seriesId: 'PCU113310113310',
+      title: 'PPI industry data for Logging, not seasonally adjusted',
+      surveyAbbr: 'PC',
+      seasonal: false,
+      itemName: 'Logging',
+    },
+  ];
+  const firstFor = async (svc: BlsCatalogService, query: string) =>
+    (await svc.search(search(query))).series[0]?.seriesId;
+
+  it.each<[string, string[]]>([
+    ['ppi', ['WPUFD4', 'WPSFD4']],
+    ['producer price index', ['WPUFD4', 'WPSFD4']],
+    ['ppi finished goods', ['WPUFD49207', 'WPSFD49207']],
+  ])('leads %j with %j', async (query, answers) => {
+    const svc = await seedAndLoad(ROWS);
+    expect(answers).toContain(await firstFor(svc, query));
   });
 });
 
@@ -3720,5 +6039,507 @@ describe('BlsCatalogService.search — long and repetitive queries (#92)', () =>
     expect(await idsFor(svc, 'all items', area)).toEqual([]);
     // An exact SeriesID still scores before the area gate, as it does for any area.
     expect(await idsFor(svc, 'TEST_ITEMS', area)).toEqual(['TEST_ITEMS']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OEWS SeriesIDs composed from the OE code tables (#119)
+// ---------------------------------------------------------------------------
+
+const SEATTLE_RN_IDS = [
+  'OEUM004266000000029114103',
+  'OEUS530000000000029114103',
+  'OEUN000000000000029114103',
+];
+
+/** One indexed OE row per area, as the opt-in harvest decodes them from `oe.series`. */
+const OE_SERIES = tsv(
+  [
+    'series_id',
+    'seasonal',
+    'areatype_code',
+    'industry_code',
+    'occupation_code',
+    'datatype_code',
+    'state_code',
+    'area_code',
+    'sector_code',
+    'series_title',
+    'footnote_codes',
+    'begin_year',
+    'begin_period',
+    'end_year',
+    'end_period',
+  ],
+  [
+    'OEUM004266000000029114103',
+    'U',
+    'M',
+    '000000',
+    '291141',
+    '03',
+    '53',
+    '0042660',
+    '-',
+    'Hourly mean wage for Registered Nurses in All Industries in Seattle-Tacoma-Bellevue, WA',
+    '',
+    '2025',
+    'A01',
+    '2025',
+    'A01',
+  ],
+  [
+    'OEUN000000000000029114103',
+    'U',
+    'N',
+    '000000',
+    '291141',
+    '03',
+    '00',
+    '0000000',
+    '-',
+    'Hourly mean wage for Registered Nurses in All Industries in the United States',
+    '',
+    '2025',
+    'A01',
+    '2025',
+    'A01',
+  ],
+);
+
+describe('BlsCatalogService — OEWS composition from the OE code tables (#119)', () => {
+  /** Harvest a fresh index at `path` from `files` (one load, every download once). */
+  async function harvestAt(
+    path: string,
+    files: Record<string, string>,
+    includeOes = false,
+  ): Promise<{ svc: BlsCatalogService; requested: string[]; warnings: string[] }> {
+    const served = serveLabstat(files);
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, includeOes);
+    await svc.load(1);
+    return { svc, ...served };
+  }
+
+  const nurses = (opts: { survey?: string; area?: string } = { survey: 'OE', area: 'Seattle' }) =>
+    searchInput('registered nurses hourly mean wage', opts);
+
+  it('harvests the OE code tables by default, never oe.series, and composes under survey OE', async () => {
+    const { svc, requested } = await harvestFrom({ ...JT_FILES, ...OE_TABLE_FILES });
+    expect(requested).toEqual(expect.arrayContaining(['oe.area', 'oe.occupation', 'oe.datatype']));
+    expect(requested.filter((f) => f === 'oe.series' || f.startsWith('oe.data.'))).toEqual([]);
+
+    const result = await svc.search(nurses());
+    expect(result.composed).toBe(true);
+    expect(result.series.slice(0, 3).map((s) => s.seriesId)).toEqual(SEATTLE_RN_IDS);
+    expect(result.series.every((s) => s.composed === true && s.surveyAbbr === 'OE')).toBe(true);
+    expect(result.series[0]).not.toHaveProperty('startYear');
+    await svc.shutdown();
+  });
+
+  it('keeps the stored tables across a restart, and when a later download fails', async () => {
+    const path = join(tmpDir, `oews-${dbCounter++}.db`);
+    const first = await harvestAt(path, { ...JT_FILES, ...OE_TABLE_FILES });
+    await first.svc.shutdown();
+    vi.restoreAllMocks();
+
+    // The other surveys failed, so the restart re-harvests every survey and the
+    // tables; oe.occupation now answers 503 and the stored set stays in force.
+    const files: Record<string, string> = { ...JT_FILES, ...OE_TABLE_FILES };
+    const warnings: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      warnings.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const file = String(url).slice(String(url).lastIndexOf('/') + 1);
+      if (file === 'oe.occupation') return Promise.resolve(new Response('busy', { status: 503 }));
+      const body = files[file];
+      return Promise.resolve(
+        body === undefined ? new Response('', { status: 404 }) : new Response(body),
+      );
+    });
+    const restarted = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    await restarted.load(1);
+    expect(warnings.join('')).toContain(
+      'OE code tables not refreshed (oe.occupation: HTTP 503) — the stored tables are kept;',
+    );
+    const result = await restarted.search(nurses());
+    expect(result.series.slice(0, 3).map((s) => s.seriesId)).toEqual(SEATTLE_RN_IDS);
+    await restarted.shutdown();
+  });
+
+  it('keeps a structurally unusable table set out, keeping the stored one', async () => {
+    const { svc, warnings } = await harvestFrom({
+      ...JT_FILES,
+      ...OE_TABLE_FILES,
+      'oe.area': '<html><body>Access Denied</body></html>\n',
+    });
+    expect(warnings.join('')).toContain(
+      'OE code tables not refreshed (a table lacks a required column or has no usable rows) — the stored tables are kept;',
+    );
+    const result = await svc.search(nurses());
+    expect(result.composed).toBeUndefined();
+    expect(result.total).toBe(0);
+    await svc.shutdown();
+  });
+
+  it('composes nothing while no tables are stored', async () => {
+    const { svc } = await harvestFrom(JT_FILES);
+    const result = await svc.search(nurses());
+    expect(result).toEqual({ series: [], total: 0, capped: false });
+    await svc.shutdown();
+  });
+
+  it('returns no composed row for an unscoped query, but decodes an exact OE SeriesID', async () => {
+    const { svc } = await harvestFrom({ ...JT_FILES, ...OE_TABLE_FILES });
+    const unscoped = await svc.search(nurses({}));
+    expect(unscoped.composed).toBeUndefined();
+    expect(unscoped.series.filter((s) => s.composed)).toEqual([]);
+
+    const exact = await svc.search(searchInput('OEUM004266000000029114103'));
+    expect(exact.series.map((s) => [s.seriesId, s.composed])).toEqual([
+      ['OEUM004266000000029114103', true],
+    ]);
+    const unknown = await svc.search(searchInput('OEUM009999900000029114103'));
+    expect(unknown.series).toEqual([]);
+    expect(unknown.composed).toBeUndefined();
+    await svc.shutdown();
+  });
+
+  it('serves only indexed OE rows, composing nothing, once the opt-in has indexed OE', async () => {
+    const { svc } = await harvestFrom(
+      { ...JT_FILES, ...OE_TABLE_FILES, 'oe.series': OE_SERIES },
+      { includeOes: true },
+    );
+    expect(svc.indexedSurveys).toContain('OE');
+    const result = await svc.search(nurses());
+    expect(result.composed).toBeUndefined();
+    expect(result.series.map((s) => [s.seriesId, s.composed])).toEqual([
+      ['OEUM004266000000029114103', undefined],
+    ]);
+    const exact = await svc.search(searchInput('OEUS530000000000029114103', { survey: 'OE' }));
+    expect(exact.series).toEqual([]);
+    await svc.shutdown();
+  });
+
+  it('composes under the opt-in while its OE harvest has indexed no rows', async () => {
+    const { svc } = await harvestFrom({ ...JT_FILES, ...OE_TABLE_FILES }, { includeOes: true });
+    expect(svc.indexedSurveys).not.toContain('OE');
+    const result = await svc.search(nurses());
+    expect(result.series.slice(0, 3).map((s) => s.seriesId)).toEqual(SEATTLE_RN_IDS);
+    await svc.shutdown();
+  });
+
+  it('requests each OE code table once when the opt-in OE harvest already read it', async () => {
+    const path = join(tmpDir, `oews-reuse-${dbCounter++}.db`);
+    const { svc, requested } = await harvestAt(
+      path,
+      { ...JT_FILES, ...OE_TABLE_FILES, 'oe.series': OE_SERIES },
+      true,
+    );
+    expect(svc.indexedSurveys).toContain('OE');
+    expect(requested.filter((f) => f.startsWith('oe.')).sort()).toEqual([
+      'oe.area',
+      'oe.datatype',
+      'oe.occupation',
+      'oe.series',
+    ]);
+    expect(svc.storedOewsTables?.areas.get('0042660')?.name).toBe('Seattle-Tacoma-Bellevue, WA');
+    await svc.shutdown();
+    vi.restoreAllMocks();
+
+    // The reused bodies were stored: a restart whose downloads all fail still holds them.
+    serveLabstat({});
+    const restarted = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, true);
+    await restarted.load(1);
+    expect(restarted.storedOewsTables?.areas.get('0042660')?.name).toBe(
+      'Seattle-Tacoma-Bellevue, WA',
+    );
+    await restarted.shutdown();
+  });
+
+  it('re-harvests a fresh version-4 index once, gaining the tables (CATALOG_INDEX_VERSION bump)', async () => {
+    const path = join(tmpDir, `v4-${dbCounter++}.db`);
+    const v4 = sqliteMirrorStore({
+      path,
+      version: 4,
+      table: 'bls_catalog',
+      primaryKey: 'series_id',
+      columns: {
+        series_id: 'TEXT',
+        title: 'TEXT',
+        survey_abbr: 'TEXT',
+        area_name: 'TEXT',
+        item_name: 'TEXT',
+        seasonal: 'INTEGER',
+        frequency: 'TEXT',
+        start_year: 'INTEGER',
+        end_year: 'INTEGER',
+        end_period: 'TEXT',
+      },
+      fts: ['series_id', 'title', 'area_name', 'item_name'],
+      indexes: [{ columns: ['survey_abbr'] }, { columns: ['seasonal'] }],
+    });
+    await v4.applyBatch(
+      [toMirrorRow({ seriesId: 'JTOLD', title: 'Old', surveyAbbr: 'JT', seasonal: true })],
+      [],
+    );
+    await v4.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      total: 1,
+      checkpoint: catalogSurveyList(false),
+    });
+    await v4.close();
+
+    const { svc, requested } = await harvestAt(path, { ...JT_FILES, ...OE_TABLE_FILES });
+    expect(requested).toEqual(expect.arrayContaining(['jt.series', 'oe.area']));
+    const result = await svc.search(nurses());
+    expect(result.series[0]?.seriesId).toBe(SEATTLE_RN_IDS[0]);
+    await svc.shutdown();
+  });
+});
+
+describe('BlsCatalogService.load — the OE code tables on the refresh schedule (#119)', () => {
+  const HOUR = 3_600_000;
+  const T0 = Date.parse('2026-10-01T00:00:00Z');
+  const OE_FILES = Object.keys(OE_TABLE_FILES);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Serve every configured survey one decodable row and the OE tables from the
+   * fixtures, except the files `failing` names (HTTP 503) — mutable between
+   * checks. A `.series` body is built a microtask after its request, by which
+   * time its survey's table requests have named every key column.
+   */
+  function serveCatalog(): { requested: string[]; lines: string[]; failing: Set<string> } {
+    const requested: string[] = [];
+    const lines: string[] = [];
+    const failing = new Set<string>();
+    const keys = new Set([
+      'industry_code',
+      'product_code',
+      'group_code',
+      'item_code',
+      'comp_code',
+      'data_type_code',
+    ]);
+    const row = (columns: string[]) => columns.map(() => 'x').join('\t');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      const file = String(url).slice(String(url).lastIndexOf('/') + 1);
+      requested.push(file);
+      if (failing.has(file)) return new Response('busy', { status: 503 });
+      const oe = OE_TABLE_FILES[file];
+      if (oe !== undefined) return new Response(oe);
+      const [abbr = '', table = ''] = file.split('.');
+      if (table !== 'series') {
+        keys.add(`${table}_code`);
+        const header = [...keys];
+        return new Response(`${header.join('\t')}\tlabel_text\n${row(header)}\tDecoded\n`);
+      }
+      await Promise.resolve();
+      const header = [...keys];
+      return new Response(
+        `series_id\tseries_title\tseasonal\t${header.join('\t')}\n${abbr.toUpperCase()}NEW\tSeries ${abbr}\tS\t${row(header)}\n`,
+      );
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    return { requested, lines, failing };
+  }
+
+  async function check(svc: BlsCatalogService, requested: string[]): Promise<string[]> {
+    const before = requested.length;
+    await svc.load(1);
+    return requested.slice(before);
+  }
+
+  async function stateOf(path: string) {
+    const store = createCatalogStore(path);
+    const state = await store.readState();
+    await store.close();
+    return state;
+  }
+
+  it('retries failed tables alone with backoff, without holding the index incomplete', async () => {
+    const path = join(tmpDir, `oe-sched-${dbCounter++}.db`);
+    const { requested, lines, failing } = serveCatalog();
+    failing.add('oe.datatype');
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    await svc.load(1); // check 1: every survey and the tables; the tables fail
+    expect(svc.indexedSurveys.length).toBeGreaterThan(0);
+    expect((await stateOf(path)).status).toBe('complete');
+    expect(lines.filter((l) => l.includes('OE code tables'))).toEqual([
+      '[bls-labor-mcp-server] Catalog: OE code tables not refreshed (oe.datatype: HTTP 503) — the stored tables are kept; next retry at the next hourly check.\n',
+    ]);
+
+    expect((await check(svc, requested)).sort()).toEqual([...OE_FILES].sort()); // check 2
+    expect(await check(svc, requested)).toEqual([]); // check 3: backing off
+    failing.clear();
+    expect((await check(svc, requested)).sort()).toEqual([...OE_FILES].sort()); // check 4
+    expect(await stateOf(path)).toMatchObject({ status: 'complete' });
+    expect(await check(svc, requested)).toEqual([]);
+    const composed = await svc.search(
+      searchInput('registered nurses hourly mean wage', { survey: 'OE', area: 'Seattle' }),
+    );
+    expect(composed.series[0]?.seriesId).toBe('OEUM004266000000029114103');
+    await svc.shutdown();
+  });
+
+  it('refreshes the tables with the index when the TTL lapses, and seeds them current on restart', async () => {
+    const path = join(tmpDir, `oe-ttl-${dbCounter++}.db`);
+    const { requested } = serveCatalog();
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    await svc.load(1);
+    expect(await stateOf(path)).toMatchObject({ status: 'complete' });
+    expect(await check(svc, requested)).toEqual([]);
+    await svc.shutdown();
+
+    const restarted = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    expect(await check(restarted, requested)).toEqual([]);
+    vi.setSystemTime(T0 + 169 * HOUR);
+    const lapsed = await check(restarted, requested);
+    expect(lapsed).toEqual(expect.arrayContaining([...OE_FILES, 'jt.series']));
+    await restarted.shutdown();
+  });
+});
+
+describe('BlsCatalogService.searchCoverage (#121)', () => {
+  const ROWS: CatalogSeries[] = [
+    { seriesId: 'CES0000000001', title: 'All employees', surveyAbbr: 'CE', seasonal: true },
+    { seriesId: 'CES0500000001', title: 'Total private', surveyAbbr: 'CE', seasonal: true },
+    { seriesId: 'CUUR0000SA0', title: 'All items', surveyAbbr: 'CU', seasonal: false },
+    { seriesId: 'LNS14000000', title: 'Unemployment rate', surveyAbbr: 'LN', seasonal: true },
+  ];
+
+  /**
+   * An index holding `rows` whose stored harvest is incomplete, so the first
+   * check retries everything: LABSTAT serves `files` and 404s the rest.
+   */
+  async function loadWith(rows: CatalogSeries[], files: Record<string, string>) {
+    const path = join(tmpDir, `coverage-${dbCounter++}.db`);
+    const store = createCatalogStore(path);
+    await store.applyBatch(rows.map(toMirrorRow), []);
+    await store.writeState({ status: 'error', total: rows.length });
+    await store.close();
+    const served = serveLabstat(files);
+    const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', path, 168, false);
+    await svc.load(1);
+    return { svc, path, ...served };
+  }
+
+  it('marks indexed surveys with their counts, OE composed, and every other survey none', async () => {
+    const { svc } = await loadWith(ROWS, OE_TABLE_FILES);
+    expect(svc.searchCoverage('CE')).toEqual({ searchCoverage: 'indexed', seriesIndexed: 2 });
+    expect(svc.searchCoverage('cu')).toEqual({ searchCoverage: 'indexed', seriesIndexed: 1 });
+    expect(svc.searchCoverage('LN')).toEqual({ searchCoverage: 'indexed', seriesIndexed: 1 });
+    expect(svc.searchCoverage('OE')).toEqual({ searchCoverage: 'composed' });
+    expect(svc.searchCoverage('EN')).toEqual({ searchCoverage: 'none' });
+    await svc.shutdown();
+  });
+
+  it('marks OE none while no tables are stored', async () => {
+    const { svc } = await loadWith(ROWS, {});
+    expect(svc.searchCoverage('OE')).toEqual({ searchCoverage: 'none' });
+    await svc.shutdown();
+  });
+
+  it('reports nothing before the first load completes', async () => {
+    serveLabstat({});
+    const svc = new BlsCatalogService(
+      LABSTAT_URL,
+      'ua/1.0',
+      join(tmpDir, `cold-${dbCounter++}.db`),
+    );
+    expect(svc.searchCoverage('CE')).toBeUndefined();
+    const loading = svc.load(1);
+    expect(svc.searchCoverage('CE')).toBeUndefined();
+    await loading;
+    await svc.shutdown();
+  });
+
+  it('marks every survey none, OE included, over a loaded but empty index', async () => {
+    const { svc } = await harvestFrom(OE_TABLE_FILES);
+    expect(svc.readiness.status).toBe('unavailable');
+    expect(svc.searchCoverage('OE')).toEqual({ searchCoverage: 'none' });
+    expect(svc.searchCoverage('CE')).toEqual({ searchCoverage: 'none' });
+    await svc.shutdown();
+  });
+
+  it('keeps a failed survey indexed with its stored count, and updates counts after a harvest', async () => {
+    const { svc } = await loadWith(ROWS, { ...OE_TABLE_FILES, ...JT_FILES });
+    // CE's refresh 404ed: its two stored rows remain, and JT's harvest added eleven.
+    expect(svc.searchCoverage('CE')).toEqual({ searchCoverage: 'indexed', seriesIndexed: 2 });
+    expect(svc.searchCoverage('JT')).toEqual({ searchCoverage: 'indexed', seriesIndexed: 11 });
+    expect(svc.indexedSurveys).toEqual(['CE', 'CU', 'JT', 'LN']);
+    await svc.shutdown();
+  });
+
+  it('reads cached counts: a call runs no catalog query', async () => {
+    const { svc } = await loadWith(ROWS, OE_TABLE_FILES);
+    const store = (svc as unknown as { store: ReturnType<typeof createCatalogStore> }).store;
+    const spies = (['raw', 'count', 'query', 'getByIds', 'readState'] as const).map((m) =>
+      vi.spyOn(store, m),
+    );
+    for (const abbr of ['CE', 'OE', 'EN', 'JT']) svc.searchCoverage(abbr);
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    await svc.shutdown();
+  });
+});
+
+describe('unpublishedOewsHint (#119)', () => {
+  const METRO = 'OEUM004266000000029114103';
+  const LEAD = 'BLS leaves many OEWS occupation–area cells unpublished; request';
+  const TAIL = 'for the same occupation and data type.';
+
+  /** Initialize the catalog singleton over a fresh index harvested from `files`. */
+  async function initFrom(files: Record<string, string>): Promise<void> {
+    vi.stubEnv('BLS_CATALOG_DB_PATH', join(tmpDir, `hint-${dbCounter++}.db`));
+    resetServerConfig();
+    serveLabstat(files);
+    initBlsCatalogService({} as AppConfig, {} as StorageService);
+    await getBlsCatalogService().load(1);
+  }
+
+  afterEach(async () => {
+    await shutdownBlsCatalogService();
+    vi.unstubAllEnvs();
+    resetServerConfig();
+  });
+
+  it('names the national row alone while the catalog is not initialized', () => {
+    expect(unpublishedOewsHint(METRO)).toBe(
+      `${LEAD} the national row OEUN000000000000029114103 ${TAIL}`,
+    );
+  });
+
+  it('names the state row, then the national row, once the catalog stores the OE code tables', async () => {
+    await initFrom({ ...JT_FILES, ...OE_TABLE_FILES });
+    expect(unpublishedOewsHint(METRO)).toBe(
+      `${LEAD} the state row OEUS530000000000029114103 or the national row OEUN000000000000029114103 ${TAIL}`,
+    );
+  });
+
+  it('names the national row alone when the initialized catalog stores no tables', async () => {
+    await initFrom(JT_FILES);
+    expect(getBlsCatalogService().storedOewsTables).toBeUndefined();
+    expect(unpublishedOewsHint(METRO)).toBe(
+      `${LEAD} the national row OEUN000000000000029114103 ${TAIL}`,
+    );
+  });
+
+  it('has none for a national OEWS ID, a subnational-only data type at state level, or another survey', () => {
+    expect(unpublishedOewsHint('OEUN000000000000029114103')).toBeUndefined();
+    expect(unpublishedOewsHint('OEUS530000000000029114116')).toBeUndefined();
+    expect(unpublishedOewsHint('LNS14000000')).toBeUndefined();
   });
 });

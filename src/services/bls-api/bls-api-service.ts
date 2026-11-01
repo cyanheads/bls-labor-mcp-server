@@ -40,13 +40,18 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { getBlsCatalogService } from '@/services/bls-catalog/bls-catalog-service.js';
+import {
+  getBlsCatalogService,
+  unpublishedOewsHint,
+} from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
 import {
+  type BlsObservationsService,
   getBlsObservationsService,
   isBlsObservationsServiceReady,
 } from '@/services/bls-observations/bls-observations-service.js';
 import type { ObservationRow } from '@/services/bls-observations/types.js';
+import { periodName } from '@/services/bls-periods/period-codes.js';
 import type {
   BlsApiResponse,
   BlsSurveysResponse,
@@ -206,15 +211,20 @@ function describeLiveFailure(error: unknown): NonNullable<SeriesData['liveFailur
   };
 }
 
-/** Title, area, item, and seasonality as the catalog index records them. */
+/**
+ * Title, area, item, measure, and seasonality as the catalog index records
+ * them. The index holds a `measure` only where its survey's code table
+ * reproduces BLS's `measure_data_type`.
+ */
 function catalogFields(
   match: CatalogSeries | undefined,
-): Pick<SeriesData, 'area' | 'item' | 'seasonal' | 'title'> {
+): Pick<SeriesData, 'area' | 'item' | 'measure' | 'seasonal' | 'title'> {
   if (!match) return {};
   return {
     ...(match.title && { title: match.title }),
     ...(match.areaName && { area: match.areaName }),
     ...(match.itemName && { item: match.itemName }),
+    ...(match.measure && { measure: match.measure }),
     seasonal: match.seasonal ? 'Seasonally Adjusted' : 'Not Seasonally Adjusted',
   };
 }
@@ -228,6 +238,41 @@ async function lookupCatalogMetadata(ids: string[]): Promise<Map<string, Catalog
     return new Map();
   }
   return catalog.isLoaded ? await catalog.lookupByIds(ids) : new Map();
+}
+
+/**
+ * Render a mirror row's `footnote_codes` cell the way the live path renders a
+ * footnote: `code: text` per comma-separated code, in order, with the text from
+ * the survey's footnote table, and a code the table lacks left bare.
+ */
+function decodeFootnotes(cell: string, table: ReadonlyMap<string, string> | undefined): string[] {
+  return cell
+    .split(',')
+    .map((code) => code.trim())
+    .filter(Boolean)
+    .map((code) => {
+      const text = table?.get(code);
+      return text ? `${code}: ${text}` : code;
+    });
+}
+
+/**
+ * Split invalid SeriesIDs into those to re-resolve through bls_search_series
+ * and, for each OEWS ID among them, the state or national row to request
+ * instead (#119): BLS leaves many OEWS occupation–area cells unpublished.
+ */
+function splitOewsFallbacks(invalidIds: readonly string[]): {
+  fallbacks: string[];
+  searchable: string[];
+} {
+  const fallbacks: string[] = [];
+  const searchable: string[] = [];
+  for (const id of invalidIds) {
+    const fallback = unpublishedOewsHint(id);
+    if (fallback) fallbacks.push(`${id}: ${fallback}`);
+    else searchable.push(id);
+  }
+  return { fallbacks, searchable };
 }
 
 /** One BLS advisory about a requested SeriesID. */
@@ -283,7 +328,7 @@ export class BlsApiService {
           ...(options.endYear !== undefined ? { endYear: options.endYear } : {}),
         });
 
-        const resolved = await this.mirrorRowsToSeriesData(mirrorResult.observations);
+        const resolved = await this.mirrorRowsToSeriesData(mirror, mirrorResult.observations);
         const { missedIds } = mirrorResult;
 
         if (missedIds.length > 0) {
@@ -434,7 +479,7 @@ export class BlsApiService {
         const mirrorResult = await mirror.queryLatest([seriesId]);
 
         if (mirrorResult.observations.length > 0) {
-          const seriesList = await this.mirrorRowsToSeriesData(mirrorResult.observations);
+          const seriesList = await this.mirrorRowsToSeriesData(mirror, mirrorResult.observations);
           const found = seriesList.find((s) => s.seriesId === seriesId);
           if (found) return found;
         }
@@ -488,16 +533,23 @@ export class BlsApiService {
 
   /**
    * Convert mirror observation rows to SeriesData, hydrating catalog metadata
-   * (title, area, item, seasonal) from the on-disk catalog index.
+   * (title, area, item, measure, seasonal) from the on-disk catalog index.
    * The LABSTAT data files carry only raw observation values — catalog metadata
    * must be joined from the catalog service's series index. Each series is
    * marked `source: 'mirror'`: the rows carry no BLS calculations, and
    * `bls_get_series` reports as much when calculations were requested.
    *
+   * Each observation takes the live API's shape: `periodName` from the shared
+   * period-code map, and footnote codes decoded against the survey's footnote
+   * table the mirror keeps — read only for series whose rows carry a code.
+   *
    * Series come back in row order and only for IDs the rows cover; the caller
    * lays them out against the request via {@link alignToRequestOrder}.
    */
-  private async mirrorRowsToSeriesData(rows: ObservationRow[]): Promise<SeriesData[]> {
+  private async mirrorRowsToSeriesData(
+    mirror: BlsObservationsService,
+    rows: ObservationRow[],
+  ): Promise<SeriesData[]> {
     // Group rows by series_id, ordered by (year DESC, period DESC)
     const grouped = new Map<string, ObservationRow[]>();
     for (const row of rows) {
@@ -509,22 +561,36 @@ export class BlsApiService {
       list.push(row);
     }
 
-    const metadata = await lookupCatalogMetadata([...grouped.keys()]);
+    const footnotedIds = [...grouped]
+      .filter(([, obsRows]) => obsRows.some((row) => row.footnote_codes))
+      .map(([seriesId]) => seriesId);
+    const [metadata, footnoteTables] = await Promise.all([
+      lookupCatalogMetadata([...grouped.keys()]),
+      footnotedIds.length > 0
+        ? mirror.footnoteTables(footnotedIds)
+        : Promise.resolve(new Map<string, ReadonlyMap<string, string>>()),
+    ]);
 
     const result: SeriesData[] = [];
     for (const [seriesId, obsRows] of grouped) {
+      const footnoteTable = footnoteTables.get(seriesId);
       const observations: Observation[] = obsRows
         .slice()
         .sort((a, b) =>
           a.year !== b.year ? b.year.localeCompare(a.year) : b.period.localeCompare(a.period),
         )
-        .map((row) => ({
-          year: row.year,
-          period: row.period,
-          value: row.value,
-          available: row.value !== '-',
-          ...(row.footnote_codes ? { footnotes: [row.footnote_codes] } : {}),
-        }));
+        .map((row) => {
+          const name = periodName(row.period);
+          const footnotes = decodeFootnotes(row.footnote_codes, footnoteTable);
+          return {
+            year: row.year,
+            period: row.period,
+            value: row.value,
+            available: row.value !== '-',
+            ...(name && { periodName: name }),
+            ...(footnotes.length > 0 && { footnotes }),
+          };
+        });
 
       result.push({
         seriesId,
@@ -942,7 +1008,8 @@ export class BlsApiService {
    * period miss may resolve once the window moves. Only two reasons are
    * declared, so a mixed batch carries the second class in the message and in a
    * recovery hint naming both moves; sending the caller to re-resolve an ID that
-   * is already correct is the failure this replaces.
+   * is already correct is the failure this replaces. An invalid OEWS SeriesID's
+   * hint names the state or national row to request instead of bls_search_series.
    */
   private throwSeriesFailure(
     failures: Map<string, SeriesAdvisory[]>,
@@ -977,21 +1044,34 @@ export class BlsApiService {
       });
     }
 
+    // An OEWS ID is pointed at its state or national row rather than back to search.
+    const { fallbacks, searchable } = splitOewsFallbacks(invalidIds);
+
     if (uncoveredIds.length === 0) {
+      const declared = ctx.recoveryFor('series_not_found');
+      const searchHint =
+        searchable.length > 0 && 'recovery' in declared ? [declared.recovery.hint] : [];
+      const hint = [...searchHint, ...fallbacks].join(' ');
       throw notFound(`BLS API: no requested SeriesID exists.${detail}`, {
         reason: 'series_not_found',
         ...data,
-        ...ctx.recoveryFor('series_not_found'),
+        ...(hint && { recovery: { hint } }),
       });
     }
 
+    const covers = `start_year/end_year to a range ${uncoveredIds.join(', ')} covers.`;
     throw notFound(
       `BLS API: no requested series returned data. Invalid: ${invalidIds.join(', ')}. No data for the requested period: ${uncoveredIds.join(', ')}.${detail}`,
       {
         reason: 'series_not_found',
         ...data,
         recovery: {
-          hint: `Replace ${invalidIds.join(', ')} with a valid SeriesID from bls_search_series, and adjust start_year/end_year to a range ${uncoveredIds.join(', ')} covers.`,
+          hint: [
+            searchable.length > 0
+              ? `Replace ${searchable.join(', ')} with a valid SeriesID from bls_search_series, and adjust ${covers}`
+              : `Adjust ${covers}`,
+            ...fallbacks,
+          ].join(' '),
         },
       },
     );

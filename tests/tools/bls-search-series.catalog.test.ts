@@ -19,14 +19,15 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
 import { blsSearchSeriesTool } from '@/mcp-server/tools/definitions/bls-search-series.tool.js';
 import {
+  catalogSurveyAbbrs,
   catalogSurveyList,
   createCatalogStore,
   getBlsCatalogService,
   initBlsCatalogService,
-  SURVEY_ABBRS,
   shutdownBlsCatalogService,
 } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
+import { OE_TABLE_FILES } from '../services/bls-catalog/oews-fixtures.js';
 
 /** `initBlsCatalogService` takes the core handles positionally and reads neither. */
 const coreConfig = {} as AppConfig;
@@ -44,6 +45,7 @@ interface SearchStructured {
   series: Array<{
     seriesId: string;
     area?: string;
+    composed?: boolean;
     frequency?: string;
     startYear?: number;
     endYear?: number;
@@ -546,21 +548,72 @@ describe('bls_search_series over a seeded catalog', () => {
     });
   });
 
+  describe('area codes and states (#110)', () => {
+    const FRAGMENT_NOTICE =
+      'The all-digit area is not an area-code length, so it matched as a substring of the area name, title, or SeriesID. Area codes are 2 digits (state FIPS), 3 (CSA), 4 (CPI area), 5 (county FIPS or CBSA), or 7 (state + place FIPS); a USPS code such as TX also names a state.';
+
+    it('resolves a state FIPS code to the state on both surfaces, with no notice', async () => {
+      const { structured, text } = await call({ query: 'unemployment rate', area: '53' });
+      // Not the decoys and CPS test rows whose SeriesIDs hold 53.
+      expect(ids(structured).sort()).toEqual([
+        'LASST530000000000003',
+        'LAUCT536300000000003',
+        'LAUMT534266000000003',
+      ]);
+      expect(structured.areaFilter).toBe('53');
+      expect(structured.notice).toBeUndefined();
+      for (const id of ids(structured)) expect(text).toContain(id);
+      expect(text).toContain('Washington');
+      expect(text).not.toContain('all-digit area');
+    });
+
+    it('notes an all-digit fragment ahead of the next-page guidance, after the clamp', async () => {
+      const { structured, text } = await call({
+        query: 'unemployment rate',
+        area: '9',
+        limit: 500,
+      });
+      expect(structured.nextOffset).toBe(50);
+      const guidance = `Requested limit=500; applied limit=50. ${FRAGMENT_NOTICE} Showing results 1–50 of ${structured.totalCount}. Pass offset: 50 for the next page.`;
+      expect(structured.notice).toBe(guidance);
+      expect(text).toContain(guidance);
+    });
+
+    it('notes an all-digit fragment ahead of the no-match guidance', async () => {
+      const { structured, text } = await call({ query: 'unemployment rate', area: '123456' });
+      expect(structured.series).toEqual([]);
+      const notice = `${FRAGMENT_NOTICE} No matching series found. Try removing the survey/area/seasonal filter or broadening the query.`;
+      expect(structured.notice).toBe(notice);
+      expect(text).toContain(notice);
+    });
+
+    it('notes an all-digit fragment on its own when the page ends a complete list', async () => {
+      const { structured, text } = await call({ query: 'all items', survey: 'CU', area: '9' });
+      expect(ids(structured)).toEqual(['CUURS49DSA0']);
+      expect(structured.nextOffset).toBeUndefined();
+      expect(structured.notice).toBe(FRAGMENT_NOTICE);
+      expect(text).toContain(FRAGMENT_NOTICE);
+    });
+  });
+
   describe('advertised survey codes (#64)', () => {
-    const codes = new Set(SURVEY_ABBRS.map((a) => a.toUpperCase()));
+    const codes = new Set(catalogSurveyAbbrs(true).map((a) => a.toUpperCase()));
     const surveyDescription =
       blsSearchSeriesTool.input.shape.survey.description ?? '(missing .describe())';
 
     it.each([
       ['tool description', blsSearchSeriesTool.description],
       ['survey .describe()', surveyDescription],
-    ])('the %s names no code outside SURVEY_ABBRS and qualifies OE as opt-in', (_, text) => {
+    ])('the %s names no code outside the catalog surveys and qualifies OE as opt-in', (_, text) => {
       const named = [...text.matchAll(/\b[A-Z]{2}\b/g)].map((m) => m[0]);
       const surveyCodes = named.filter((c) => !['ID', 'US'].includes(c));
       expect(surveyCodes.length).toBeGreaterThan(0);
       expect(surveyCodes.filter((c) => !codes.has(c))).toEqual([]);
       expect(text).toMatch(/OE[^.]*BLS_CATALOG_INCLUDE_OES=true/);
-      expect(text).toContain('CW, CM, CI;');
+      // Every default-indexed survey, the catalog-only ones included (#120).
+      expect(text).toContain(
+        'CU, AP, CE, LN, LA, PC, WP, JT, EC, PR, MP, CW, CM, CI, SM, LE, EI, SU, IP, BD, LU, EE;',
+      );
     });
   });
 });
@@ -644,6 +697,111 @@ describe('bls_search_series — geographic preference (#98)', () => {
     const past = await call({ query: 'Seattle unemployment rate', offset: structured.totalCount });
     expect(past.structured.series).toEqual([]);
     expect(past.text).toContain(`Offset ${structured.totalCount} is past the last`);
+  });
+});
+
+describe('bls_search_series — a place word alone never outranks a real match (#105)', () => {
+  const rows: CatalogSeries[] = [
+    {
+      seriesId: 'LAUCN550990000000003',
+      title: 'Unemployment Rate: Price County, WI (U)',
+      surveyAbbr: 'LA',
+      seasonal: false,
+      areaName: 'Price County, WI',
+    },
+    {
+      seriesId: 'APU0000708111',
+      title:
+        'Eggs, grade A, large, per doz. in U.S. city average, average price, not seasonally adjusted',
+      surveyAbbr: 'AP',
+      seasonal: false,
+      areaName: 'U.S. city average',
+      itemName: 'Eggs, grade A, large, per doz.',
+    },
+  ];
+  beforeAll(() => startService({}, rows));
+  afterAll(() => stopService());
+
+  it('orders both surfaces with the matching series first', async () => {
+    const { structured, text } = await call({ query: 'price of eggs' });
+    expect(ids(structured)).toEqual(['APU0000708111', 'LAUCN550990000000003']);
+    expect(text.indexOf('**APU0000708111**')).toBeGreaterThan(-1);
+    expect(text.indexOf('**APU0000708111**')).toBeLessThan(
+      text.indexOf('**LAUCN550990000000003**'),
+    );
+  });
+});
+
+describe('bls_search_series — currency and the JOLTS aggregate break equal-score ties (#122)', () => {
+  /** Real 2026-11-01 rows; the breakdown and the ended twin seed first, leading on candidate order alone. */
+  const rows: CatalogSeries[] = [
+    {
+      seriesId: 'JTS230000000000000QUR',
+      title: 'JOLTS - Quits - Construction - Total US - All size classes - Rate',
+      surveyAbbr: 'JT',
+      seasonal: true,
+      areaName: 'Total US',
+      startYear: 2000,
+      endYear: 2026,
+    },
+    {
+      seriesId: 'JTS000000000000000QUR',
+      title: 'JOLTS - Quits - Total nonfarm - Total US - All size classes - Rate',
+      surveyAbbr: 'JT',
+      seasonal: true,
+      areaName: 'Total US',
+      startYear: 2000,
+      endYear: 2026,
+    },
+    {
+      seriesId: 'WPS017',
+      title: 'PPI Commodity data for Farm products-Chicken eggs, seasonally adjusted',
+      surveyAbbr: 'WP',
+      seasonal: true,
+      itemName: 'Chicken eggs',
+      startYear: 1967,
+      endYear: 2012,
+    },
+    {
+      seriesId: 'WPU017',
+      title: 'PPI Commodity data for Farm products-Chicken eggs, not seasonally adjusted',
+      surveyAbbr: 'WP',
+      seasonal: false,
+      itemName: 'Chicken eggs',
+      startYear: 1926,
+      endYear: 2026,
+    },
+  ];
+  beforeAll(() => startService({}, rows));
+  afterAll(() => stopService());
+
+  const inOrder = (text: string, order: string[]) => {
+    const at = order.map((id) => text.indexOf(`**${id}**`));
+    expect(at.every((i) => i > -1)).toBe(true);
+    expect(at).toEqual([...at].sort((a, b) => a - b));
+  };
+
+  it('puts the JOLTS aggregate first on both surfaces', async () => {
+    const { structured, text } = await call({ query: 'quits rate', survey: 'JT' });
+    expect(ids(structured)).toEqual(['JTS000000000000000QUR', 'JTS230000000000000QUR']);
+    inOrder(text, ids(structured));
+  });
+
+  it('ranks the ended twin last on both surfaces, keeping its snapshot coverage and no other label', async () => {
+    const { structured, text } = await call({ query: 'eggs' });
+    expect(ids(structured)).toEqual(['WPU017', 'WPS017']);
+    inOrder(text, ids(structured));
+    expect(structured.series[1]).toEqual({
+      seriesId: 'WPS017',
+      title: 'PPI Commodity data for Farm products-Chicken eggs, seasonally adjusted',
+      survey: 'WP',
+      item: 'Chicken eggs',
+      seasonal: 'Seasonally Adjusted',
+      startYear: 1967,
+      endYear: 2012,
+    });
+    expect(text).toContain('Coverage: 1967–2012');
+    expect(text).not.toMatch(/discontinu|ended/i);
   });
 });
 
@@ -861,5 +1019,181 @@ describe('bls_search_series with the OES opt-in on but no OE rows indexed (#64)'
     expect(structured.notice).toBe(
       `Survey OE has no series in the offline catalog index (indexed: ${INDEXED}). Use bls_list_surveys for valid codes; series in other surveys are fetchable by SeriesID via bls_get_series.`,
     );
+  });
+});
+
+/**
+ * The seeded index holds no OE rows and its stored harvest ended in error, so
+ * the first check re-harvests: every survey download fails (the seeded rows are
+ * kept) and LABSTAT serves the three OE code tables, which the search composes
+ * OEWS SeriesIDs from.
+ */
+describe('bls_search_series — OEWS SeriesIDs composed from the OE code tables (#119)', () => {
+  const COMPOSED =
+    'These OEWS SeriesIDs are composed from the OE code tables, not read from the index, so each is unconfirmed: BLS leaves many occupation–area cells unpublished. One bls_get_series call checks them all; where it reports a metro or state ID nonexistent, request the state or national row for the same occupation and data type.';
+  const STOPPED =
+    'Composition stops at 50 rows, so other occupation, area, and data type combinations may also match; name the occupation, area, or data type more precisely to reach them.';
+  const NURSES = { query: 'registered nurses hourly mean wage', survey: 'OE', area: 'Seattle' };
+  const SEEDED = [...CU_ROWS, ...CE_ROWS];
+
+  beforeAll(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'bls-search-oews-'));
+    const dbPath = join(tmpDir, 'catalog.db');
+    await seedCatalog(dbPath, SEEDED);
+    const store = createCatalogStore(dbPath);
+    await store.writeState({ status: 'error', total: SEEDED.length });
+    await store.close();
+    resetServerConfig();
+    vi.stubEnv('BLS_CATALOG_DB_PATH', dbPath);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = String(url);
+      const body = OE_TABLE_FILES[u.slice(u.lastIndexOf('/') + 1)];
+      return body === undefined
+        ? Promise.reject(new Error('unmocked fetch'))
+        : Promise.resolve(new Response(body));
+    });
+    initBlsCatalogService(coreConfig, coreStorage);
+    await getBlsCatalogService().load(1);
+  });
+  afterAll(() => stopService());
+
+  it('kept the seeded rows and stored the OE code tables', () => {
+    expect(getBlsCatalogService().totalSeries).toBe(SEEDED.length);
+    expect(getBlsCatalogService().storedOewsTables).toBeDefined();
+  });
+
+  it('answers the acceptance query with the Seattle row, then its state and national rows', async () => {
+    const { structured, text } = await call(NURSES);
+    expect(ids(structured).slice(0, 3)).toEqual([
+      'OEUM004266000000029114103',
+      'OEUS530000000000029114103',
+      'OEUN000000000000029114103',
+    ]);
+    expect(structured.series.slice(0, 3)).toEqual([
+      {
+        seriesId: 'OEUM004266000000029114103',
+        title:
+          'Hourly mean wage for Registered Nurses in All Industries in Seattle-Tacoma-Bellevue, WA',
+        survey: 'OE',
+        area: 'Seattle-Tacoma-Bellevue, WA',
+        item: 'Registered Nurses',
+        seasonal: 'Not Seasonally Adjusted',
+        composed: true,
+      },
+      {
+        seriesId: 'OEUS530000000000029114103',
+        title: 'Hourly mean wage for Registered Nurses in All Industries in Washington',
+        survey: 'OE',
+        area: 'Washington',
+        item: 'Registered Nurses',
+        seasonal: 'Not Seasonally Adjusted',
+        composed: true,
+      },
+      {
+        seriesId: 'OEUN000000000000029114103',
+        title: 'Hourly mean wage for Registered Nurses in All Industries in the United States',
+        survey: 'OE',
+        area: 'National',
+        item: 'Registered Nurses',
+        seasonal: 'Not Seasonally Adjusted',
+        composed: true,
+      },
+    ]);
+    expect(structured.series.every((s) => s.composed === true)).toBe(true);
+    expect(structured).toMatchObject({
+      totalCount: 15,
+      capped: false,
+      nextOffset: 10,
+      truncated: true,
+      surveyFilter: 'OE',
+      areaFilter: 'Seattle',
+    });
+    expect(structured.notice).toBe(
+      `Showing results 1–10 of 15. Pass offset: 10 for the next page. ${COMPOSED}`,
+    );
+    const row = text.split('\n').find((line) => line.includes('OEUM004266000000029114103'));
+    expect(row).toContain('· composed (unconfirmed)');
+    expect(
+      text.split('\n').filter((line) => line.includes('· composed (unconfirmed)')),
+    ).toHaveLength(10);
+    expect(text).toContain('so each is unconfirmed');
+  });
+
+  it('ends the list on its last page with the unconfirmed notice alone', async () => {
+    const { structured } = await call({ ...NURSES, offset: 10 });
+    expect(structured.series).toHaveLength(5);
+    expect(structured.nextOffset).toBeUndefined();
+    expect(structured.truncated).toBeUndefined();
+    expect(structured.notice).toBe(COMPOSED);
+  });
+
+  it('prefixes a clamped limit to the composed notice', async () => {
+    const { structured } = await call({ ...NURSES, limit: 60 });
+    expect(structured.series).toHaveLength(15);
+    expect(structured.notice).toBe(`Requested limit=60; applied limit=50. ${COMPOSED}`);
+  });
+
+  it('pages a capped composition to 50 rows and says composition stopped', async () => {
+    const query = { query: 'nurses', survey: 'OE', area: 'Washington', limit: 20 };
+    const pages: SearchStructured[] = [];
+    for (const offset of [0, 20, 40]) pages.push((await call({ ...query, offset })).structured);
+    expect(pages.map((p) => p.series.length)).toEqual([20, 20, 10]);
+    expect(new Set(pages.flatMap(ids)).size).toBe(50);
+    for (const p of pages) expect(p).toMatchObject({ totalCount: 50, capped: true });
+    expect(pages[0]?.notice).toBe(
+      `Showing results 1–20 of 50. Pass offset: 20 for the next page. ${STOPPED} ${COMPOSED}`,
+    );
+    expect(pages[2]?.notice).toBe(`${STOPPED} ${COMPOSED}`);
+    const past = await call({ ...query, offset: 50 });
+    expect(past.structured.series).toEqual([]);
+    expect(past.structured.notice).toBe(
+      'Offset 50 is past the last of 50 results. Pass an offset below 50 (offset 0 is the first page).',
+    );
+  });
+
+  it.each([
+    ['an occupation the tables lack', { query: 'zzzqqq', survey: 'OE' }],
+    ['an area the tables lack', { query: 'registered nurses', survey: 'OE', area: 'Atlantis' }],
+    [
+      'an OEWS SeriesID whose codes the tables lack',
+      { query: 'OEUM009999900000029114103', survey: 'OE' },
+    ],
+  ])('explains an empty composition for %s', async (_, args) => {
+    const { structured, text } = await call(args);
+    expect(structured.series).toEqual([]);
+    expect(structured.totalCount).toBe(0);
+    expect(structured.notice).toBe(
+      'No OEWS SeriesID was composed. Under survey OE the search builds SeriesIDs from the OE code tables, and nothing in them matched: name an occupation as BLS titles it (e.g. "registered nurses"), and give area as a state or metro name, a USPS state code or 2-digit state FIPS, 5-digit CBSA, or 7-digit OEWS area code.',
+    );
+    expect(text).toContain('No series returned.');
+  });
+
+  it('says OEWS publishes no seasonally adjusted series under seasonal_adjustment true', async () => {
+    const { structured } = await call({ ...NURSES, seasonal_adjustment: true });
+    expect(structured.series).toEqual([]);
+    expect(structured.notice).toBe(
+      'OEWS publishes no seasonally adjusted series, so none was composed. Omit seasonal_adjustment or set it to false.',
+    );
+  });
+
+  it('decodes an exact OEWS SeriesID without the survey filter', async () => {
+    const { structured, text } = await call({ query: 'oeus530000000000029114103' });
+    expect(ids(structured)).toEqual(['OEUS530000000000029114103']);
+    expect(structured.series[0]?.composed).toBe(true);
+    expect(structured.notice).toBe(COMPOSED);
+    expect(text).toContain('· composed (unconfirmed)');
+  });
+
+  it('composes nothing for an unscoped query and keeps the indexed notices', async () => {
+    const { structured, text } = await call({ query: 'registered nurses' });
+    expect(structured.series).toEqual([]);
+    expect(structured.notice).toBe(
+      'No matching series found. Try broadening the query, checking spelling, or using a BLS SeriesID directly.',
+    );
+    expect(text).not.toContain('composed');
+    const indexed = await call({ query: 'all items', survey: 'CU' });
+    expect(indexed.structured.series.every((s) => s.composed === undefined)).toBe(true);
+    expect(indexed.text).not.toContain('composed');
   });
 });

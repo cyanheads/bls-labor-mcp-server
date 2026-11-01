@@ -185,10 +185,18 @@ describe('hourly catalog refresh (#84)', () => {
     expect(after.structured.series.map((s) => s.seriesId)).toContain('JTS000000000000000JOL');
     expect(after.text).toContain('JTS000000000000000JOL');
 
-    // 14:00 — JT updated, but the other configured surveys failed: retry next hour.
+    // 14:00 — the other configured surveys failed at 12:00 and retry now (#104);
+    // JT, updated at 13:00, is inside its one-hour TTL, so none of its files is requested.
     requested.length = 0;
     await vi.advanceTimersByTimeAsync(HOUR);
-    expect(requested).toContain('jt.series');
+    const failed = catalogSurveyList(false)
+      .split(',')
+      .filter((abbr) => abbr !== 'jt')
+      .map((abbr) => `${abbr}.series`);
+    await vi.waitFor(() =>
+      expect(requested.filter((f) => f.endsWith('.series')).sort()).toEqual(failed.sort()),
+    );
+    expect(requested.filter((f) => f.startsWith('jt.'))).toEqual([]);
   });
 
   it('starts no second harvest when a tick lands during the boot harvest', async () => {

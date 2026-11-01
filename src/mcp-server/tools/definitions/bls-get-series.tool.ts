@@ -14,6 +14,7 @@ import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { type BatchFetchOptions, getBlsApiService } from '@/services/bls-api/bls-api-service.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
+import { unpublishedOewsHint } from '@/services/bls-catalog/bls-catalog-service.js';
 import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
 import { getCanvasBridge, toDatasetField } from '@/services/canvas-bridge/canvas-bridge.js';
 
@@ -138,7 +139,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
     {
       reason: 'series_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No requested series returned data and at least one SeriesID does not exist. A batch mixing an invalid SeriesID with one BLS has no data for lands here too, and names both in the message and recovery hint.',
+      when: 'No requested series returned data and at least one SeriesID does not exist. A batch mixing an invalid SeriesID with one BLS has no data for lands here too, and names both in the message and recovery hint. For an OEWS SeriesID, usually an occupation–area cell BLS does not publish, the hint names the state or national row to request instead of bls_search_series.',
       thrownBy: 'service',
       recovery: 'Use bls_search_series to find valid SeriesIDs before calling bls_get_series.',
     },
@@ -316,7 +317,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
       .string()
       .optional()
       .describe(
-        "Guidance for agents — names any SeriesID that returned zero observations with its reason (including a failed live fallback's reason and recovery for a SeriesID the local observation mirror does not hold), names mirror-served series that lack requested calculations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.",
+        "Guidance for agents — names any SeriesID that returned zero observations with its reason (including a failed live fallback's reason and recovery for a SeriesID the local observation mirror does not hold, and the state or national row to request for an OEWS SeriesID BLS reports nonexistent), names mirror-served series that lack requested calculations, reports a resolved end_year the 20-year window capped, and reports the bls_dataframe_describe then bls_dataframe_query workflow when results spill to canvas. Absent when every requested series returned data over the window as asked and it all fit inline.",
       ),
   },
 
@@ -487,7 +488,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
         const failure = entry?.failure;
         notices.push(
           failure?.reason === 'series_not_found'
-            ? `BLS reports ${id} is invalid or does not exist. Use bls_search_series to find a valid SeriesID.`
+            ? `BLS reports ${id} is invalid or does not exist. ${unpublishedOewsHint(id) ?? 'Use bls_search_series to find a valid SeriesID.'}`
             : failure?.reason === 'series_omitted'
               ? `BLS omitted ${id} after applying its request limit. Request it separately.`
               : failure?.reason === 'no_data_for_period'

@@ -8,14 +8,16 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { areaForm } from '@/services/bls-catalog/area-filter.js';
 import {
+  catalogSurveyAbbrs,
   getBlsCatalogService,
   OES_SURVEY_ABBR,
-  SURVEY_ABBRS,
 } from '@/services/bls-catalog/bls-catalog-service.js';
+import { OEWS_COMPOSED_LIMIT } from '@/services/bls-catalog/oews-composition.js';
 
-/** The surveys a default deployment indexes, derived from the harvest list. */
-const DEFAULT_SURVEY_CODES = SURVEY_ABBRS.filter((a) => a !== OES_SURVEY_ABBR)
+/** The surveys a default deployment indexes, derived from the catalog's harvest list. */
+const DEFAULT_SURVEY_CODES = catalogSurveyAbbrs(false)
   .map((a) => a.toUpperCase())
   .join(', ');
 
@@ -26,16 +28,25 @@ function normalizeFilter(value: string | undefined): string | undefined {
 
 export const blsSearchSeriesTool = tool('bls_search_series', {
   title: 'Search BLS Series',
-  description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag, and publication frequency for surveys that publish one series at several frequencies) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE only when the server sets BLS_CATALOG_INCLUDE_OES=true); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts state names, MSA names, or FIPS area codes.`,
+  description: `Search the BLS series catalog by natural language query, survey code, geographic area, or keywords to resolve cryptic SeriesIDs. Returns matching series with decoded components (survey, area, item, seasonal flag, and publication frequency for surveys that publish one series at several frequencies) and plain-language names, ranked by relevance and paged with limit and offset. Use this before bls_get_series when you have a concept but not a SeriesID. Operates offline against an index of the major surveys — no API quota consumed. Survey filter accepts the two-letter code of an indexed survey (${DEFAULT_SURVEY_CODES}; OE is indexed only when the server sets BLS_CATALOG_INCLUDE_OES=true, and otherwise composes OEWS SeriesIDs from the OE code tables, marked composed and unconfirmed); series in other surveys are fetched by SeriesID with bls_get_series. Area filter accepts place names, USPS state codes, and FIPS, CBSA, and CPI area codes.`,
   annotations: { readOnlyHint: true, openWorldHint: false },
 
   errors: [
     {
+      reason: 'catalog_loading',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The catalog index holds no series yet and a LABSTAT harvest is building it — at first startup, or while an hourly check retries an empty index.',
+      recovery:
+        'Retry this search shortly; the index answers once the harvest finishes. bls_get_series and bls_get_latest fetch a known SeriesID meanwhile.',
+      retryable: true,
+      severity: 'notice',
+    },
+    {
       reason: 'catalog_unavailable',
       code: JsonRpcErrorCode.InternalError,
-      when: 'The catalog index failed to load at startup.',
+      when: 'The catalog index holds no series and no harvest is running — every LABSTAT download failed, or the load stopped with an error.',
       recovery:
-        'Restart the server to retry catalog loading. Check BLS_CATALOG_BASE_URL if using a custom mirror.',
+        'The hourly catalog check retries the harvest; restart the server to retry now, and check BLS_CATALOG_BASE_URL if it points at a custom mirror. bls_get_series fetches a known SeriesID meanwhile.',
     },
   ],
 
@@ -51,13 +62,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .string()
       .optional()
       .describe(
-        `Two-letter LABSTAT survey abbreviation to filter results, case-insensitive (e.g. CU for CPI, CE for CES, LN for CPS, LA for LAUS, JT for JOLTS). Indexed surveys: ${DEFAULT_SURVEY_CODES}; OE (OEWS) only when the server sets BLS_CATALOG_INCLUDE_OES=true. Omit to search all indexed surveys.`,
+        `Two-letter LABSTAT survey abbreviation to filter results, case-insensitive (e.g. CU for CPI, CE for CES, SM for state and metro CES, LN for CPS, LA for LAUS, JT for JOLTS). Indexed surveys: ${DEFAULT_SURVEY_CODES}; OE (OEWS) is indexed only when the server sets BLS_CATALOG_INCLUDE_OES=true, and without its rows OE composes OEWS SeriesIDs from the OE code tables for the occupation, place, and data type the query and area name, each marked composed. Omit to search all indexed surveys.`,
       ),
     area: z
       .string()
       .optional()
       .describe(
-        'State name, MSA name, or FIPS area code to narrow results to a geographic area — a case-insensitive substring of the area name, title, or SeriesID. Without this filter, specific whole place names in query are relevance preferences; otherwise national series rank first among equal matches.',
+        'Geographic area to narrow results to, case-insensitive. A USPS state code (TX) or 2-digit state FIPS code (48) selects the state: its statewide series, the areas in it (metro areas reaching into it included), and series with no decoded area whose title names it. An all-digit area code selects the area it names in every survey that decodes it: 3 digits a combined statistical area (CSA), 4 a CPI area (0000 is the U.S. city average), 5 a county FIPS or metro area (CBSA) code, 7 a city or town (state + place FIPS); a code naming no indexed area returns no series. Any other value, such as a place name ("Seattle") or a SeriesID fragment ("ST48"), matches as a substring of the area name, title, or SeriesID; another all-digit value does too, with a notice. Under survey OE with no indexed OE rows, area selects the OEWS areas to compose: a USPS state code or 2-digit state FIPS names the state, a 5-digit CBSA or 7-digit OEWS area code (0042660, 5300000) its area, and any other value is a substring of an OEWS area name; each metro or state it names also composes its state and national rows. Without this filter, a place query names in full (every distinctive word of it, e.g. "black hawk") ranks first among the series matching every query word; otherwise, among equal matches, current series rank first, then national ones.',
       ),
     seasonal_adjustment: z
       .boolean()
@@ -122,7 +133,13 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
               .string()
               .optional()
               .describe(
-                'Publication frequency — "Monthly", "Semi-Annual", "Quarterly", or "Annual" — for CU, CW, and LN, which publish one series at several frequencies under the same title. Absent for other surveys.',
+                'Publication frequency — "Monthly", "Semi-Annual", "Quarterly", or "Annual" — for CU, CW, LN, and BD, which publish one series at several frequencies under the same title. Absent for other surveys.',
+              ),
+            composed: z
+              .boolean()
+              .optional()
+              .describe(
+                'True when the SeriesID was composed from the OEWS code tables rather than read from the index: unconfirmed until bls_get_series returns data for it, since BLS leaves many occupation–area cells unpublished. Composed rows carry no coverage years. Absent for indexed series.',
               ),
           })
           .describe('A matching BLS series entry.'),
@@ -149,7 +166,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     capped: z
       .boolean()
       .describe(
-        'True when the FTS candidate pool, after the survey/area/seasonal filters, reached the internal cap (~1000). totalCount is then a lower bound and offset paging stops at the pool. Narrow the query, add filters, or use a direct SeriesID to get an exact count.',
+        'True when the FTS candidate pool, after the survey/area/seasonal filters, reached the internal cap (~1000), or when composing OEWS SeriesIDs stopped at its 50-row cap with combinations left. totalCount is then a lower bound and offset paging stops at the pool. Narrow the query, add filters, or use a direct SeriesID to get an exact count.',
       ),
     catalogSize: z
       .number()
@@ -183,7 +200,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       .string()
       .optional()
       .describe(
-        'Requested and applied limits when clamped, plus guidance on unindexed surveys, offsets past the end, empty results, the next page, or the capped candidate pool. Absent when the limit was unchanged and this page ends an uncapped list with results.',
+        'Requested and applied limits when clamped, and how an all-digit area that is not an area code matched, plus guidance on unindexed surveys, offsets past the end, empty results, the next page, the capped candidate pool, or composed OEWS SeriesIDs, which stay unconfirmed until bls_get_series returns them. Absent when neither applies and this page ends an uncapped list of indexed series.',
       ),
   },
 
@@ -195,17 +212,17 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     });
 
     const service = getBlsCatalogService();
-    if (!service.isLoaded) {
+    const readiness = service.readiness;
+    if (readiness.status === 'loading') {
       throw ctx.fail(
-        'catalog_unavailable',
-        'The BLS series catalog index has not been loaded. Server startup may have failed.',
+        'catalog_loading',
+        'The BLS series catalog index is still being built from the LABSTAT files and holds no series yet.',
       );
     }
-    if (service.totalSeries === 0) {
-      const detail = service.catalogLoadError ? ` ${service.catalogLoadError}` : '';
+    if (readiness.status === 'unavailable') {
       throw ctx.fail(
         'catalog_unavailable',
-        `The BLS series catalog loaded but is empty — all LABSTAT downloads failed at startup.${detail} Check BLS_CATALOG_BASE_URL and restart the server.`,
+        `The BLS series catalog index holds no series and no harvest is running. ${readiness.error}`,
       );
     }
 
@@ -215,7 +232,12 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     const limit = Math.min(input.limit, 50);
     const clampNotice =
       input.limit > limit ? `Requested limit=${input.limit}; applied limit=${limit}. ` : '';
-    const notice = (message: string) => ctx.enrich.notice(`${clampNotice}${message}`);
+    const fragmentNotice =
+      area !== undefined && areaForm(area).kind === 'fragment'
+        ? 'The all-digit area is not an area-code length, so it matched as a substring of the area name, title, or SeriesID. Area codes are 2 digits (state FIPS), 3 (CSA), 4 (CPI area), 5 (county FIPS or CBSA), or 7 (state + place FIPS); a USPS code such as TX also names a state. '
+        : '';
+    const prefix = `${clampNotice}${fragmentNotice}`;
+    const notice = (message: string) => ctx.enrich.notice(`${prefix}${message}`);
     const result = await service.search({
       query: input.query,
       survey,
@@ -243,16 +265,43 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     ctx.enrich.total(total);
     ctx.enrich.echo(input.query);
 
-    // One notice per response — prepend any clamp disclosure to the guidance. A page
-    // with results after it carries next-page guidance; otherwise the
-    // precedence is un-indexed survey, offset past the end, no match, then the
-    // capped-pool note on a last page.
+    // One notice per response — prepend any clamp and all-digit-fragment
+    // disclosure to the guidance. A page with results after it carries
+    // next-page guidance; otherwise the precedence is un-indexed survey,
+    // offset past the end, no match, then the capped-pool note on a last page.
     const range = `results ${offset + 1}–${offset + shown}`;
-    if (nextOffset !== undefined) {
+    if (result.composed) {
+      // OEWS SeriesIDs composed from the OE code tables (#119). OE has no indexed
+      // rows, so the un-indexed-survey branch below must not answer; truncated()
+      // writes the paging fields and notice() the one message, last-wins.
+      if (nextOffset !== undefined) ctx.enrich.truncated({ shown, cap: limit });
+      if (total === 0) {
+        notice(
+          input.seasonal_adjustment
+            ? 'OEWS publishes no seasonally adjusted series, so none was composed. Omit seasonal_adjustment or set it to false.'
+            : 'No OEWS SeriesID was composed. Under survey OE the search builds SeriesIDs from the OE code tables, and nothing in them matched: name an occupation as BLS titles it (e.g. "registered nurses"), and give area as a state or metro name, a USPS state code or 2-digit state FIPS, 5-digit CBSA, or 7-digit OEWS area code.',
+        );
+      } else if (offset >= total) {
+        notice(
+          `Offset ${offset} is past the last of ${total} results. Pass an offset below ${total} (offset 0 is the first page).`,
+        );
+      } else {
+        const paging =
+          nextOffset !== undefined
+            ? `Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page. `
+            : '';
+        const stopped = capped
+          ? `Composition stops at ${OEWS_COMPOSED_LIMIT} rows, so other occupation, area, and data type combinations may also match; name the occupation, area, or data type more precisely to reach them. `
+          : '';
+        notice(
+          `${paging}${stopped}These OEWS SeriesIDs are composed from the OE code tables, not read from the index, so each is unconfirmed: BLS leaves many occupation–area cells unpublished. One bls_get_series call checks them all; where it reports a metro or state ID nonexistent, request the state or national row for the same occupation and data type.`,
+        );
+      }
+    } else if (nextOffset !== undefined) {
       ctx.enrich.truncated({
         shown,
         cap: limit,
-        guidance: `${clampNotice}Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page.`,
+        guidance: `${prefix}Showing ${range} of ${total}. Pass offset: ${nextOffset} for the next page.`,
       });
     } else if (survey !== undefined && !service.indexedSurveys.includes(survey)) {
       const oesHint =
@@ -278,8 +327,8 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       notice(
         `Showing ${range}, the last of ${total} ranked candidates. The candidate pool is capped, so other series may also match. Narrow the query or add survey/area filters to reach them.`,
       );
-    } else if (clampNotice) {
-      ctx.enrich.notice(clampNotice.trim());
+    } else if (prefix) {
+      ctx.enrich.notice(prefix.trim());
     }
 
     return {
@@ -294,6 +343,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
         ...(s.startYear !== undefined ? { startYear: s.startYear } : {}),
         ...(s.endYear !== undefined ? { endYear: s.endYear } : {}),
         ...(s.endPeriod ? { endPeriod: s.endPeriod } : {}),
+        ...(s.composed ? { composed: true } : {}),
       })),
     };
   },
@@ -314,6 +364,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
           `(${[s.seasonal, ...(s.frequency ? [s.frequency] : [])].map(escapeMarkdownInline).join(', ')})`,
         );
       parts.push(`[${s.survey}]`);
+      if (s.composed) parts.push('· composed (unconfirmed)');
       const coverage =
         s.startYear !== undefined && s.endYear !== undefined
           ? `${s.startYear}–${s.endYear}`
