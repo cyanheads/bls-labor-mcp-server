@@ -4,10 +4,13 @@
  * @module tests/services/bls-observations/ingester.test
  */
 
-import type { MirrorLogger, SyncContext } from '@cyanheads/mcp-ts-core/mirror';
+import { readFileSync } from 'node:fs';
+import type { MirrorLogger, SyncContext, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
 import { describe, expect, it, vi } from 'vitest';
 import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
-import { observationsSync } from '@/services/bls-observations/ingester.js';
+import { observationsSync, syncFootnoteTables } from '@/services/bls-observations/ingester.js';
+import type { SyncGaps } from '@/services/bls-observations/types.js';
+import { type FakeLabstat, fakeLabstat } from './labstat-fake.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -19,32 +22,6 @@ const DATA_FILE_CONTENT = [
   'LNS14000000\t2024\tM12\t4.1\t',
   'LNS14000000\t2024\tM11\t4.2\tP',
   'CES0000000001\t2024\tM12\t159367\t',
-].join('\n');
-
-/** Index content listing two data files in the older documentation shape. */
-const INDEX_WITH_TWO_FILES = `
-Name of file:  cu.data.1.AllItems
-Name of file:  cu.data.2.Seasonally Adjusted Average
-`;
-
-/** Index content with no data file references. */
-const INDEX_WITH_NO_FILES = `
-This survey has no observation data files in LABSTAT.
-`;
-
-/** Index that lists a file as a bare name. */
-const INDEX_ALT_FORMAT = `
-cu.data.0.AllData
-`;
-
-/** The `{abbr}.txt` directory index LABSTAT publishes for every survey. */
-const CU_INDEX = [
-  '/pub/time.series/cu/',
-  '',
-  '01/15/2026  08:30 AM        12345 cu.contacts',
-  '01/15/2026  08:30 AM     98765432 cu.data.0.Current',
-  '01/15/2026  08:30 AM    123456789 cu.data.1.AllItems',
-  '01/15/2026  08:30 AM      9876543 cu.series',
 ].join('\n');
 
 /** Data file mixing the BLS '-' sentinel with a malformed empty-value row. */
@@ -87,19 +64,33 @@ function recordingLog(): MirrorLogger & { warnings: string[] } {
   };
 }
 
-/** Serve one index + one data file for every survey; everything else 404s. */
+/** Serve the first survey one data file; everything else 404s. */
 function stubDataFile(content: string): void {
-  vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-    const u = String(url);
-    const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
-    if (u.endsWith('.txt')) {
-      return Promise.resolve(new Response('cu.data.1.AllItems\n', { status: 200, headers }));
+  stubLabstat({ cu: { 'cu.data.1.AllItems': { body: content } } });
+}
+
+const DEFAULT_LAST_MODIFIED = 'Mon, 01 Jan 2024 00:00:00 GMT';
+
+/**
+ * Stub LABSTAT for the given surveys: each survey's directory listing names its
+ * files, and each file answers as described (`Last-Modified` defaults to
+ * {@link DEFAULT_LAST_MODIFIED}). Every other URL 404s. Returns the fake, whose
+ * `requested` lists the URLs asked for, in order.
+ */
+function stubLabstatFake(surveys: FakeLabstat): ReturnType<typeof fakeLabstat> {
+  for (const files of Object.values(surveys)) {
+    for (const [name, file] of Object.entries(files)) {
+      if (name !== '') file.lastModified ??= DEFAULT_LAST_MODIFIED;
     }
-    if (u.includes('.data.')) {
-      return Promise.resolve(new Response(content, { status: 200, headers }));
-    }
-    return Promise.resolve(new Response('', { status: 404 }));
-  });
+  }
+  const fake = fakeLabstat(surveys);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(fake.fetch);
+  return fake;
+}
+
+/** {@link stubLabstatFake}, returning only the requested URLs. */
+function stubLabstat(surveys: FakeLabstat): string[] {
+  return stubLabstatFake(surveys).requested;
 }
 
 /** Drain the first non-empty page and return the rows belonging to one series. */
@@ -121,27 +112,7 @@ async function collectSeriesRows(seriesId: string): Promise<Record<string, unkno
 
 describe('observationsSync — tab-delimited parsing', () => {
   it('parses a well-formed data file into correct ObservationRow fields', async () => {
-    // Mock: index → one file, data file → DATA_FILE_CONTENT
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith('.txt')) {
-        return Promise.resolve(
-          new Response('cu.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
-    });
+    stubDataFile(DATA_FILE_CONTENT);
 
     const ctx = makeCtx();
     const pages: unknown[] = [];
@@ -209,26 +180,7 @@ describe('observationsSync — tab-delimited parsing', () => {
   });
 
   it('handles data files without footnote_codes column', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith('.txt')) {
-        return Promise.resolve(
-          new Response('cu.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_NO_FOOTNOTES, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
-    });
+    stubDataFile(DATA_FILE_NO_FOOTNOTES);
 
     const ctx = makeCtx();
     let records: Record<string, unknown>[] = [];
@@ -248,26 +200,7 @@ describe('observationsSync — tab-delimited parsing', () => {
   });
 
   it('generates composite row_key as series_id|year|period', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith('.txt')) {
-        return Promise.resolve(
-          new Response('cu.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
-    });
+    stubDataFile(DATA_FILE_CONTENT);
 
     const ctx = makeCtx();
     let records: Record<string, unknown>[] = [];
@@ -284,25 +217,10 @@ describe('observationsSync — tab-delimited parsing', () => {
     expect(lnsRow?.row_key).toBe('LNS14000000|2024|M12');
   });
 
-  it('warns on a survey whose index fetch returns 404 and harvests the next one', async () => {
-    // 404 the first survey's index (cu); the second (ap) serves its own.
+  it('warns on a survey whose listing fetch returns 404 and harvests the next one', async () => {
+    // 404 the first survey's listing (cu); the second (ap) serves its own.
     const second = SURVEY_ABBRS[1]!;
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
-      if (u.includes('/cu/')) {
-        return Promise.resolve(new Response('', { status: 404 }));
-      }
-      if (u.endsWith(`/${second}/${second}.txt`)) {
-        return Promise.resolve(
-          new Response(`${second}.data.1.AllItems\n`, { status: 200, headers }),
-        );
-      }
-      if (u.includes(`/${second}/`) && u.includes('.data.')) {
-        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
-    });
+    stubLabstat({ [second]: { [`${second}.data.1.AllItems`]: { body: DATA_FILE_CONTENT } } });
 
     const log = recordingLog();
     const pages: unknown[] = [];
@@ -323,33 +241,14 @@ describe('observationsSync — tab-delimited parsing', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests — index data-file discovery
+// Tests — listing data-file discovery
 // ---------------------------------------------------------------------------
 
-describe('observationsSync — index data-file discovery', () => {
-  /** Run the sync against the cu survey, capturing the data-file URLs fetched. */
-  async function captureDataUrls(index: string, log?: MirrorLogger): Promise<string[]> {
-    const fetchedDataUrls: string[] = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith('/cu/cu.txt')) {
-        return Promise.resolve(
-          new Response(index, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('/cu/') && u.includes('.data.')) {
-        fetchedDataUrls.push(u.toLowerCase());
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
+describe('observationsSync — listing data-file discovery', () => {
+  /** Run the sync against the cu survey's listing, capturing the data-file URLs fetched. */
+  async function captureDataUrls(files: string[], log?: MirrorLogger): Promise<string[]> {
+    const requested = stubLabstat({
+      cu: Object.fromEntries(files.map((name) => [name, { body: DATA_FILE_CONTENT }])),
     });
 
     const ctx = makeCtx();
@@ -358,54 +257,138 @@ describe('observationsSync — index data-file discovery', () => {
       userAgent: 'test-agent',
       ...(log && { log }),
     })) {
-      if (fetchedDataUrls.length >= 2) break; // cu is the first survey
+      // drain
     }
-    return fetchedDataUrls;
+    return requested
+      .filter((u) => u.includes('/cu/') && u.includes('.data.'))
+      .map((u) => u.toLowerCase());
   }
 
-  it('discovers multiple data files from a "Name of file:" index', async () => {
-    const urls = await captureDataUrls(INDEX_WITH_TWO_FILES);
+  it('discovers multiple data files from the listing', async () => {
+    const urls = await captureDataUrls(['cu.data.1.AllItems', 'cu.data.2.Summaries', 'cu.series']);
     expect(urls.some((u) => u.includes('cu.data.1.allitems'))).toBe(true);
     expect(urls.some((u) => u.includes('cu.data.2'))).toBe(true);
   });
 
-  it('warns and fetches nothing when the index lists no data files', async () => {
+  it('warns and fetches nothing when the listing names no data files', async () => {
     // No guessed filename: `{abbr}.data.1.AllData` exists for only some
     // harvested surveys, so requesting it for the rest only 404s.
     const log = recordingLog();
-    const urls = await captureDataUrls(INDEX_WITH_NO_FILES, log);
+    const urls = await captureDataUrls(['cu.series', 'cu.footnote'], log);
     expect(urls).toHaveLength(0);
     expect(log.warnings.some((w) => w.includes('"survey":"cu"'))).toBe(true);
-  });
-
-  it('discovers a bare-filename data file from an alternate index format', async () => {
-    const urls = await captureDataUrls(INDEX_ALT_FORMAT);
-    expect(urls.some((u) => u.includes('cu.data.0.alldata'))).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests — the `{abbr}.txt` index is the only published file list
+// Tests — data files come from the survey's directory listing (#124)
 // ---------------------------------------------------------------------------
 
-describe('observationsSync — {abbr}.txt index (#78)', () => {
-  it('reads the data-file list from the survey index', async () => {
-    // LABSTAT serves no `{abbr}.readme`; the index every survey publishes is
-    // `{abbr}.txt`. Reading the wrong name left 8 of 13 surveys unharvested
-    // while the sync still reported success.
-    const fetched: string[] = [];
+/** A captured LABSTAT fixture under `tests/fixtures/labstat-listings/`. */
+function fixture(name: string): string {
+  return readFileSync(new URL(`../../fixtures/labstat-listings/${name}`, import.meta.url), 'utf8');
+}
+
+/** Non-empty lines of a captured name list. */
+function names(text: string): string[] {
+  return text.split('\n').filter(Boolean);
+}
+
+describe('observationsSync — directory-listing discovery (#124)', () => {
+  /**
+   * Serve one survey the way download.bls.gov did on 2026-11-01: its captured
+   * directory listing, an `{abbr}.txt` naming the files its description
+   * documents, and a data file for each name the listing serves. Everything
+   * else — a documented name the listing lacks included — 404s.
+   */
+  function serveCapturedSurvey(abbr: string): string[] {
+    const listed = new Set(names(fixture(`${abbr}.files`)));
+    const requested: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = String(url);
-      fetched.push(u.toLowerCase());
-      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
-      if (u.endsWith('/cu/cu.txt')) {
-        return Promise.resolve(new Response(CU_INDEX, { status: 200, headers }));
+      const prefix = `https://download.bls.gov/pub/time.series/${abbr}/`;
+      if (!u.startsWith(prefix)) return Promise.resolve(new Response('', { status: 404 }));
+      const name = decodeURIComponent(u.slice(prefix.length));
+      requested.push(name);
+      const headers = { 'Last-Modified': 'Thu, 15 Oct 2026 07:30:00 GMT' };
+      if (name === '') {
+        return Promise.resolve(new Response(fixture(`${abbr}.listing`), { status: 200, headers }));
       }
-      if (u.includes('/cu/') && u.includes('.data.')) {
-        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
+      if (name === `${abbr}.txt`) {
+        return Promise.resolve(new Response(fixture(`${abbr}.stale`), { status: 200, headers }));
       }
-      return Promise.resolve(new Response('', { status: 404 }));
+      return Promise.resolve(
+        listed.has(name)
+          ? new Response(DATA_FILE_CONTENT, { status: 200, headers })
+          : new Response('', { status: 404 }),
+      );
     });
+    return requested;
+  }
+
+  it.each([
+    ['pc', 'every one of 71 files, none of which its description names as served'],
+    ['ce', 'the 10 files its description misnames'],
+    ['wp', 'wp.data.80i.ConstructnInputs, which its description misnames'],
+    ['jt', 'jt.data.8.UnemployedPerJobOpeningRatio, which its description omits'],
+  ])('reads every data file the captured %s listing serves — %s', async (abbr) => {
+    const requested = serveCapturedSurvey(abbr);
+
+    for await (const _page of observationsSync(makeCtx(), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+    })) {
+      // drain
+    }
+
+    const dataRequests = requested.filter((n) => n.toLowerCase().startsWith(`${abbr}.data.`));
+    expect(dataRequests).toEqual(names(fixture(`${abbr}.files`)));
+  });
+
+  it('requests a listed name containing a space URL-encoded, never cut at the space', async () => {
+    const requested = stubLabstat({
+      cu: {
+        'cu.data.1.All Items': { body: DATA_FILE_CONTENT },
+        'cu.series': {},
+        'cu.footnote': {},
+        'cu.dataelement': {},
+      },
+    });
+
+    for await (const _page of observationsSync(makeCtx(), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+    })) {
+      // drain
+    }
+
+    const cuRequests = requested.filter((u) => u.includes('/cu/'));
+    expect(cuRequests).toContain('https://download.bls.gov/pub/time.series/cu/');
+    expect(cuRequests.filter((u) => u.includes('.data'))).toEqual([
+      'https://download.bls.gov/pub/time.series/cu/cu.data.1.All%20Items',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — the directory listing is the file list
+// ---------------------------------------------------------------------------
+
+describe('observationsSync — the directory listing is the file list (#78, #124)', () => {
+  it('reads the data-file list from the survey listing, not its description files', async () => {
+    // LABSTAT serves no `{abbr}.readme`, and the `{abbr}.txt` description names
+    // files the directory does not hold. Reading either left surveys
+    // unharvested while the sync still reported success.
+    const requested = stubLabstat({
+      cu: {
+        'cu.contacts': {},
+        'cu.data.0.Current': { body: DATA_FILE_CONTENT },
+        'cu.data.1.AllItems': { body: DATA_FILE_CONTENT },
+        'cu.series': {},
+        'cu.txt': {},
+      },
+    });
+    const lowered = (): string[] => requested.map((u) => u.toLowerCase());
 
     const log = recordingLog();
     for await (const _page of observationsSync(makeCtx(), {
@@ -413,49 +396,28 @@ describe('observationsSync — {abbr}.txt index (#78)', () => {
       userAgent: 'test-agent',
       log,
     })) {
-      if (fetched.some((u) => u.includes('cu.data.1.allitems'))) break;
+      if (lowered().some((u) => u.includes('cu.data.1.allitems'))) break;
     }
+    const fetched = lowered();
 
-    expect(fetched).toContain('https://download.bls.gov/pub/time.series/cu/cu.txt');
+    expect(fetched).toContain('https://download.bls.gov/pub/time.series/cu/');
     expect(fetched.some((u) => u.includes('cu.data.0.current'))).toBe(true);
     expect(fetched.some((u) => u.includes('cu.data.1.allitems'))).toBe(true);
     expect(fetched.some((u) => u.includes('cu.readme'))).toBe(false);
+    expect(fetched.some((u) => u.endsWith('/cu.txt'))).toBe(false);
   });
 
   it.each([
-    [
-      'cm',
-      [
-        '\tcm.data.1.AllData\t- all estimates\t\t\tdata file',
-        '\tcm.data.0.Current\t- All most recent reference \tdata file',
-        '\t1.  cm.data.0.Current\t- Most recent reference period estimates',
-        '\t2.  cm.data.1.AllData\t- All estimates',
-        'File Name: cm.data.0.Current',
-      ],
-    ],
-    [
-      'ci',
-      [
-        '\tci.data.0.Current\t- all most recent reference ',
-        '\tci.data.1.AllData\t- all estimates\t\t\tdata file',
-        '\t1. ci.data.0.Current\t- All recent reference period estimates',
-        '\t2. ci.data.1.AllData\t- All estimates',
-      ],
-    ],
-  ])('harvests both %s data files its real index lists (#86)', async (abbr, lines) => {
-    const dataUrls: string[] = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      const headers = { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
-      if (u.endsWith(`/${abbr}/${abbr}.txt`)) {
-        return Promise.resolve(new Response(lines.join('\r\n'), { status: 200, headers }));
-      }
-      if (u.includes(`/${abbr}/`) && u.includes('.data.')) {
-        dataUrls.push(u.slice(u.lastIndexOf('/') + 1));
-        return Promise.resolve(new Response(DATA_FILE_CONTENT, { status: 200, headers }));
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
+    ['cm', ['cm.contacts', 'cm.data.0.Current', 'cm.data.1.AllData', 'cm.series']],
+    ['ci', ['ci.contacts', 'ci.data.0.Current', 'ci.data.1.AllData', 'ci.series']],
+  ])('harvests both %s data files its listing serves (#86)', async (abbr, listed) => {
+    const requested = stubLabstat({
+      [abbr]: Object.fromEntries(listed.map((name) => [name, { body: DATA_FILE_CONTENT }])),
     });
+    const dataUrls = (): string[] =>
+      requested
+        .filter((u) => u.includes(`/${abbr}/`) && u.includes('.data.'))
+        .map((u) => u.slice(u.lastIndexOf('/') + 1).toLowerCase());
 
     const pages: Array<{ records: unknown[] }> = [];
     for await (const page of observationsSync(makeCtx(), {
@@ -464,7 +426,7 @@ describe('observationsSync — {abbr}.txt index (#78)', () => {
     })) {
       pages.push(page);
     }
-    expect(dataUrls.sort()).toEqual([`${abbr}.data.0.current`, `${abbr}.data.1.alldata`]);
+    expect(dataUrls().sort()).toEqual([`${abbr}.data.0.current`, `${abbr}.data.1.alldata`]);
     expect(pages.flatMap((p) => p.records)).toHaveLength(6);
   });
 
@@ -500,25 +462,13 @@ describe('observationsSync — {abbr}.txt index (#78)', () => {
 
 describe('observationsSync — cursor and checkpoint', () => {
   it('checkpoint is an ISO 8601 string derived from Last-Modified', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith('.txt')) {
-        return Promise.resolve(
-          new Response('cu.data.1.AllItems\n', {
-            status: 200,
-            headers: { 'Last-Modified': 'Wed, 01 Jan 2025 06:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Wed, 01 Jan 2025 06:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
+    stubLabstat({
+      cu: {
+        'cu.data.1.AllItems': {
+          body: DATA_FILE_CONTENT,
+          lastModified: 'Wed, 01 Jan 2025 06:00:00 GMT',
+        },
+      },
     });
 
     const ctx = makeCtx();
@@ -542,31 +492,33 @@ describe('observationsSync — cursor and checkpoint', () => {
     }
   });
 
+  it('resumes an interrupted init from its survey:file:row cursor', async () => {
+    // `0:1:2` — the first survey, its second data file, past that file's first two rows.
+    const requested = stubLabstat({
+      cu: {
+        'cu.data.0.Current': { body: DATA_FILE_CONTENT },
+        'cu.data.1.AllItems': { body: DATA_FILE_WITH_SENTINEL },
+      },
+    });
+
+    const pages: Array<{ records: Record<string, unknown>[] }> = [];
+    for await (const page of observationsSync(makeCtx({ cursor: '0:1:2' }), {
+      catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+      userAgent: 'test-agent',
+    })) {
+      pages.push(page as { records: Record<string, unknown>[] });
+    }
+
+    expect(requested.some((u) => u.toLowerCase().endsWith('/cu.data.0.current'))).toBe(false);
+    expect(pages.flatMap((p) => p.records).map((r) => r.row_key)).toEqual(['LNS14000000|2024|M09']);
+  });
+
   it('cursor is not emitted on the very last page of the last survey', async () => {
     // Serve only whichever survey is last in SURVEY_ABBRS; all others 404. Read
     // from the list rather than naming a survey, so appending one keeps testing
     // the completion signal instead of silently testing a mid-list survey.
-    const lastAbbr = SURVEY_ABBRS.at(-1);
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
-      const u = String(url);
-      if (u.endsWith(`/${lastAbbr}/${lastAbbr}.txt`)) {
-        return Promise.resolve(
-          new Response(`${lastAbbr}.data.1.AllData\n`, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      if (u.includes(`/${lastAbbr}/`) && u.includes('.data.')) {
-        return Promise.resolve(
-          new Response(DATA_FILE_CONTENT, {
-            status: 200,
-            headers: { 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
-          }),
-        );
-      }
-      return Promise.resolve(new Response('', { status: 404 }));
-    });
+    const lastAbbr = SURVEY_ABBRS.at(-1)!;
+    stubLabstat({ [lastAbbr]: { [`${lastAbbr}.data.1.AllData`]: { body: DATA_FILE_CONTENT } } });
 
     const ctx = makeCtx();
     const pages: Array<{ cursor: string | undefined; records: unknown[] }> = [];
@@ -583,6 +535,282 @@ describe('observationsSync — cursor and checkpoint', () => {
       const lastPage = pages[pages.length - 1]!;
       expect(lastPage.cursor).toBeUndefined();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — the checkpoint advances only after a run reads every listed file (#117)
+// ---------------------------------------------------------------------------
+
+/** Run a sync to completion, returning its pages and the gaps it reports. */
+async function drain(
+  ctx: SyncContext,
+  log?: MirrorLogger,
+): Promise<{ gaps: SyncGaps; pages: SyncPage[] }> {
+  const run = observationsSync(ctx, {
+    catalogBaseUrl: 'https://download.bls.gov/pub/time.series',
+    userAgent: 'test-agent',
+    ...(log && { log }),
+  });
+  const pages: SyncPage[] = [];
+  for (;;) {
+    const step = await run.next();
+    if (step.done) return { gaps: step.value, pages };
+    pages.push(step.value);
+  }
+}
+
+/** {@link drain} under fake timers, so retry backoff and stall timeouts elapse instantly. */
+async function drainWithFakeTimers(
+  ctx: SyncContext,
+  log?: MirrorLogger,
+): Promise<{ gaps: SyncGaps; pages: SyncPage[] }> {
+  vi.useFakeTimers();
+  try {
+    const result = drain(ctx, log);
+    await vi.runAllTimersAsync();
+    return await result;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** A data file holding `count` rows of one series, oldest first. */
+function dataRows(count: number, seriesId = 'LNS14000000'): string {
+  const lines = ['series_id\tyear\tperiod\tvalue\tfootnote_codes'];
+  for (let i = 0; i < count; i++) {
+    lines.push(
+      `${seriesId}\t${1900 + Math.floor(i / 12)}\tM${String((i % 12) + 1).padStart(2, '0')}\t${i}\t`,
+    );
+  }
+  return lines.join('\r\n');
+}
+
+const CU_URL = 'https://download.bls.gov/pub/time.series/cu/cu.data.1.AllItems';
+
+/** Serve every survey a data file holding no rows, then apply `overrides` survey by survey. */
+function allSurveys(overrides: FakeLabstat): FakeLabstat {
+  const quiet = SURVEY_ABBRS.map((abbr) => [
+    abbr,
+    { [`${abbr}.data.1.AllItems`]: { body: 'series_id\tyear\tperiod\tvalue\tfootnote_codes' } },
+  ]);
+  return { ...Object.fromEntries(quiet), ...overrides };
+}
+
+describe('observationsSync — checkpoint and unread files (#117)', () => {
+  it('emits the checkpoint once, on a final empty page after the last survey', async () => {
+    stubLabstat(
+      allSurveys({
+        cu: {
+          'cu.data.1.AllItems': {
+            body: DATA_FILE_CONTENT,
+            lastModified: 'Wed, 01 Jan 2025 06:00:00 GMT',
+          },
+        },
+        ap: {
+          'ap.data.1.AllItems': {
+            body: DATA_FILE_CONTENT,
+            lastModified: 'Sat, 01 Mar 2025 06:00:00 GMT',
+          },
+        },
+      }),
+    );
+
+    const { pages, gaps } = await drain(makeCtx());
+
+    expect(pages.filter((p) => p.checkpoint !== undefined)).toEqual([
+      { records: [], checkpoint: '2025-03-01T06:00:00.000Z' },
+    ]);
+    expect(pages.at(-1)).toEqual({ records: [], checkpoint: '2025-03-01T06:00:00.000Z' });
+    expect(gaps.unreadFiles).toEqual([]);
+  });
+
+  it('holds the checkpoint when a listed data file answers 404, naming it in a warning and in the gaps', async () => {
+    stubLabstat(
+      allSurveys({
+        cu: { 'cu.data.1.AllItems': { status: 404 } },
+        ap: {
+          'ap.data.1.AllItems': {
+            body: DATA_FILE_CONTENT,
+            lastModified: 'Sat, 01 Mar 2025 06:00:00 GMT',
+          },
+        },
+      }),
+    );
+    const log = recordingLog();
+
+    const { pages, gaps } = await drain(makeCtx(), log);
+
+    expect(pages.some((p) => p.checkpoint !== undefined)).toBe(false);
+    expect(pages.flatMap((p) => p.records)).toHaveLength(3);
+    expect(gaps.unreadFiles).toEqual([{ survey: 'cu', url: CU_URL, status: 404 }]);
+    expect(
+      log.warnings.filter((w) => w.includes('"survey":"cu"') && w.includes(`"url":"${CU_URL}"`)),
+    ).toHaveLength(1);
+  });
+
+  it("holds the checkpoint when a survey's directory listing cannot be read", async () => {
+    stubLabstat(
+      allSurveys({
+        cu: { '': { status: 404 } },
+        ap: { 'ap.data.1.AllItems': { body: DATA_FILE_CONTENT } },
+      }),
+    );
+
+    const { pages, gaps } = await drain(makeCtx());
+
+    expect(pages.some((p) => p.checkpoint !== undefined)).toBe(false);
+    expect(gaps.unreadFiles).toEqual([
+      { survey: 'cu', url: 'https://download.bls.gov/pub/time.series/cu/', status: 404 },
+    ]);
+  });
+
+  it('reports a listing with no data files without holding the checkpoint', async () => {
+    // Nothing of that survey was skipped by the checkpoint compare.
+    stubLabstat(
+      allSurveys({
+        cu: { 'cu.series': {} },
+        ap: {
+          'ap.data.1.AllItems': {
+            body: DATA_FILE_CONTENT,
+            lastModified: 'Sat, 01 Mar 2025 06:00:00 GMT',
+          },
+        },
+      }),
+    );
+
+    const { pages, gaps } = await drain(makeCtx());
+
+    expect(pages.at(-1)).toEqual({ records: [], checkpoint: '2025-03-01T06:00:00.000Z' });
+    expect(gaps).toEqual({ surveysWithoutDataFiles: ['cu'], unreadFiles: [] });
+  });
+
+  it('retries a transient failure and reads the file on a later attempt', async () => {
+    const surveys = allSurveys({
+      cu: { 'cu.data.1.AllItems': { body: DATA_FILE_CONTENT, status: 503 } },
+    });
+    const fake = stubLabstatFake(surveys);
+    vi.mocked(globalThis.fetch).mockImplementation(async (url, init) => {
+      const response = await fake.fetch(url as string, init);
+      if (String(url) === CU_URL) delete surveys.cu!['cu.data.1.AllItems']!.status;
+      return response;
+    });
+
+    const { pages, gaps } = await drainWithFakeTimers(makeCtx());
+
+    expect(fake.requested.filter((u) => u === CU_URL)).toHaveLength(2);
+    expect(pages.flatMap((p) => p.records)).toHaveLength(3);
+    expect(gaps.unreadFiles).toEqual([]);
+  });
+
+  it('does not retry an answer that is not transient', async () => {
+    const fake = stubLabstatFake(allSurveys({ cu: { 'cu.data.1.AllItems': { status: 403 } } }));
+
+    const { gaps } = await drainWithFakeTimers(makeCtx());
+
+    expect(fake.requested.filter((u) => u === CU_URL)).toHaveLength(1);
+    expect(gaps.unreadFiles).toEqual([{ survey: 'cu', url: CU_URL, status: 403 }]);
+  });
+
+  it('gives up on a body that stops arriving, after every attempt stalls', async () => {
+    // No whole-response deadline: a body is read for as long as it keeps arriving.
+    const fake = stubLabstatFake(
+      allSurveys({ cu: { 'cu.data.1.AllItems': { body: dataRows(50), stallAfterBytes: 300 } } }),
+    );
+
+    const { pages, gaps } = await drainWithFakeTimers(makeCtx());
+
+    expect(fake.requested.filter((u) => u === CU_URL)).toHaveLength(3);
+    expect(pages.flatMap((p) => p.records)).toHaveLength(0);
+    expect(gaps.unreadFiles).toEqual([
+      { survey: 'cu', url: CU_URL, error: expect.stringContaining('No data') },
+    ]);
+  });
+
+  it('counts a data file without the observation header as unread', async () => {
+    stubLabstat(allSurveys({ cu: { 'cu.data.1.AllItems': { body: '<html>moved</html>\r\n' } } }));
+
+    const { gaps } = await drain(makeCtx());
+
+    expect(gaps.unreadFiles).toEqual([
+      { survey: 'cu', url: CU_URL, error: expect.stringContaining('header') },
+    ]);
+  });
+
+  it('skips a file no newer than the checkpoint on refresh without reading its body', async () => {
+    const fake = stubLabstatFake({
+      cu: {
+        'cu.data.1.AllItems': {
+          body: dataRows(20_000),
+          lastModified: 'Mon, 01 Jan 2024 00:00:00 GMT',
+        },
+      },
+    });
+
+    const { pages } = await drain(
+      makeCtx({ mode: 'refresh', checkpoint: '2025-01-01T00:00:00.000Z' }),
+    );
+
+    expect(pages).toEqual([]);
+    expect(fake.cancelled).toEqual([CU_URL]);
+  });
+
+  it('puts no resume cursor on refresh pages — only an init resumes', async () => {
+    stubLabstat({ cu: { 'cu.data.1.AllItems': { body: dataRows(12_000) } } });
+
+    const { pages } = await drain(makeCtx({ mode: 'refresh' }));
+
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages.every((p) => p.cursor === undefined)).toBe(true);
+  });
+
+  it('stores no checkpoint from a resumed init, which cannot vouch for files read before it', async () => {
+    stubLabstat(
+      allSurveys({
+        cu: { 'cu.data.1.AllItems': { body: DATA_FILE_CONTENT } },
+        ap: { 'ap.data.1.AllItems': { body: DATA_FILE_CONTENT } },
+      }),
+    );
+
+    const { pages } = await drain(makeCtx({ cursor: '0:0:0' }));
+
+    expect(pages.flatMap((p) => p.records)).toHaveLength(6);
+    expect(pages.some((p) => p.checkpoint !== undefined)).toBe(false);
+  });
+
+  it("counts a resumed file's later cursors from the file's first row", async () => {
+    stubLabstat({
+      cu: { 'cu.data.1.AllItems': { body: dataRows(12_000) } },
+      ap: { 'ap.data.1.AllItems': { body: DATA_FILE_CONTENT } },
+    });
+
+    const { pages } = await drain(makeCtx({ cursor: '0:0:5000' }));
+
+    expect(pages.map((p) => [p.records.length, p.cursor])).toEqual([
+      [5_000, '0:0:10000'],
+      [2_000, '1:0:0'],
+      [3, '2:0:0'],
+    ]);
+    expect(pages[0]!.records[0]).toMatchObject({ year: '2316', period: 'M09' });
+  });
+
+  it('ignores a Last-Modified header that is not a date', async () => {
+    stubLabstat(
+      allSurveys({
+        cu: { 'cu.data.1.AllItems': { body: DATA_FILE_CONTENT, lastModified: 'yesterday' } },
+        ap: {
+          'ap.data.1.AllItems': {
+            body: DATA_FILE_CONTENT,
+            lastModified: 'Sat, 01 Mar 2025 06:00:00 GMT',
+          },
+        },
+      }),
+    );
+
+    const { pages } = await drain(makeCtx());
+
+    expect(pages.flatMap((p) => p.records)).toHaveLength(6);
+    expect(pages.at(-1)?.checkpoint).toBe('2025-03-01T06:00:00.000Z');
   });
 });
 
@@ -616,6 +844,145 @@ describe('observationsSync — cancellation', () => {
 
     // Should have yielded 0 pages (aborted immediately)
     expect(pages.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — footnote code tables (#118)
+// ---------------------------------------------------------------------------
+
+describe('syncFootnoteTables (#118)', () => {
+  const BASE = 'https://download.bls.gov/pub/time.series';
+  const CU_FOOTNOTE_URL = `${BASE}/cu/cu.footnote`;
+  const CI_T = 'No units were initiated this reference period.';
+  const CI_U =
+    'See Footnote U on <a href="/eci/overview/eci-labstat-footnotes.htm#U" target="new">www.bls.gov/eci/overview/eci-labstat-footnotes.htm</a>.';
+
+  /** Run the footnote pass, returning each table it saved by survey, in save order. */
+  async function syncTables(
+    log?: MirrorLogger,
+    signal = AbortSignal.timeout(5_000),
+  ): Promise<Map<string, ReadonlyMap<string, string>>> {
+    const saved = new Map<string, ReadonlyMap<string, string>>();
+    await syncFootnoteTables(
+      { catalogBaseUrl: BASE, userAgent: 'test-agent', ...(log && { log }) },
+      (survey, footnotes) => {
+        saved.set(survey, footnotes);
+        return Promise.resolve();
+      },
+      signal,
+    );
+    return saved;
+  }
+
+  /** {@link syncTables} under fake timers, so retry backoff elapses instantly. */
+  async function syncTablesWithFakeTimers(
+    log?: MirrorLogger,
+  ): Promise<Map<string, ReadonlyMap<string, string>>> {
+    vi.useFakeTimers();
+    try {
+      const result = syncTables(log, new AbortController().signal);
+      await vi.runAllTimersAsync();
+      return await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it('reads the table of every mirrored survey, naming none', async () => {
+    const fake = stubLabstatFake(
+      Object.fromEntries(
+        SURVEY_ABBRS.map((abbr) => [
+          abbr,
+          {
+            [`${abbr}.footnote`]: {
+              body: `footnote_code\tfootnote_text\r\nP\t${abbr} preliminary\r\n`,
+            },
+          },
+        ]),
+      ),
+    );
+
+    const saved = await syncTables();
+
+    expect([...saved.keys()]).toEqual([...SURVEY_ABBRS]);
+    for (const abbr of SURVEY_ABBRS) {
+      expect(saved.get(abbr)).toEqual(new Map([['P', `${abbr} preliminary`]]));
+    }
+    expect(fake.requested).toEqual(SURVEY_ABBRS.map((abbr) => `${BASE}/${abbr}/${abbr}.footnote`));
+  });
+
+  it('keeps each code’s text byte for byte, dropping CRLF line ends and blank lines', async () => {
+    stubLabstat({
+      cu: {
+        'cu.footnote': {
+          body: `footnote_code\tfootnote_text\r\nT\t${CI_T}\r\n\r\nU\t${CI_U}\r\n   \r\n`,
+        },
+      },
+    });
+
+    const saved = await syncTables();
+
+    expect(saved.get('cu')).toEqual(
+      new Map([
+        ['T', CI_T],
+        ['U', CI_U],
+      ]),
+    );
+  });
+
+  it('saves an empty table when the survey’s table lists no codes', async () => {
+    stubLabstat({ cu: { 'cu.footnote': { body: 'footnote_code\tfootnote_text\r\n' } } });
+
+    const saved = await syncTables();
+
+    expect(saved.get('cu')).toEqual(new Map());
+  });
+
+  it('saves nothing and stays quiet for a survey that publishes no table', async () => {
+    // EC serves no ec.footnote: a 404 is its normal answer, not a failure.
+    stubLabstat({ ec: {} });
+    const log = recordingLog();
+
+    const saved = await syncTables(log);
+
+    expect(saved.size).toBe(0);
+    expect(log.warnings).toEqual([]);
+  });
+
+  it('retries a transient failure, then warns and saves nothing, keeping the stored copy', async () => {
+    const fake = stubLabstatFake({ cu: { 'cu.footnote': { status: 503 } } });
+    const log = recordingLog();
+
+    const saved = await syncTablesWithFakeTimers(log);
+
+    expect(fake.requested.filter((u) => u === CU_FOOTNOTE_URL)).toHaveLength(3);
+    expect(saved.has('cu')).toBe(false);
+    expect(log.warnings).toEqual([
+      expect.stringContaining(`"survey":"cu","url":"${CU_FOOTNOTE_URL}","status":503`),
+    ]);
+  });
+
+  it('warns and saves nothing for a body that is not a footnote table', async () => {
+    stubLabstat({ cu: { 'cu.footnote': { body: '<html>moved</html>\r\n' } } });
+    const log = recordingLog();
+
+    const saved = await syncTables(log);
+
+    expect(saved.has('cu')).toBe(false);
+    expect(log.warnings).toEqual([
+      expect.stringContaining('No footnote_code/footnote_text header line'),
+    ]);
+  });
+
+  it('rethrows the caller’s cancellation rather than skipping the table', async () => {
+    const controller = new AbortController();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      controller.abort(new Error('Aborted by SIGTERM'));
+      return Promise.reject(controller.signal.reason);
+    });
+
+    await expect(syncTables(undefined, controller.signal)).rejects.toThrow('Aborted by SIGTERM');
   });
 });
 

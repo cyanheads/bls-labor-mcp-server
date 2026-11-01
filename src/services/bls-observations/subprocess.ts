@@ -16,6 +16,11 @@
  *     exits on {@link runObservationsChildSync}'s code. `--init` runs the full
  *     harvest; anything else runs an incremental refresh.
  *
+ * Exit codes: 0 — the sync completed and read every listed file; 2
+ * ({@link DEGRADED_EXIT_CODE}) — it completed, but left listed files unread or
+ * found surveys listing none; 1 — it failed or was aborted. Either way short of
+ * 0, the next scheduled run re-reads what was missed.
+ *
  * @module services/bls-observations/subprocess
  */
 
@@ -35,6 +40,9 @@ const SIGKILL_GRACE_MS = 30_000;
 
 /** Default child timeout: 2 hours — large surveys take time. */
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+/** Exit code of a sync that completed with listed files unread or surveys listing none. */
+export const DEGRADED_EXIT_CODE = 2;
 
 /** Tracks the in-flight child so overlapping cron ticks are no-ops. */
 let activeChild: ChildProcess | undefined;
@@ -109,6 +117,11 @@ export function runObservationsSubprocess(opts: {
     child.on('exit', (code, signal) => {
       if (code === 0) {
         log.info?.('Observations subprocess completed', { code });
+      } else if (code === DEGRADED_EXIT_CODE) {
+        log.warning?.(
+          'Observations subprocess completed with gaps; the next run re-reads the files it missed',
+          { code },
+        );
       } else if (timedOut) {
         log.error?.('Observations subprocess terminated on timeout', { code, signal });
       } else {
@@ -218,8 +231,10 @@ function isMainEntry(): boolean {
  * out so the SQLite handle is closed rather than dropped by `process.exit`.
  *
  * `--init` selects the full harvest; anything else is an incremental refresh.
- * Ordinary failures — an unusable configuration, a rejected sync — resolve to
- * exit code 1 rather than throwing.
+ * The sync writes its own records — the runner's and each unread file — through
+ * `log`. A sync that completes with gaps resolves to
+ * {@link DEGRADED_EXIT_CODE}; ordinary failures — an unusable configuration, a
+ * rejected or aborted sync — resolve to exit code 1 rather than throwing.
  */
 export async function runObservationsChildSync(
   args: readonly string[],
@@ -228,7 +243,7 @@ export async function runObservationsChildSync(
 ): Promise<number> {
   const mode: SyncMode = args.includes('--init') ? 'init' : 'refresh';
   try {
-    initBlsObservationsService();
+    initBlsObservationsService(log);
     if (!isBlsObservationsServiceReady()) {
       log.warning?.(
         'Observations mirror not enabled (BLS_OBSERVATIONS_MIRROR_ENABLED=false); exiting',
@@ -236,14 +251,19 @@ export async function runObservationsChildSync(
       return 0;
     }
 
-    const result = await getBlsObservationsService().runSync({ mode, signal });
-    log.info?.('Observations sync complete', {
-      pagesFetched: result.pagesFetched,
-      recordsApplied: result.recordsApplied,
-      tombstonesApplied: result.tombstonesApplied,
-      total: result.total,
+    const { unreadFiles, surveysWithoutDataFiles, ...counters } =
+      await getBlsObservationsService().runSync({ mode, signal });
+    if (unreadFiles.length === 0 && surveysWithoutDataFiles.length === 0) {
+      log.info?.('Observations sync complete', counters);
+      return 0;
+    }
+    log.warning?.('Observations sync completed with gaps', {
+      ...counters,
+      unreadFiles: unreadFiles.length,
+      surveysWithoutDataFiles,
+      checkpointHeld: unreadFiles.length > 0,
     });
-    return 0;
+    return DEGRADED_EXIT_CODE;
   } catch (err: unknown) {
     log.error?.('Observations sync failed', {
       error: err instanceof Error ? err.message : String(err),

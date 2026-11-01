@@ -6,7 +6,9 @@
  * `BLS_OBSERVATIONS_MIRROR_ENABLED=true`. Requires a one-time bootstrap before
  * serving mirror traffic. Falls back to the live BLS API when not ready (or when
  * a requested series has no mirror rows) unless
- * `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`.
+ * `BLS_OBSERVATIONS_MIRROR_FALLBACK_LIVE=false`. Beside the rows, the store
+ * keeps each survey's footnote code table, read on every sync, so callers can
+ * decode the codes the rows carry.
  * @module services/bls-observations/bls-observations-service
  */
 
@@ -18,17 +20,21 @@ import {
   type MirrorRunOptions,
   type MirrorStatus,
   type QueryFilter,
+  type SyncContext,
+  type SyncPage,
   type SyncResult,
   sqliteMirrorStore,
 } from '@cyanheads/mcp-ts-core/mirror';
-import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
-import { observationsSync } from './ingester.js';
-import type { MirrorSeriesResult, ObservationRow } from './types.js';
+import { type IngesterOptions, observationsSync, syncFootnoteTables } from './ingester.js';
+import type { MirrorSeriesResult, ObservationRow, SyncGaps } from './types.js';
 
 /** Re-export MirrorRunOptions for callers (subprocess.ts). */
 export type { MirrorRunOptions };
+
+/** A completed sync's counters, with what it did not cover. */
+export type ObservationsSyncResult = SyncResult & SyncGaps;
 
 // ---------------------------------------------------------------------------
 // Latest-observation ordering
@@ -58,27 +64,6 @@ function isLaterObservation(row: ObservationRow, existing: ObservationRow): bool
 }
 
 // ---------------------------------------------------------------------------
-// Ingester logging
-// ---------------------------------------------------------------------------
-
-/**
- * Sink for the ingester's own records — the same framework logger the mirror
- * runner writes to. A harvest runs outside the request pipeline (cron job or
- * CLI script), so each call wraps its metadata in a fresh `RequestContext`, the
- * shape the framework logger expects.
- */
-const INGESTER_LOG: MirrorLogger = {
-  warning: (message, meta) =>
-    logger.warning(
-      message,
-      requestContextService.createRequestContext({
-        operation: 'bls-observations-sync',
-        ...(meta && { additionalContext: meta }),
-      }),
-    ),
-};
-
-// ---------------------------------------------------------------------------
 // Schema migrations
 // ---------------------------------------------------------------------------
 
@@ -100,21 +85,71 @@ const MIRROR_SENTINEL_BACKFILL: Migration = {
   },
 };
 
+/**
+ * Drop the high-water mark, and an interrupted init's resume cursor, so the
+ * next run reads every data file the survey directory listings name.
+ *
+ * Data files come from each survey's directory listing, no longer from its
+ * `{abbr}.txt` description, which misnamed or omitted many of them (all 71 of
+ * PC's, ten of CE's, one each of WP's and JT's). A mirror synced before that
+ * holds a checkpoint newer than those files, and a refresh skips every file no
+ * newer than it — without this, each would arrive only when BLS next republishes
+ * it. A resume cursor indexes the old file list, so resuming from it could skip
+ * a file or start one partway through; an init without a cursor starts over.
+ * Stored rows stay (a re-read upserts them) and the completion marker is
+ * untouched, so the mirror keeps serving while it re-reads.
+ */
+const MIRROR_LISTING_DISCOVERY_RESET: Migration = {
+  version: 3,
+  up: (handle) => {
+    handle.exec('UPDATE mirror_sync_state SET checkpoint = NULL, cursor = NULL');
+  },
+};
+
+/**
+ * Each survey's `{abbr}.footnote` code table, replaced on every sync and decoded
+ * into observations at read time. The rows store only codes, so keeping the
+ * text beside them needs no backfill, and BLS's rewording reaches every row on
+ * the next sync whether or not a data file changed.
+ */
+const MIRROR_FOOTNOTE_TABLE: Migration = {
+  version: 4,
+  up: (handle) => {
+    handle.exec(`CREATE TABLE IF NOT EXISTS bls_footnotes (
+      survey TEXT NOT NULL,
+      code TEXT NOT NULL,
+      text TEXT NOT NULL,
+      PRIMARY KEY (survey, code)
+    ) WITHOUT ROWID`);
+  },
+};
+
+/** The survey a SeriesID belongs to: BLS SeriesIDs open with the survey's two-letter code. */
+function surveyOf(seriesId: string): string {
+  return seriesId.slice(0, 2).toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
 // Service class
 // ---------------------------------------------------------------------------
 
 export class BlsObservationsService {
   private readonly mirror: Mirror;
-  private readonly catalogBaseUrl: string;
-  private readonly userAgent: string;
+  private readonly ingester: IngesterOptions;
+  /** Gaps the last completed sync reported; `defineMirror` runs one sync at a time. */
+  private lastGaps: SyncGaps | undefined;
 
-  constructor(mirrorPath: string, catalogBaseUrl: string, userAgent: string) {
-    this.catalogBaseUrl = catalogBaseUrl;
-    this.userAgent = userAgent;
+  /**
+   * `log` receives the sync's records — the runner's and the ingester's. The
+   * sync subprocess passes its stdout logger; a server that only queries the
+   * mirror passes none, and the runner falls back to the framework logger.
+   */
+  constructor(mirrorPath: string, catalogBaseUrl: string, userAgent: string, log?: MirrorLogger) {
+    this.ingester = { catalogBaseUrl, userAgent, ...(log && { log }) };
 
     this.mirror = defineMirror({
       name: 'bls-observations',
+      ...(log && { logger: log }),
       store: sqliteMirrorStore({
         path: mirrorPath,
         table: 'bls_observations',
@@ -129,21 +164,85 @@ export class BlsObservationsService {
         },
         fts: [], // no FTS — queries are series_id-filtered point lookups
         indexes: [{ columns: ['series_id', 'year', 'period'] }],
-        version: 2,
-        migrations: [MIRROR_SENTINEL_BACKFILL],
+        version: 4,
+        migrations: [
+          MIRROR_SENTINEL_BACKFILL,
+          MIRROR_LISTING_DISCOVERY_RESET,
+          MIRROR_FOOTNOTE_TABLE,
+        ],
       }),
-      sync: (ctx) =>
-        observationsSync(ctx, {
-          catalogBaseUrl: this.catalogBaseUrl,
-          userAgent: this.userAgent,
-          log: INGESTER_LOG,
-        }),
+      sync: (ctx) => this.harvest(ctx),
     });
   }
 
-  /** Run a sync (init or refresh). Resolves when complete. */
-  runSync(options: MirrorRunOptions): Promise<SyncResult> {
-    return this.mirror.runSync(options);
+  /**
+   * One sync run: replace the footnote tables, then run the ingester, keeping
+   * the gaps it returns for {@link runSync}.
+   */
+  private async *harvest(ctx: SyncContext): AsyncGenerator<SyncPage> {
+    await syncFootnoteTables(
+      this.ingester,
+      (survey, footnotes) => this.saveFootnotes(survey, footnotes),
+      ctx.signal,
+    );
+    this.lastGaps = yield* observationsSync(ctx, this.ingester);
+  }
+
+  /** Replace one survey's stored footnote table. */
+  private async saveFootnotes(
+    survey: string,
+    footnotes: ReadonlyMap<string, string>,
+  ): Promise<void> {
+    const db = await this.mirror.raw();
+    db.transaction(() => {
+      db.prepare('DELETE FROM bls_footnotes WHERE survey = ?').run(survey);
+      const insert = db.prepare('INSERT INTO bls_footnotes (survey, code, text) VALUES (?, ?, ?)');
+      for (const [code, text] of footnotes) insert.run(survey, code, text);
+    });
+  }
+
+  /**
+   * Footnote text by code, keyed by series ID, for each of `seriesIds` whose
+   * survey has a stored table. The table is the survey's — a SeriesID names its
+   * survey in its first two letters — so a survey added to the harvest decodes
+   * with no change here. A series whose survey publishes no table, or whose
+   * table no sync has read yet, is absent: its codes stay bare.
+   */
+  async footnoteTables(seriesIds: string[]): Promise<Map<string, ReadonlyMap<string, string>>> {
+    const surveys = [...new Set(seriesIds.map(surveyOf))];
+    const db = await this.mirror.raw();
+    const rows = db
+      .prepare<{ code: string; survey: string; text: string }>(
+        `SELECT survey, code, text FROM bls_footnotes WHERE survey IN (${surveys.map(() => '?').join(', ')})`,
+      )
+      .all(...surveys);
+
+    const bySurvey = new Map<string, Map<string, string>>();
+    for (const { survey, code, text } of rows) {
+      let table = bySurvey.get(survey);
+      if (!table) {
+        table = new Map();
+        bySurvey.set(survey, table);
+      }
+      table.set(code, text);
+    }
+    return new Map(
+      seriesIds.flatMap((id): Array<[string, ReadonlyMap<string, string>]> => {
+        const table = bySurvey.get(surveyOf(id));
+        return table ? [[id, table]] : [];
+      }),
+    );
+  }
+
+  /**
+   * Run a sync (init or refresh). Resolves when complete, with the listing and
+   * data files it could not read and the surveys that listed none.
+   */
+  async runSync(options: MirrorRunOptions): Promise<ObservationsSyncResult> {
+    const result = await this.mirror.runSync(options);
+    const gaps = this.lastGaps;
+    if (!gaps) throw new Error('Observations sync completed without reporting its gaps');
+    return { ...result, ...gaps };
   }
 
   /** True once a full sync has ever completed. */
@@ -258,11 +357,12 @@ let _service: BlsObservationsService | undefined;
 
 /**
  * Construct the mirror service from server configuration, or no-op when the
- * mirror is switched off. Takes no arguments: every input the mirror needs comes
- * from `getServerConfig()`, which lets the sync subprocess — which holds neither
- * core handle — call it the same way `setup()` does.
+ * mirror is switched off. Every input the mirror needs comes from
+ * `getServerConfig()`, which lets the sync subprocess — which holds neither
+ * core handle — call it the same way `setup()` does. The subprocess, which runs
+ * the syncs, passes the logger they write through.
  */
-export function initBlsObservationsService(): void {
+export function initBlsObservationsService(log?: MirrorLogger): void {
   const cfg = getServerConfig();
   if (!cfg.observationsMirrorEnabled) {
     // Not enabled — don't create the mirror store (avoids opening SQLite on startup).
@@ -272,6 +372,7 @@ export function initBlsObservationsService(): void {
     cfg.observationsMirrorPath,
     cfg.catalogBaseUrl,
     cfg.userAgent,
+    log,
   );
 }
 
