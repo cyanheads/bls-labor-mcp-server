@@ -4,10 +4,11 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsSearchSeriesTool } from '@/mcp-server/tools/definitions/bls-search-series.tool.js';
 import type { CatalogReadiness } from '@/services/bls-catalog/types.js';
+import { quotedText, readBack } from '../fixtures/markdown-read-back.js';
 
 const MOCK_SERIES = [
   {
@@ -397,5 +398,57 @@ describe('blsSearchSeriesTool — composed OEWS rows (#119)', () => {
     expect(indexed.result.series[0]).not.toHaveProperty('composed');
     expect(indexed.notice).toBeUndefined();
     expect(indexed.text).not.toContain('composed');
+  });
+});
+
+describe('blsSearchSeriesTool — SeriesIDs read back from content[] (#133)', () => {
+  const IP = 'IPUAN311___W200000000';
+
+  beforeEach(() => {
+    mockReadiness = { status: 'ready' };
+    mockTotalSeries = 847000;
+  });
+
+  function contentText(result: { content: Array<{ type: string; text?: string }> }): string {
+    return result.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
+  }
+
+  it('renders a row’s SeriesID as a code span that reads back as BLS writes it', async () => {
+    mockSearch.mockResolvedValueOnce({
+      series: [{ seriesId: IP, title: 'Labor productivity', surveyAbbr: 'IP', seasonal: false }],
+      total: 1,
+      capped: false,
+    });
+    const result = await runToolContract(
+      blsSearchSeriesTool,
+      { query: 'productivity' },
+      { context: { errors: blsSearchSeriesTool.errors } },
+    );
+
+    expect(result.structuredContent).toMatchObject({ series: [{ seriesId: IP }] });
+    const row = readBack(contentText(result)).find((block) => block.codeSpans.includes(IP));
+    expect(row?.text).toBe(`${IP} — Labor productivity (Not Seasonally Adjusted) [IP]`);
+    expect(contentText(result)).toContain(`**\`${IP}\`**`);
+  });
+
+  it.each([
+    { survey: IP, codeSpans: [IP] },
+    { survey: '*a*_b_', codeSpans: [] },
+  ])('quotes the notice escaped, $survey reading back as sent', async ({ survey, codeSpans }) => {
+    mockSearch.mockResolvedValueOnce({ series: [], total: 0, capped: false });
+    const result = await runToolContract(
+      blsSearchSeriesTool,
+      { query: 'productivity', survey },
+      { context: { errors: blsSearchSeriesTool.errors } },
+    );
+
+    const { notice } = result.structuredContent as { notice: string };
+    expect(notice).toContain(`Survey ${survey.toUpperCase()} has no series`);
+    expect(quotedText(contentText(result))).toBe(notice);
+    expect(
+      readBack(contentText(result))
+        .filter((block) => block.quoted)
+        .flatMap((block) => block.codeSpans),
+    ).toEqual(codeSpans);
   });
 });

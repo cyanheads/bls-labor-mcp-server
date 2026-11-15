@@ -52,6 +52,7 @@ import {
 } from '@/services/bls-observations/bls-observations-service.js';
 import type { ObservationRow } from '@/services/bls-observations/types.js';
 import { periodName } from '@/services/bls-periods/period-codes.js';
+import { seriesIdsIn } from './series-id-markdown.js';
 import type {
   BlsApiResponse,
   BlsSurveysResponse,
@@ -890,12 +891,16 @@ export class BlsApiService {
       // parameters"). Retrying identical parameters cannot help, so this fails
       // fast; withCatalogReissue sends the request once more without catalog
       // metadata, the one change measured to clear it.
-      throw serviceUnavailable(`BLS API error: ${messages.join('; ') || parsed.status}`, {
-        reason: 'request_rejected',
-        retryable: false,
-        messages,
-        ...ctx.recoveryFor('request_rejected'),
-      });
+      throw serviceUnavailable(
+        `BLS API error: ${messages.join('; ') || parsed.status}`,
+        {
+          reason: 'request_rejected',
+          retryable: false,
+          messages,
+          ...ctx.recoveryFor('request_rejected'),
+        },
+        { literals: options.seriesIds },
+      );
     }
 
     const byId = new Map((parsed.Results?.series ?? []).map((raw) => [raw.seriesID, raw]));
@@ -1037,26 +1042,35 @@ export class BlsApiService {
     const data = { messages, seriesIds: options.seriesIds };
 
     if (invalidIds.length === 0) {
-      throw validationError(`BLS API: No data available for the requested period range.${detail}`, {
-        reason: 'no_data_for_period',
-        ...data,
-        ...ctx.recoveryFor('no_data_for_period'),
-      });
+      throw validationError(
+        `BLS API: No data available for the requested period range.${detail}`,
+        {
+          reason: 'no_data_for_period',
+          ...data,
+          ...ctx.recoveryFor('no_data_for_period'),
+        },
+        { literals: options.seriesIds },
+      );
     }
 
     // An OEWS ID is pointed at its state or national row rather than back to search.
     const { fallbacks, searchable } = splitOewsFallbacks(invalidIds);
+    const literals = [...options.seriesIds, ...fallbacks.flatMap(seriesIdsIn)];
 
     if (uncoveredIds.length === 0) {
       const declared = ctx.recoveryFor('series_not_found');
       const searchHint =
         searchable.length > 0 && 'recovery' in declared ? [declared.recovery.hint] : [];
       const hint = [...searchHint, ...fallbacks].join(' ');
-      throw notFound(`BLS API: no requested SeriesID exists.${detail}`, {
-        reason: 'series_not_found',
-        ...data,
-        ...(hint && { recovery: { hint } }),
-      });
+      throw notFound(
+        `BLS API: no requested SeriesID exists.${detail}`,
+        {
+          reason: 'series_not_found',
+          ...data,
+          ...(hint && { recovery: { hint } }),
+        },
+        { literals },
+      );
     }
 
     const covers = `start_year/end_year to a range ${uncoveredIds.join(', ')} covers.`;
@@ -1074,6 +1088,7 @@ export class BlsApiService {
           ].join(' '),
         },
       },
+      { literals },
     );
   }
 

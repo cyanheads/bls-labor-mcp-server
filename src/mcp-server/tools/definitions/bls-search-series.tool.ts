@@ -7,7 +7,8 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
+import { renderSeriesIdNotice } from '@/services/bls-api/series-id-markdown.js';
 import { areaForm } from '@/services/bls-catalog/area-filter.js';
 import {
   catalogSurveyAbbrs,
@@ -204,6 +205,9 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
       ),
   },
 
+  // The notice quotes the caller's survey filter, so it renders escaped.
+  enrichmentTrailer: { notice: { render: renderSeriesIdNotice } },
+
   async handler(input, ctx) {
     ctx.log.info('Executing bls_search_series', {
       query: input.query,
@@ -357,7 +361,7 @@ export const blsSearchSeriesTool = tool('bls_search_series', {
     }
     const lines: string[] = [`**${result.series.length} series returned:**\n`];
     for (const s of result.series) {
-      const parts: string[] = [`**${escapeMarkdownInline(s.seriesId)}**`];
+      const parts: string[] = [`**${markdown().inlineCode(s.seriesId).build()}**`];
       parts.push(`— ${escapeMarkdownInline(s.title)}`);
       if (s.area) parts.push(`· ${escapeMarkdownInline(s.area)}`);
       if (s.seasonal)

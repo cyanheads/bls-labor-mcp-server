@@ -366,7 +366,7 @@ describe('bls_search_series over a seeded catalog', () => {
         'Showing results 51–100 of 120. Pass offset: 100 for the next page.',
       );
       expect(text).toContain('**50 series returned:**');
-      expect(text).toContain('**LNTEST0050**');
+      expect(text).toContain('**`LNTEST0050`**');
       expect(text).toContain('Showing results 51–100 of 120. Pass offset: 100 for the next page.');
       expect(text).toContain('**offsetApplied:** 50');
       expect(text).toContain('**nextOffset:** 100');
@@ -732,9 +732,9 @@ describe('bls_search_series — a place word alone never outranks a real match (
   it('orders both surfaces with the matching series first', async () => {
     const { structured, text } = await call({ query: 'price of eggs' });
     expect(ids(structured)).toEqual(['APU0000708111', 'LAUCN550990000000003']);
-    expect(text.indexOf('**APU0000708111**')).toBeGreaterThan(-1);
-    expect(text.indexOf('**APU0000708111**')).toBeLessThan(
-      text.indexOf('**LAUCN550990000000003**'),
+    expect(text.indexOf('**`APU0000708111`**')).toBeGreaterThan(-1);
+    expect(text.indexOf('**`APU0000708111`**')).toBeLessThan(
+      text.indexOf('**`LAUCN550990000000003`**'),
     );
   });
 });
@@ -783,7 +783,7 @@ describe('bls_search_series — currency and the JOLTS aggregate break equal-sco
   afterAll(() => stopService());
 
   const inOrder = (text: string, order: string[]) => {
-    const at = order.map((id) => text.indexOf(`**${id}**`));
+    const at = order.map((id) => text.indexOf(`**\`${id}\`**`));
     expect(at.every((i) => i > -1)).toBe(true);
     expect(at).toEqual([...at].sort((a, b) => a - b));
   };
@@ -831,14 +831,14 @@ describe('bls_search_series — token modes (#95)', () => {
     expect(ids(first.structured)).toEqual(['ZZ001']);
     expect(first.structured.totalCount).toBe(3);
     expect(first.structured.nextOffset).toBe(1);
-    expect(first.text).toContain('**ZZ001**');
+    expect(first.text).toContain('**`ZZ001`**');
     expect(first.text).toContain('Pass offset: 1 for the next page.');
     const second = await call({ query: 'a b c manufactur', limit: 1, offset: 1 });
     expect(ids(second.structured)).toEqual(['ZZ002']);
-    expect(second.text).toContain('**ZZ002**');
+    expect(second.text).toContain('**`ZZ002`**');
     const last = await call({ query: 'a b c manufactur', limit: 1, offset: 2 });
     expect(ids(last.structured)).toEqual(['ABC001']);
-    expect(last.text).toContain('**ABC001**');
+    expect(last.text).toContain('**`ABC001`**');
     expect(last.structured.nextOffset).toBeUndefined();
     const past = await call({ query: 'a b c manufactur', offset: 3 });
     expect(past.structured.series).toEqual([]);
@@ -930,9 +930,9 @@ describe('bls_search_series — frequency field and CM/CI rows (#85, #86)', () =
       ['CUUR0100SA0', 'Monthly'],
     ]);
     expect(text).toContain(
-      '**CUUS0100SA0** — All items in Northeast urban, all urban consumers, not seasonally adjusted · Northeast urban (Not Seasonally Adjusted, Semi-Annual) [CU]',
+      '**`CUUS0100SA0`** — All items in Northeast urban, all urban consumers, not seasonally adjusted · Northeast urban (Not Seasonally Adjusted, Semi-Annual) [CU]',
     );
-    expect(text).toContain('**CUUR0100SA0** —');
+    expect(text).toContain('**`CUUR0100SA0`** —');
     expect(text).toContain('(Not Seasonally Adjusted, Monthly) [CU]');
   });
 
@@ -966,7 +966,7 @@ describe('bls_search_series — frequency field and CM/CI rows (#85, #86)', () =
       seasonal: 'Not Seasonally Adjusted',
     });
     expect(text).toContain(
-      '**CMU1010000000000D** — Total compensation cost per hour worked for civilian workers · United States (National) (Not Seasonally Adjusted) [CM]',
+      '**`CMU1010000000000D`** — Total compensation cost per hour worked for civilian workers · United States (National) (Not Seasonally Adjusted) [CM]',
     );
     expect(text).toContain('  _Total compensation_');
   });

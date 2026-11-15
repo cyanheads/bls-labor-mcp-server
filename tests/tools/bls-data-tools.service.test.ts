@@ -17,6 +17,7 @@ import {
   LATEST_INVALID_WITHOUT_CATALOG,
   MIXED_INVALID_WITHOUT_CATALOG,
 } from '../fixtures/bls-live-responses.js';
+import { quotedText, readBack } from '../fixtures/markdown-read-back.js';
 
 const state = vi.hoisted(() => ({
   config: {
@@ -689,7 +690,7 @@ describe('bls_get_series — failed live fallback keeps the mirrored series (#80
     expect(notice).not.toContain('LNU00000002');
 
     const text = contentText(result);
-    expect(text).toContain('### LNU00000002');
+    expect(text).toContain('### `LNU00000002`');
     expect(text).toContain('| March 2025 | M03 | 4.4 |');
     expect(text).toContain('quota_exceeded');
     expect(text).toContain('UTC midnight');
@@ -773,7 +774,7 @@ describe('bls_get_series — failed live fallback keeps the mirrored series (#80
       notice: expect.stringContaining('BOGUS123 is invalid or does not exist'),
     });
     expect((result.structuredContent as { notice: string }).notice).not.toContain('fallback');
-    expect(contentText(result)).toContain('### LNS14000000');
+    expect(contentText(result)).toContain('### `LNS14000000`');
   });
 
   it('fails the call with the live error when every requested ID missed the mirror', async () => {
@@ -849,7 +850,7 @@ describe('bls_get_series — catalog-free re-issue after the generic rejection (
     expect(invalid).not.toHaveProperty('title');
 
     const text = contentText(result);
-    expect(text).toContain('### LNS14000000 — (Seas) Unemployment Rate');
+    expect(text).toContain('### `LNS14000000` — (Seas) Unemployment Rate');
     expect(text).toContain('Seasonality: Seasonally Adjusted');
     expect(text).toContain('BOGUS123 is invalid or does not exist');
   });
@@ -870,7 +871,7 @@ describe('bls_get_series — catalog-free re-issue after the generic rejection (
     for (const field of ['title', 'area', 'item', 'seasonal']) {
       expect(valid).not.toHaveProperty(field);
     }
-    expect(contentText(result)).toContain('### LNS14000000\n');
+    expect(contentText(result)).toContain('### `LNS14000000`\n');
   });
 
   it('fails with request_rejected when both answers are generic', async () => {
@@ -946,7 +947,7 @@ describe('bls_get_latest — end to end (#80, #81)', () => {
       notice: expect.stringContaining('quota_exceeded'),
     });
     const text = contentText(result);
-    expect(text).toContain('**LNU00000002**');
+    expect(text).toContain('**`LNU00000002`**');
     expect(text).toContain('UTC midnight');
   });
 });
@@ -1128,6 +1129,8 @@ describe('unpublished OEWS SeriesIDs point at their national row (#119)', () => 
   const METRO = 'OEUM004766000000029114103';
   const NATIONAL = 'OEUN000000000000029114103';
   const HINT = `BLS leaves many OEWS occupation–area cells unpublished; request the national row ${NATIONAL} for the same occupation and data type.`;
+  /** The hint as content[] renders it, each SeriesID a code span (#133). */
+  const HINT_LINE = `\`${METRO}\`: BLS leaves many OEWS occupation–area cells unpublished; request the national row \`${NATIONAL}\` for the same occupation and data type.`;
 
   /** BLS's answer naming every ID in `invalid` nonexistent, with one observation per `valid` ID. */
   function answer(invalid: string[], valid: string[] = []): Response {
@@ -1158,7 +1161,7 @@ describe('unpublished OEWS SeriesIDs point at their national row (#119)', () => 
     expect(result.structuredContent).toMatchObject({
       error: { data: { reason: 'series_not_found', recovery: { hint: `${METRO}: ${HINT}` } } },
     });
-    expect(contentText(result)).toContain(`${METRO}: ${HINT}`);
+    expect(contentText(result)).toContain(HINT_LINE);
     expect(contentText(result)).not.toContain('bls_search_series');
   });
 
@@ -1241,7 +1244,7 @@ describe('unpublished OEWS SeriesIDs point at their national row (#119)', () => 
         },
       },
     });
-    expect(contentText(oews)).toContain(`${METRO}: ${HINT}`);
+    expect(contentText(oews)).toContain(HINT_LINE);
   });
 
   it('bls_get_series names the OEWS row in the per-ID notice when another series returned data', async () => {
@@ -1276,4 +1279,221 @@ describe('unpublished OEWS SeriesIDs point at their national row (#119)', () => 
     });
     expect(contentText(result)).toContain('request the national row');
   });
+});
+
+describe('SeriesIDs read back from content[] exactly as BLS writes them (#133)', () => {
+  const IP = 'IPUAN311___W200000000';
+  const IP_PRODUCTIVITY = 'IPURN6215__L000000000';
+
+  /** A captured BLS body with its invalid ID swapped for `id`, keeping BLS's own wording. */
+  function withInvalidId<T>(body: T, id: string): T {
+    return JSON.parse(JSON.stringify(body).replaceAll('BOGUS123', id)) as T;
+  }
+
+  /** A live answer with one observation for every SeriesID the request named. */
+  function echoAnswer(url: unknown, init: RequestInit | undefined, message: string[] = []) {
+    const ids = init?.body
+      ? (JSON.parse(init.body as string) as { seriesid: string[] }).seriesid
+      : [decodeURIComponent(String(url).split('/timeseries/data/')[1]!.split('?')[0]!)];
+    return okJson({
+      status: 'REQUEST_SUCCEEDED',
+      responseTime: 1,
+      message,
+      Results: {
+        series: ids.map((seriesID) => ({
+          seriesID,
+          data: [{ year: '2025', period: 'M01', value: '101.5' }],
+        })),
+      },
+    });
+  }
+
+  const tools = [
+    { name: 'bls_get_series', tool: blsGetSeriesTool, tag: 'h3' },
+    { name: 'bls_get_latest', tool: blsGetLatestTool, tag: 'p' },
+  ] as const;
+
+  it.each(tools)(
+    '$name renders a returned SeriesID as a code span, structuredContent unchanged',
+    async ({ tool, tag }) => {
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) =>
+        Promise.resolve(echoAnswer(url, init)),
+      );
+      const result = await runToolContract(
+        tool,
+        { series_ids: [IP] },
+        { context: { errors: tool.errors } },
+      );
+
+      const structured = result.structuredContent as Record<string, Array<{ seriesId: string }>>;
+      expect((structured.series ?? structured.results)?.[0]?.seriesId).toBe(IP);
+      const lead = readBack(contentText(result)).find((block) => block.codeSpans.includes(IP));
+      expect(lead).toMatchObject({ tag, codeSpans: [IP] });
+      expect(lead?.text.split('\n')[0]).toBe(IP);
+    },
+  );
+
+  it.each(tools)(
+    '$name names the unprocessed remainder in code spans on both trailer lines',
+    async ({ tool }) => {
+      const ids = Array.from({ length: 51 }, (_, i) => `IPUAN${300 + i}___W200000000`);
+      const last = ids.at(-1)!;
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) =>
+        Promise.resolve(echoAnswer(url, init)),
+      );
+      const result = await runToolContract(
+        tool,
+        { series_ids: ids },
+        { context: { errors: tool.errors } },
+      );
+
+      const { unprocessedSeriesIds, notice } = result.structuredContent as {
+        unprocessedSeriesIds: string[];
+        notice: string;
+      };
+      expect(unprocessedSeriesIds).toEqual([last]);
+      expect(notice).toContain(`Request the remaining SeriesIDs separately: ${last}.`);
+      const blocks = readBack(contentText(result));
+      const remainder = blocks.find((block) => !block.quoted && block.codeSpans.includes(last));
+      expect(remainder?.text.split('\n')).toContain(`unprocessedSeriesIds: ${last}`);
+      expect(quotedText(contentText(result))).toBe(notice);
+      expect(blocks.filter((b) => b.quoted).flatMap((b) => b.codeSpans)).toEqual([last]);
+    },
+  );
+
+  it('bls_get_series quotes a notice naming an invalid SeriesID, reading back exactly', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      okJson(withInvalidId(MIXED_INVALID_WITHOUT_CATALOG, IP)),
+    );
+    const result = await runToolContract(
+      blsGetSeriesTool,
+      { series_ids: ['LNS14000000', IP], start_year: 2025, end_year: 2025 },
+      seriesContext,
+    );
+
+    const { notice } = result.structuredContent as { notice: string };
+    expect(notice).toContain(`Unable to get Catalog Data for series ${IP}`);
+    expect(notice).toContain(`BLS reports ${IP} is invalid or does not exist.`);
+    expect(quotedText(contentText(result))).toBe(notice);
+    expect(
+      readBack(contentText(result))
+        .filter((block) => block.quoted)
+        .flatMap((block) => block.codeSpans),
+    ).toEqual([IP, IP]);
+    // The invalid series keeps its own heading.
+    expect(readBack(contentText(result))).toContainEqual(
+      expect.objectContaining({ tag: 'h3', text: IP, codeSpans: [IP] }),
+    );
+  });
+
+  it('bls_get_series quotes every line of a BLS advisory with markup beside its SeriesIDs', async () => {
+    const advisory = `Note *${IP}*, \`${IP}\`\n${IP} opens this line and ends it: ${IP}`;
+    vi.mocked(globalThis.fetch).mockImplementation((url, init) =>
+      Promise.resolve(echoAnswer(url, init, [advisory])),
+    );
+    const result = await runToolContract(blsGetSeriesTool, { series_ids: [IP] }, seriesContext);
+
+    const { notice } = result.structuredContent as { notice: string };
+    expect(notice).toBe(advisory);
+    expect(quotedText(contentText(result))).toBe(advisory);
+    expect(
+      readBack(contentText(result))
+        .filter((block) => block.quoted)
+        .flatMap((block) => block.codeSpans),
+    ).toEqual([IP, IP, IP, IP]);
+  });
+
+  it('bls_get_latest renders a failed SeriesID and the error naming it as code spans', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      okJson(withInvalidId(LATEST_INVALID_WITHOUT_CATALOG, IP)),
+    );
+    const result = await runToolContract(blsGetLatestTool, { series_ids: [IP] }, latestContext);
+
+    const { failed } = result.structuredContent as { failed: Array<{ error: string }> };
+    expect(failed[0]?.error).toContain(`Invalid Series for Series ${IP}`);
+    const item = readBack(contentText(result)).find((block) => block.text.startsWith(`${IP}: `));
+    expect(item?.text.split('\n')[0]).toBe(`${IP}: ${failed[0]?.error}`);
+    expect(item?.codeSpans).toEqual([IP, IP, IP]);
+  });
+
+  it.each([
+    {
+      failure: 'every ID invalid',
+      reason: 'series_not_found',
+      ids: [IP],
+      years: {},
+      body: () => okJson(withInvalidId(LATEST_INVALID_WITHOUT_CATALOG, IP)),
+      hintSpans: [],
+    },
+    {
+      failure: 'every ID uncovered',
+      reason: 'no_data_for_period',
+      ids: [IP],
+      years: { start_year: 2005, end_year: 2005 },
+      body: () =>
+        okJson({
+          status: 'REQUEST_SUCCEEDED',
+          responseTime: 1,
+          message: [`No Data Available for Series ${IP} Year: 2005`],
+          Results: { series: [{ seriesID: IP, data: [] }] },
+        }),
+      hintSpans: [],
+    },
+    {
+      failure: 'one invalid, one uncovered',
+      reason: 'series_not_found',
+      ids: [IP, IP_PRODUCTIVITY],
+      years: { start_year: 2005, end_year: 2005 },
+      body: () =>
+        okJson({
+          status: 'REQUEST_SUCCEEDED',
+          responseTime: 1,
+          message: [
+            `Series does not exist for Series ${IP_PRODUCTIVITY}`,
+            `No Data Available for Series ${IP} Year: 2005`,
+          ],
+          Results: {
+            series: [
+              { seriesID: IP, data: [] },
+              { seriesID: IP_PRODUCTIVITY, data: [] },
+            ],
+          },
+        }),
+      hintSpans: [IP_PRODUCTIVITY, IP],
+    },
+    {
+      failure: 'a rejection naming the ID',
+      reason: 'request_rejected',
+      ids: [IP],
+      years: {},
+      body: () =>
+        okJson({ ...GENERIC_REJECTION, message: [`Series ${IP} cannot be served this way.`] }),
+      hintSpans: [],
+    },
+  ])(
+    'bls_get_series renders the SeriesIDs its $reason error quotes as code spans ($failure)',
+    async ({ reason, ids, years, body, hintSpans }) => {
+      vi.mocked(globalThis.fetch).mockImplementation(() => Promise.resolve(body()));
+      const result = await runToolContract(
+        blsGetSeriesTool,
+        { series_ids: ids, ...years },
+        seriesContext,
+      );
+
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as {
+        error: { message: string; data: { reason: string; recovery: { hint: string } } };
+      };
+      expect(error.data.reason).toBe(reason);
+      expect(error.message).toContain(IP);
+      const [message, recovery] = readBack(contentText(result));
+      expect(message?.text).toBe(`Error: ${error.message}`);
+      expect(message?.codeSpans).toContain(IP);
+      expect(message?.codeSpans.every((span) => ids.includes(span))).toBe(true);
+      expect(recovery).toMatchObject({
+        text: `Recovery: ${error.data.recovery.hint}`,
+        codeSpans: hintSpans,
+      });
+    },
+  );
 });

@@ -8,8 +8,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getBlsApiService } from '@/services/bls-api/bls-api-service.js';
+import {
+  escapeWithSeriesIds,
+  renderSeriesIdNotice,
+} from '@/services/bls-api/series-id-markdown.js';
 import { unpublishedOewsHint } from '@/services/bls-catalog/bls-catalog-service.js';
 
 /**
@@ -169,8 +173,11 @@ export const blsGetLatestTool = tool('bls_get_latest', {
   },
 
   enrichmentTrailer: {
-    unprocessedSeriesIds: { render: (ids) => ids?.map(escapeMarkdownInline).join(', ') ?? '' },
-    notice: { render: escapeMarkdownInline },
+    unprocessedSeriesIds: {
+      render: (ids = []) =>
+        `**unprocessedSeriesIds:** ${ids.map((id) => markdown().inlineCode(id).build()).join(', ')}`,
+    },
+    notice: { render: renderSeriesIdNotice },
   },
 
   async handler(input, ctx) {
@@ -334,7 +341,7 @@ export const blsGetLatestTool = tool('bls_get_latest', {
       const obs = r.latestObservation;
       if (!obs) continue;
       lines.push(
-        `**${escapeMarkdownInline(r.seriesId)}**${r.title ? ` — ${escapeMarkdownInline(r.title)}` : ''}`,
+        `**${markdown().inlineCode(r.seriesId).build()}**${r.title ? ` — ${escapeMarkdownInline(r.title)}` : ''}`,
       );
       const periodStr = obs.periodName
         ? `${obs.periodName} ${obs.year}`
@@ -357,8 +364,12 @@ export const blsGetLatestTool = tool('bls_get_latest', {
     if (result.failed.length > 0) {
       lines.push(`**${result.failed.length} failed:**`);
       for (const f of result.failed) {
-        lines.push(`- ${escapeMarkdownInline(f.seriesId)}: ${escapeMarkdownInline(f.error)}`);
+        lines.push(
+          `- ${markdown().inlineCode(f.seriesId).build()}: ${escapeWithSeriesIds(f.error)}`,
+        );
       }
+      // A blank line ends the list; without it the footer joins the last bullet.
+      lines.push('');
     }
     const total = result.results.length + result.failed.length;
     lines.push(`_${result.succeeded} of ${total} series returned data._`);

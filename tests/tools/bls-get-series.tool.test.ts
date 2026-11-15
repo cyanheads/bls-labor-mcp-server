@@ -456,7 +456,7 @@ describe('blsGetSeriesTool', () => {
       .filter((block) => block.type === 'text')
       .map((block) => block.text)
       .join('\n');
-    expect(text).toContain('### ABSENT001');
+    expect(text).toContain('### `ABSENT001`');
     expect(text).toContain('_No observations returned.');
   });
 

@@ -150,10 +150,10 @@ describe('bls_search_series over a harvested JOLTS catalog', () => {
     });
 
     expect(text(result)).toContain(
-      '**JTS000000060000000JOR** — JOLTS - Job openings - Total nonfarm - California - All size classes - Rate · California (Seasonally Adjusted) [JT]',
+      '**`JTS000000060000000JOR`** — JOLTS - Job openings - Total nonfarm - California - All size classes - Rate · California (Seasonally Adjusted) [JT]',
     );
     expect(text(result)).toContain(
-      '**JTU000000060000000JOR** — JOLTS - Job openings - Total nonfarm - California - All size classes - Rate · California (Not Seasonally Adjusted) [JT]',
+      '**`JTU000000060000000JOR`** — JOLTS - Job openings - Total nonfarm - California - All size classes - Rate · California (Not Seasonally Adjusted) [JT]',
     );
     expect(text(result)).not.toContain('All areas');
     expect(text(result)).toContain('Coverage: 2000–2026 M07');

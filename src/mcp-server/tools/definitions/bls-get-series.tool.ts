@@ -10,9 +10,10 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import type { ColumnSchema, ColumnType } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { type BatchFetchOptions, getBlsApiService } from '@/services/bls-api/bls-api-service.js';
+import { renderSeriesIdNotice } from '@/services/bls-api/series-id-markdown.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
 import { unpublishedOewsHint } from '@/services/bls-catalog/bls-catalog-service.js';
 import { isAnnualAveragePeriod } from '@/services/bls-periods/period-codes.js';
@@ -322,8 +323,11 @@ export const blsGetSeriesTool = tool('bls_get_series', {
   },
 
   enrichmentTrailer: {
-    unprocessedSeriesIds: { render: (ids) => ids?.map(escapeMarkdownInline).join(', ') ?? '' },
-    notice: { render: escapeMarkdownInline },
+    unprocessedSeriesIds: {
+      render: (ids = []) =>
+        `**unprocessedSeriesIds:** ${ids.map((id) => markdown().inlineCode(id).build()).join(', ')}`,
+    },
+    notice: { render: renderSeriesIdNotice },
   },
 
   async handler(input, ctx) {
@@ -609,7 +613,7 @@ export const blsGetSeriesTool = tool('bls_get_series', {
 
     for (const s of result.series) {
       lines.push(
-        `### ${escapeMarkdownInline(s.seriesId)}${s.title ? ` — ${escapeMarkdownInline(s.title)}` : ''}`,
+        `### ${markdown().inlineCode(s.seriesId).build()}${s.title ? ` — ${escapeMarkdownInline(s.title)}` : ''}`,
       );
       if (s.area) lines.push(`Area: ${escapeMarkdownInline(s.area)}`);
       if (s.item) lines.push(`Item: ${escapeMarkdownInline(s.item)}`);

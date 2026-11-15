@@ -13,6 +13,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsGetLatestTool } from '@/mcp-server/tools/definitions/bls-get-latest.tool.js';
 import type { SeriesData } from '@/services/bls-api/types.js';
+import { readBack } from '../fixtures/markdown-read-back.js';
 
 const MOCK_SERIES: SeriesData = {
   seriesId: 'LNS14000000',
@@ -251,7 +252,7 @@ describe('blsGetLatestTool — additional coverage', () => {
         .filter((block) => block.type === 'text')
         .map((block) => block.text)
         .join('\n');
-      expect(text).toContain('- LNU00009999:');
+      expect(text).toContain('- `LNU00009999`:');
       expect(text).toContain(hint);
     },
   );
@@ -355,6 +356,25 @@ describe('blsGetLatestTool — additional coverage', () => {
     const blocks = blsGetLatestTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('1 of 2 series returned data');
+  });
+
+  it('renders the footer as its own paragraph, outside the last failure bullet', () => {
+    const output = {
+      results: [],
+      succeeded: 0,
+      failed: [
+        { seriesId: 'INVALID000', error: 'series_not_found' },
+        { seriesId: 'INVALID001', error: 'series_not_found' },
+      ],
+    };
+    const text = (blsGetLatestTool.format!(output)[0] as { text: string }).text;
+    const blocks = readBack(text).map((block) => block.text);
+    expect(blocks).toEqual([
+      '2 failed:',
+      'INVALID000: series_not_found',
+      'INVALID001: series_not_found',
+      '0 of 2 series returned data.',
+    ]);
   });
 
   it('rejects empty series_ids array', () => {

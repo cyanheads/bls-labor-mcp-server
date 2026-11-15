@@ -487,7 +487,7 @@ describe('mirror-served measure through the tools (#127)', () => {
     });
     expect(result.series[1]).not.toHaveProperty('measure');
     expect(ciSection).toContain('Item: Total compensation\nMeasure: Total compensation\n');
-    expect(jtSection).toMatch(/^JTS000000000000000JOL — /);
+    expect(jtSection).toMatch(/^`JTS000000000000000JOL` — /);
     expect(jtSection).not.toContain('Measure:');
   });
 
@@ -635,9 +635,9 @@ describe('mirror-served LAUS measure from a harvested catalog, through the tools
       ['LASST530000000000008', 'Washington', 'labor force participation rate'],
       ['LAUCN530330000000003', 'King County, WA', 'unemployment rate'],
     ]);
-    expect(stateSection).toMatch(/^LASST530000000000008 — /);
+    expect(stateSection).toMatch(/^`LASST530000000000008` — /);
     expect(stateSection).toContain('Area: Washington\nMeasure: labor force participation rate\n');
-    expect(countySection).toMatch(/^LAUCN530330000000003 — /);
+    expect(countySection).toMatch(/^`LAUCN530330000000003` — /);
     expect(countySection).toContain('Area: King County, WA\nMeasure: unemployment rate\n');
   });
 
