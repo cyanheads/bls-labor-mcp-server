@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-11-14 · ⚠️ Breaking
 
-bls_dataframe_query refuses SQL that names a DuckDB metadata view anywhere, aliases included; the catalog streams .series files so OE indexes under Node; survey aggregates rank above their breakdowns; SeriesIDs render as code spans; concurrent first stagings share one canvas.
+bls_dataframe_query refuses SQL that names a DuckDB metadata view anywhere, aliases included; the catalog streams .series files so OE indexes under Node; survey aggregates outrank their tied breakdowns; SeriesIDs render as code spans; concurrent first stagings share one canvas.
 
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-11-01
 
