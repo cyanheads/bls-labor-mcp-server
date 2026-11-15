@@ -54,7 +54,7 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 
 ### `bls_search_series` <sub>tool</sub>
 
-- Search by text or SeriesID, with optional `survey`, `area`, and `seasonal_adjustment`; blank filters are omitted. `area` takes a USPS or 2-digit FIPS state code; a 3-, 4-, 5-, or 7-digit CSA, CPI area, county or CBSA, or state + place code; otherwise a substring of area, title, or SeriesID (all-digit values outside those lengths add a notice). `limit` defaults to 10 and requests above 50 clamp to 50 with notice, with `offset` pagination. Exact SeriesIDs rank first, then series matching every query word, with any place the query names in full ahead of the rest; at equal score, current series rank first, then national ones, then the JOLTS aggregate.
+- Search by text or SeriesID, with optional `survey`, `area`, and `seasonal_adjustment`; blank filters are omitted. `area` takes a USPS or 2-digit FIPS state code; a 3-, 4-, 5-, or 7-digit CSA, CPI area, county or CBSA, or state + place code; otherwise a substring of area, title, or SeriesID (all-digit values outside those lengths add a notice). `limit` defaults to 10 and requests above 50 clamp to 50 with notice, with `offset` pagination. Exact SeriesIDs rank first, then series by how many query words they match (a concept alias such as `inflation` or `wage` counts for every series of its survey), with any place the query names in full first among the series matching every word; at equal score, current series rank first, then national ones, then a survey's aggregate (the JOLTS Total nonfarm, ECEC and ECI totals, BED total private, and CPI All items rows) ahead of its breakdowns.
 - Returns decoded SeriesIDs, titles, `frequency`, and independently optional `startYear`, `endYear`, and `endPeriod` coverage (for example, `1982–2005 Q04`). Coverage describes the catalog snapshot, not continuous observations. Follow `nextOffset` while `truncated` is true; `capped: true` makes `totalCount` a lower bound, and paging stops at the FTS candidate pool.
 - Searches the offline LABSTAT index without using API quota; OE/OEWS is opt-in through `BLS_CATALOG_INCLUDE_OES`. Under `survey: "OE"` without those rows, it composes OEWS SeriesIDs from the OE code tables, up to 50 per search; each is marked `composed: true` and is unconfirmed until `bls_get_series` returns data for it. Unindexed surveys remain fetchable by SeriesID.
 
@@ -79,7 +79,7 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 ### `bls_dataframe_describe` <sub>tool</sub>
 
 - Optional `name` describes one registered dataframe; omit it to list active dataframes for the tenant. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
-- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`, fixed at table creation), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, `SMALLINT`, lists) report as `VARCHAR`. Expired entries are removed when their canvas drop succeeds.
+- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`, fixed at table creation), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, lists) report as `VARCHAR`; `SMALLINT` and `UTINYINT` report as `INTEGER`. Expired entries are removed when their canvas drop succeeds.
 
 ---
 
@@ -87,7 +87,7 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 
 - Run one SELECT against registered tables, with JOINs, aggregates, window functions, or CTEs. `row_limit` defaults to 1000; larger values clamp to 10000, and `preview` clamps to the applied row limit with requested/applied notices. Zero preview remains valid; writes, external-file reads, and system catalogs are denied.
 - Engine-setting functions (`current_setting`, `current_schema`, `current_schemas`, `in_search_path`) and `query_table` are denied. Unqualified `current_schema` keyword or column references are also denied; qualify a real column with its table alias (for example, `t.current_schema`). `query()` accepts one plain SQL string literal, checked recursively up to four levels; computed SQL strings are rejected. Reference staged tables directly for analysis.
-- Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
+- Returns rows without consuming BLS API quota. Optional `register_as` stages the result with a fresh TTL for chained analysis; a name that matches a DuckDB system catalog or metadata view is refused with `register_as_system_catalog`. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
 
 ---
 
@@ -195,7 +195,7 @@ MCP_TRANSPORT_TYPE=http MCP_SESSION_MODE=stateless MCP_HTTP_PORT=3010 BLS_API_KE
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - A free BLS API v2 key — register at [bls.gov/developers](https://www.bls.gov/developers/home.htm). Grants 500 queries/day; the server also works without a key at 25 req/day.
 
 ### Installation
@@ -236,7 +236,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `BLS_CATALOG_BASE_URL` | LABSTAT flat-file base URL. Override to point at a local mirror. | `https://download.bls.gov/pub/time.series` |
 | `BLS_CATALOG_DB_PATH` | On-disk SQLite catalog index — queried on demand and persisted across restarts. Empty uses an in-memory DB (re-harvested each boot). Mount a volume here in containers. | `.cache/bls-catalog.db` |
 | `BLS_CATALOG_CACHE_TTL_HOURS` | Per-survey catalog freshness window in hours — a survey re-harvests once its last success is older, and a failed survey's retry backoff is capped at this many hourly checks. Checked at startup and hourly while running. | `168` (7 days) |
-| `BLS_CATALOG_INCLUDE_OES` | Include the OES/OEWS wage survey (~6M series / ~1.26 GB; Bun-only; multi-minute first harvest). Off by default — OES series stay fetchable by ID, and search composes them from the small OE code tables. | `false` |
+| `BLS_CATALOG_INCLUDE_OES` | Include the OES/OEWS wage survey (~6M series / ~1.26 GB; multi-minute first harvest). Off by default — OES series stay fetchable by ID, and search composes them from the small OE code tables. | `false` |
 | `BLS_OBSERVATIONS_MIRROR_ENABLED` | Serve observations from a local SQLite mirror instead of the live API (requires a one-time bootstrap — see below). | `false` |
 | `BLS_DATASET_TTL_SECONDS` | Per-dataframe TTL for canvas-registered tables, in seconds. | `86400` (24 h) |
 | `BLS_DATAFRAME_DROP_ENABLED` | Expose `bls_dataframe_drop`. TTL handles cleanup by default. | `false` |
@@ -304,6 +304,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/bls-observations` | Optional LABSTAT observation mirror — embedded SQLite store, ingester, and refresh subprocess. |
 | `src/services/bls-periods` | Period-code semantics shared by the API and mirror paths: annual-average codes (`M13`/`Q05`/`S03`) and the live API's period names. |
 | `src/services/canvas-bridge` | DataCanvas bridge — dataframe registration, SQL gate, lifecycle management. |
+| `src/services/labstat` | Streamed LABSTAT reads (header and per-chunk stall deadlines, line regrouping) shared by the catalog harvest and the observation ingester. |
 | `docs/design.md` | Full tool surface specification, service architecture, and error contracts. |
 | `docs/observation-mirror.md` | Observation mirror setup, coverage, and upgrade notes. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

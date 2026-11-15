@@ -2,12 +2,10 @@
 
 **Server:** bls-labor-mcp-server
 **Version:** 0.7.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **Zod:** ^4.6.7
-
-**Dependency hold:** `@duckdb/node-api` stays on `^1.5.6-r.2`. DuckDB 2 produces `PRAGMA_SHOW` for `SHOW <table>`, which the framework SQL gate refuses (mcp-ts-core #800); the 1.5 line preserves the working schema query.
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -214,6 +212,7 @@ src/
   services/
     bls-api/
       bls-api-service.ts                # BLS API v2 service (batch fetch, latest, surveys)
+      series-id-markdown.ts             # SeriesIDs in Markdown: code spans in rows, notices, and error literals
       types.ts                          # BLS API types
     bls-catalog/
       bls-catalog-service.ts            # LABSTAT flat-file catalog (offline search + on-disk cache)
@@ -229,6 +228,8 @@ src/
       period-codes.ts                   # Period-code semantics: annual-average codes (M13/Q05/S03) and the live API's period names — shared by the API and mirror paths
     canvas-bridge/
       canvas-bridge.ts                  # DataCanvas bridge (dataframe registration, SQL gate, lifecycle)
+    labstat/
+      labstat-stream.ts                 # Streamed LABSTAT reads (header and per-chunk stall deadlines, line regrouping) shared by the catalog harvest and the observation ingester
   mcp-server/
     tools/definitions/
       bls-list-surveys.tool.ts
