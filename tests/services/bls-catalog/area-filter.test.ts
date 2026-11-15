@@ -16,7 +16,11 @@ import {
   resolveArea,
   statesOf,
 } from '@/services/bls-catalog/area-filter.js';
-import { expectLinearCpuTime } from './linear-time.js';
+import {
+  expectLinearCpuTime,
+  LINE_BREAK_SHAPES,
+  type TextShape,
+} from '../../fixtures/linear-time.js';
 
 describe('areaForm (#110)', () => {
   it.each([
@@ -60,14 +64,19 @@ describe('areaForm (#110)', () => {
     },
   );
 
-  it.each<[string, (n: number) => string]>([
-    ['digits', (n) => '1'.repeat(n)],
-    ['digits then a letter', (n) => `${'1'.repeat(n)}a`],
-    ['letters', (n) => 'a'.repeat(n)],
-    ['a letter then digits', (n) => `a${'1'.repeat(n)}`],
-  ])('runs in linear time on a long run of %s', (label, text) => {
-    expectLinearCpuTime(areaForm, text, label, 5);
-  });
+  it.each<TextShape>([
+    ['a long run of digits', (n) => '1'.repeat(n)],
+    ['a long run of digits then a letter', (n) => `${'1'.repeat(n)}a`],
+    ['a long run of letters', (n) => 'a'.repeat(n)],
+    ['a long run of a letter then digits', (n) => `a${'1'.repeat(n)}`],
+    ...LINE_BREAK_SHAPES,
+  ])(
+    'runs in linear time on %s',
+    (label, text) => {
+      expectLinearCpuTime(areaForm, text, label, 5);
+    },
+    0,
+  );
 });
 
 describe('statesOf (#110)', () => {

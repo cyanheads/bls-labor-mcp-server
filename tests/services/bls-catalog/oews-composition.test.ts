@@ -16,7 +16,12 @@ import {
   parseOewsTables,
 } from '@/services/bls-catalog/oews-composition.js';
 import type { CatalogSearchInput } from '@/services/bls-catalog/types.js';
-import { expectLinearCpuTime } from './linear-time.js';
+import {
+  expectLinearCpuTime,
+  LINE_BREAK_SHAPES,
+  repeatTo,
+  type TextShape,
+} from '../../fixtures/linear-time.js';
 import { OE_AREA, OE_DATATYPE, OE_OCCUPATION, tsv } from './oews-fixtures.js';
 
 function tables(): OewsTables {
@@ -443,13 +448,18 @@ describe('composeOewsSearch — caller-sized text', () => {
     }
   };
 
-  it.each<[string, (n: number) => string]>([
-    ['a long repeated query', (n) => 'registered nurses '.repeat(Math.ceil(n / 18))],
+  it.each<TextShape>([
+    ['a long repeated query', (n) => repeatTo('registered nurses ', n)],
     ['a long digit run', (n) => '9'.repeat(n)],
     ['a long run of commas between digits', (n) => '1,'.repeat(n / 2)],
-  ])('stays linear on %s', (label, text) => {
-    expectLinearCpuTime(composeBoth, text, label, 100);
-  });
+    ...LINE_BREAK_SHAPES,
+  ])(
+    'stays linear on %s',
+    (label, text) => {
+      expectLinearCpuTime(composeBoth, text, label, 100);
+    },
+    0,
+  );
 });
 
 describe('oewsFallbacks', () => {

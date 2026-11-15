@@ -43,7 +43,7 @@ const ServerConfigSchema = z.object({
     .stringbool()
     .default(false)
     .describe(
-      'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.26 GB (over 20× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index, and only the Bun runtime can read oe.series into one string (Node caps a string at 536,870,888 characters). Without indexed OE rows, bls_search_series under survey OE composes OEWS SeriesIDs from the small OE code tables every harvest stores, and OES series stay fetchable by ID via bls_get_series.',
+      'Include the OES/OEWS occupational-wage survey in the catalog index. Off by default — OES alone is ~6M series / ~1.26 GB (over 20× the rest of the catalog combined), adding a multi-minute first harvest and GBs of on-disk index. Without indexed OE rows, bls_search_series under survey OE composes OEWS SeriesIDs from the small OE code tables every harvest stores, and OES series stay fetchable by ID via bls_get_series.',
     ),
   userAgent: z
     .string()

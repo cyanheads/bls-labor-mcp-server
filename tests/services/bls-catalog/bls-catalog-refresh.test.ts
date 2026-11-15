@@ -74,33 +74,49 @@ async function seed(path: string, completedAt: Date): Promise<void> {
   await store.close();
 }
 
-/**
- * Serve jt.series once `gate` opens (or reject when the request aborts); every
- * other URL 404s at once. Returns the file names requested.
- */
-function serveJt(gate: Promise<void>): string[] {
-  const requested: string[] = [];
-  vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
-    const u = String(url);
-    const file = u.slice(u.lastIndexOf('/') + 1);
-    requested.push(file);
-    if (file.startsWith('jt.') && file !== 'jt.series')
-      return Promise.resolve(new Response(JT_TABLE));
-    if (file !== 'jt.series') return Promise.resolve(new Response('', { status: 404 }));
-    return new Promise<Response>((resolve, reject) => {
-      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
-      void gate.then(() => resolve(new Response(JT_SERIES)));
-    });
-  });
-  return requested;
-}
-
 function deferred(): { promise: Promise<void>; release: () => void } {
   let release: () => void = () => {};
   const promise = new Promise<void>((resolve) => {
     release = resolve;
   });
   return { promise, release };
+}
+
+/**
+ * Serve JT's files, holding its `jt.state` code table until `gate` opens (or
+ * rejecting when the request aborts); every other URL 404s at once. A held
+ * table holds its batch before any `.series` request opens, so no request
+ * deadline is armed while the fake clock advances. `requestOf(file)` resolves
+ * once `file` is next requested. Returns the file names requested.
+ */
+function serveJt(gate: Promise<void>): {
+  requested: string[];
+  requestOf: (file: string) => Promise<void>;
+} {
+  const requested: string[] = [];
+  const waits = new Map<string, () => void>();
+  vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+    const u = String(url);
+    const file = u.slice(u.lastIndexOf('/') + 1);
+    requested.push(file);
+    waits.get(file)?.();
+    if (file === 'jt.series') return Promise.resolve(new Response(JT_SERIES));
+    if (file !== 'jt.state') {
+      return Promise.resolve(
+        file.startsWith('jt.') ? new Response(JT_TABLE) : new Response('', { status: 404 }),
+      );
+    }
+    return new Promise<Response>((resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      void gate.then(() => resolve(new Response(JT_TABLE)));
+    });
+  });
+  const requestOf = (file: string) => {
+    const wait = deferred();
+    waits.set(file, wait.release);
+    return wait.promise;
+  };
+  return { requested, requestOf };
 }
 
 async function startService(completedAt: Date, ttlHours: number): Promise<void> {
@@ -150,7 +166,7 @@ describe('hourly catalog refresh (#84)', () => {
   it('re-harvests once the TTL lapses, without a restart, serving the old index until it completes', async () => {
     await startService(new Date(), 1);
     const gate = deferred();
-    const requested = serveJt(gate.promise);
+    const { requested, requestOf } = serveJt(gate.promise);
     const svc = getBlsCatalogService();
     await svc.load();
     await scheduleBlsCatalogRefresh();
@@ -165,19 +181,21 @@ describe('hourly catalog refresh (#84)', () => {
     await vi.advanceTimersByTimeAsync(30 * MINUTE);
     expect(requested).toEqual([]);
 
-    // 12:00 — an hour and a half old: the tick starts a harvest.
+    // 12:00 — an hour and a half old: the tick starts a harvest, held at a JT code table.
+    const held = requestOf('jt.state');
     await vi.advanceTimersByTimeAsync(HOUR);
-    await vi.waitFor(() => expect(requested).toContain('jt.series'));
+    await held;
     const during = await searchTool({ query: 'CES0000000001' });
     expect(during.structured.series[0]?.seriesId).toBe('CES0000000001');
     expect(during.structured.catalogSize).toBe(3);
 
     // 13:00 — a tick while the 12:00 harvest is still in flight starts no second one.
     await vi.advanceTimersByTimeAsync(HOUR);
-    expect(count(requested, 'jt.series')).toBe(1);
+    expect(count(requested, 'jt.state')).toBe(1);
 
     gate.release();
     await svc.load(); // joins the in-flight harvest
+    expect(count(requested, 'jt.state')).toBe(1);
     expect(count(requested, 'jt.series')).toBe(1);
     expect(svc.totalSeries).toBe(5);
     expect(svc.indexedSurveys).toEqual(['CE', 'CU', 'JT', 'LN']);
@@ -190,14 +208,15 @@ describe('hourly catalog refresh (#84)', () => {
     // 14:00 — the other configured surveys failed at 12:00 and retry now (#104);
     // JT, updated at 13:00, is inside its one-hour TTL, so none of its files is requested.
     requested.length = 0;
-    await vi.advanceTimersByTimeAsync(HOUR);
     const failed = catalogSurveyList(false)
       .split(',')
       .filter((abbr) => abbr !== 'jt')
       .map((abbr) => `${abbr}.series`);
-    await vi.waitFor(() =>
-      expect(requested.filter((f) => f.endsWith('.series')).sort()).toEqual(failed.sort()),
-    );
+    const lastFailed = requestOf(failed.at(-1)!);
+    await vi.advanceTimersByTimeAsync(HOUR);
+    await lastFailed;
+    // One at a time, in survey order: the last one's request follows every other.
+    expect(requested.filter((f) => f.endsWith('.series'))).toEqual(failed);
     expect(requested.filter((f) => f.startsWith('jt.'))).toEqual([]);
   });
 
@@ -205,13 +224,14 @@ describe('hourly catalog refresh (#84)', () => {
     await startService(new Date(Date.now() - 1_000 * HOUR), 168);
     vi.setSystemTime(new Date('2026-09-23T10:59:59Z'));
     const gate = deferred();
-    const requested = serveJt(gate.promise);
+    const { requested, requestOf } = serveJt(gate.promise);
+    const held = requestOf('jt.state');
     const svc = getBlsCatalogService();
     const load = vi.spyOn(svc, 'load');
 
     const boot = svc.load();
     await scheduleBlsCatalogRefresh();
-    await vi.waitFor(() => expect(requested).toContain('jt.series'));
+    await held;
 
     await vi.advanceTimersByTimeAsync(2_000); // 11:00:01 — the tick fires mid-harvest
     // The tick called load() and was handed the boot's in-flight run.
@@ -229,7 +249,7 @@ describe('hourly catalog refresh (#84)', () => {
     await startService(new Date(Date.now() - 1_000 * HOUR), 168);
     const gate = deferred();
     gate.release();
-    const requested = serveJt(gate.promise);
+    const { requested } = serveJt(gate.promise);
     await scheduleBlsCatalogRefresh();
     expect(schedulerService.listJobs().map((j) => j.id)).toContain(CATALOG_REFRESH_JOB_ID);
 
@@ -243,16 +263,16 @@ describe('hourly catalog refresh (#84)', () => {
 
   it('stops a tick’s in-flight harvest on teardown without an unhandled rejection', async () => {
     await startService(new Date(Date.now() - 1_000 * HOUR), 168);
-    const requested: string[] = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
-      requested.push(String(url));
+    const fetched = deferred();
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      fetched.release();
       return new Promise<Response>((_, reject) => {
         init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
       });
     });
     await scheduleBlsCatalogRefresh();
     await vi.advanceTimersByTimeAsync(HOUR);
-    await vi.waitFor(() => expect(requested.length).toBeGreaterThan(0));
+    await fetched.promise;
 
     await shutdownBlsCatalogService();
     const check = createCatalogStore(join(tmpDir, 'catalog.db'));

@@ -1,9 +1,9 @@
 /**
  * @fileoverview BLS LABSTAT flat-file catalog service. Downloads each survey's
- * `{survey}.series` file and code tables from
- * `download.bls.gov/pub/time.series/{survey}/`, decodes them into a searchable
- * series index, and persists that index in an on-disk SQLite store
- * (the framework's FTS5-capable `sqliteMirrorStore`). Search runs as an FTS5
+ * code tables and `{survey}.series` file from
+ * `download.bls.gov/pub/time.series/{survey}/`, decoding the series rows into
+ * a searchable index as the file streams in, and persists that index in an
+ * on-disk SQLite store (the framework's FTS5-capable `sqliteMirrorStore`). Search runs as an FTS5
  * candidate query rescored by a bespoke relevance function — the index lives on
  * disk, not the JS heap, so large surveys do not inflate memory. No API quota is
  * consumed; the BLS FAQ confirms there is no API catalog endpoint. An hourly
@@ -27,6 +27,12 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { schedulerService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  lineBatches,
+  type OpenResponse,
+  openUrl,
+  readBody,
+} from '@/services/labstat/labstat-stream.js';
 import {
   AREA_CODE_SOURCES,
   type AreaIndex,
@@ -278,11 +284,10 @@ export const SURVEY_ABBRS: readonly string[] = SURVEYS.filter((s) => !s.catalogO
 /**
  * The OES/OEWS survey is a pathological outlier — ~6M series / ~1.26 GB, over
  * 20× every other survey combined. Its series are excluded from the index unless
- * explicitly opted in (`BLS_CATALOG_INCLUDE_OES=true`, which only the Bun
- * runtime can read into one string), keeping the default index small, the
- * first harvest fast, and on-disk size modest. Every harvest stores OE's small
- * code tables instead, and while the index holds no OE rows bls_search_series
- * composes OEWS SeriesIDs from them (`oews-composition.ts`).
+ * explicitly opted in (`BLS_CATALOG_INCLUDE_OES=true`), keeping the default
+ * index small, the first harvest fast, and on-disk size modest. Every harvest
+ * stores OE's small code tables instead, and while the index holds no OE rows
+ * bls_search_series composes OEWS SeriesIDs from them (`oews-composition.ts`).
  */
 export const OES_SURVEY_ABBR = 'oe';
 
@@ -488,13 +493,19 @@ export function queryFrequencies(query: string): Set<string> {
 /** Relevance boost for a candidate whose survey matches a query concept alias. */
 const ALIAS_SURVEY_BOOST = 6;
 
-/** Max surveys fetched concurrently during a harvest. Keeps the request burst small. */
+/**
+ * Surveys whose code tables a harvest requests at once. Their `.series` files
+ * are requested one at a time after the tables arrive. Keeps the request burst
+ * small.
+ */
 const SURVEY_FETCH_CONCURRENCY = 3;
 
 /**
- * Rows per SQLite transaction during a harvest, upserts and deletes alike. The
- * driver is synchronous, so this bounds how long one write holds the event
- * loop; the harvest yields a turn between chunks so searches interleave.
+ * Rows per SQLite transaction during a harvest — upserts, the SeriesIDs
+ * recorded beside them, and deletes alike — and the most parsed rows a
+ * survey's stream holds before writing them. The driver is synchronous, so
+ * this bounds how long one write holds the event loop; the harvest yields a
+ * turn between chunks so searches interleave.
  */
 const HARVEST_CHUNK_SIZE = 5_000;
 
@@ -550,6 +561,44 @@ const NATIONAL_AREAS: ReadonlySet<string> = new Set([
   'U.S. totals',
   'All States',
 ]);
+
+/**
+ * Each survey's aggregate SeriesIDs as a SQLite `GLOB` pattern: `?` is any one
+ * character, every other character is a total code at its 1-based position,
+ * and the pattern's length is the ID's. At equal score an aggregate leads its
+ * breakdowns, and among rows matching every query word the candidate query
+ * admits a national one first, after a place the query names. Ownership is
+ * not a total code: the query's words choose it, so a private-industry query
+ * still lifts the private aggregate.
+ */
+const AGGREGATE_SERIES: ReadonlyMap<string, string> = new Map([
+  // Industry 000000 (4–9), size class 00 (17–18): Total nonfarm, All size classes.
+  ['JT', 'JT?000000???????00???'],
+  /**
+   * Industry 0000 (7–10), occupation 000 (11–13), subcell 000 (14–16), and data
+   * type D (17, cost per hour worked): its percent and percentile rows hold the
+   * same codes before 17.
+   */
+  ['CM', 'CM????0000000000D'],
+  // Industry 0000 (7–10), occupation 000 (11–13), subcell 000 (14–16).
+  ['CI', 'CI????0000000000?'],
+  // Industry 000000 (14–19), size class 00 (22–23).
+  ['BD', 'BD???????????000000??00?????'],
+  // Item SA0 (All items) from 9.
+  ['CU', 'CU??????SA0'],
+  ['CW', 'CW??????SA0'],
+  ['SU', 'SU??????SA0'],
+]);
+
+/** Whether `seriesId` matches its survey's `AGGREGATE_SERIES` pattern, as SQLite's `GLOB` reads it. */
+function isAggregate(survey: string, seriesId: string): boolean {
+  const pattern = AGGREGATE_SERIES.get(survey);
+  return (
+    pattern !== undefined &&
+    pattern.length === seriesId.length &&
+    [...pattern].every((c, i) => c === '?' || c === seriesId[i])
+  );
+}
 
 /** Geographic boilerplate and modifiers do not identify a place on their own. */
 const GEOGRAPHIC_STOP_WORDS = new Set([
@@ -689,16 +738,17 @@ interface AllWordsMatch {
   surveys?: readonly string[];
 }
 
-/** A scored candidate and its rank keys; every key but `score` is 0 or 1. */
+/** A scored candidate and its rank keys; every key but `score` and `words` is 0 or 1. */
 interface RankedSeries {
   aggregate: number;
-  allWords: number;
   current: number;
   exact: number;
   national: number;
   place: number;
   s: CatalogSeries;
   score: number;
+  /** Required query words the row matches, in its own text or through its survey's concept alias. */
+  words: number;
 }
 
 /**
@@ -742,6 +792,17 @@ interface Decoder {
 
 function warn(message: string): void {
   process.stderr.write(`[bls-labor-mcp-server] Catalog: ${message}\n`);
+}
+
+/**
+ * Why a request or body read failed, for a warning line — rethrowing the
+ * harvest's own stop when `signal` has aborted. Node's fetch rejects with a
+ * bare "fetch failed" that carries the reason in `cause`.
+ */
+function failureCause(error: unknown, signal: AbortSignal): string {
+  signal.throwIfAborted();
+  if (!(error instanceof Error)) return String(error);
+  return error.cause instanceof Error ? `${error.message}: ${error.cause.message}` : error.message;
 }
 
 /**
@@ -824,46 +885,48 @@ function decode(decoder: Decoder | undefined, parts: string[]): string | undefin
   return fallback && code === fallback.code ? decode(fallback.decoder, parts) : labels.get(code);
 }
 
+/** How each row of one survey's `.series` file decodes: its header's columns, resolved against the survey's code tables. */
+interface SeriesLayout {
+  area: Decoder | undefined;
+  endPeriodCol: number;
+  endYearCol: number;
+  /** Rows one field wider than the header read their coverage one field later (`SurveyDefinition.footnoteUnlabeled`). */
+  footnoteUnlabeled: boolean;
+  frequency: Decoder | undefined;
+  headerLength: number;
+  item: Decoder | undefined;
+  measure: Decoder | undefined;
+  seasonalCol: number;
+  seriesIdCol: number;
+  startYearCol: number;
+  survey: SurveyDefinition;
+  surveyAbbr: string;
+  titleCol: number;
+  titleDecoders: readonly (Decoder | undefined)[];
+}
+
 /**
- * Parse a `.series` file into catalog entries, decoding each row's area, item,
- * measure, frequency, and — when the row has no `series_title` — its synthesized title
- * through the survey's code tables (`tables`: table suffix → file text). Two
- * bodies yield no entries, so the survey keeps its indexed rows: one whose
- * header has no `series_id` column (an HTML error page served with a 200), and
- * one that ends mid-line. Every LABSTAT file ends in a line break; a
- * close-delimited response cut short resolves with a partial body instead of
- * rejecting, and parsing it would delete the missing tail and index the
- * fragment of its last line. Missing or structurally unusable declared code
- * tables also keep the survey's prior rows rather than replacing decoded data.
- * The measure table is the exception for a survey with no indexed rows
- * (`measureRequired` false): it only labels mirror-served series (#127), so
- * such a survey indexes without a measure rather than not at all.
+ * Resolve a `.series` header line against the survey's code tables (`tables`:
+ * table suffix → file text). Undefined, so the survey writes no row and keeps
+ * its indexed ones, for a header with no `series_id` column (an HTML error
+ * page served with a 200) and for a missing or structurally unusable declared
+ * code table, rather than replacing decoded data. The measure table is the
+ * exception for a survey with no indexed rows (`measureRequired` false): it
+ * only labels mirror-served series (#127), so such a survey indexes without a
+ * measure rather than not at all.
  */
-function parseSeries(
-  text: string,
+function seriesLayout(
+  headerLine: string,
   survey: SurveyDefinition,
   tables: ReadonlyMap<string, string>,
   measureRequired: boolean,
-): CatalogSeries[] {
-  const lines = text.split('\n');
-  if (lines.length < 2) return [];
-  if (lines.at(-1) !== '') {
-    warn(`${survey.abbr}.series ends mid-line — a truncated download; its indexed rows are kept.`);
-    return [];
-  }
-
-  const header = splitFields(lines[0] ?? '', false).map((h) => h.toLowerCase());
+): SeriesLayout | undefined {
+  const header = splitFields(headerLine, false).map((h) => h.toLowerCase());
   const seriesIdCol = header.indexOf('series_id');
   if (seriesIdCol < 0) {
     warn(`${survey.abbr}.series has no series_id header column — its indexed rows are kept.`);
-    return [];
+    return;
   }
-  const titleCol = header.indexOf('series_title');
-  const seasonalCol = header.findIndex((h) => h.includes('seasonal'));
-  const startYearCol = header.indexOf('begin_year');
-  const endYearCol = header.indexOf('end_year');
-  const endPeriodCol = header.indexOf('end_period');
-  const footnoteUnlabeled = survey.footnoteUnlabeled && !header.includes('footnote_codes');
 
   const parsedTables = new Map<string, CodeLabels | undefined>();
   let incomplete = false;
@@ -901,56 +964,153 @@ function parseSeries(
 
   const area = resolve(survey.area);
   const item = resolve(survey.item);
-  const frequencyDecoder = resolve(survey.frequency);
+  const frequency = resolve(survey.frequency);
   const titleDecoders = survey.title ? survey.title.map(resolve) : [item, area];
-  if (incomplete) return [];
-  const measureDecoder = resolve(survey.measure);
-  if (incomplete && measureRequired) return [];
-  const surveyAbbr = survey.abbr.toUpperCase();
+  if (incomplete) return;
+  const measure = resolve(survey.measure);
+  if (incomplete && measureRequired) return;
+  return {
+    area,
+    endPeriodCol: header.indexOf('end_period'),
+    endYearCol: header.indexOf('end_year'),
+    footnoteUnlabeled: Boolean(survey.footnoteUnlabeled) && !header.includes('footnote_codes'),
+    frequency,
+    headerLength: header.length,
+    item,
+    measure,
+    seasonalCol: header.findIndex((h) => h.includes('seasonal')),
+    seriesIdCol,
+    startYearCol: header.indexOf('begin_year'),
+    survey,
+    surveyAbbr: survey.abbr.toUpperCase(),
+    titleCol: header.indexOf('series_title'),
+    titleDecoders,
+  };
+}
 
-  const entries: CatalogSeries[] = [];
-  for (const line of lines.slice(1)) {
-    if (!line.trim()) continue;
-    const parts = splitFields(line, false);
-    const coverageOffset = footnoteUnlabeled && parts.length === header.length + 1 ? 1 : 0;
-    const startYear = coverageYear(
-      startYearCol < 0 ? undefined : parts[startYearCol + coverageOffset],
-    );
-    const endYear = coverageYear(endYearCol < 0 ? undefined : parts[endYearCol + coverageOffset]);
-    const endPeriod = endPeriodCol < 0 ? undefined : parts[endPeriodCol + coverageOffset];
-    const seriesId = parts[seriesIdCol];
-    if (!seriesId) continue;
+/**
+ * Decode one `.series` row's area, item, measure, frequency, and — when the
+ * row has no `series_title` — its synthesized title. Undefined for a blank
+ * line or a row without a SeriesID.
+ */
+function parseSeriesRow(line: string, layout: SeriesLayout): CatalogSeries | undefined {
+  if (!line.trim()) return;
+  const parts = splitFields(line, false);
+  const seriesId = parts[layout.seriesIdCol];
+  if (!seriesId) return;
+  const { endPeriodCol, endYearCol, seasonalCol, startYearCol, survey, titleCol } = layout;
+  const coverageOffset =
+    layout.footnoteUnlabeled && parts.length === layout.headerLength + 1 ? 1 : 0;
+  const startYear = coverageYear(
+    startYearCol < 0 ? undefined : parts[startYearCol + coverageOffset],
+  );
+  const endYear = coverageYear(endYearCol < 0 ? undefined : parts[endYearCol + coverageOffset]);
+  const endPeriod = endPeriodCol < 0 ? undefined : parts[endPeriodCol + coverageOffset];
 
-    const areaName = decode(area, parts);
-    const itemName = decode(item, parts);
-    const measure = decode(measureDecoder, parts);
-    const frequency = decode(frequencyDecoder, parts);
-    const title =
-      (titleCol >= 0 ? parts[titleCol] : undefined) ||
-      [survey.name, ...titleDecoders.map((d) => decode(d, parts))]
-        .filter((p): p is string => Boolean(p))
-        .join(' - ');
+  const areaName = decode(layout.area, parts);
+  const itemName = decode(layout.item, parts);
+  const measure = decode(layout.measure, parts);
+  const frequency = decode(layout.frequency, parts);
+  const title =
+    (titleCol >= 0 ? parts[titleCol] : undefined) ||
+    [survey.name, ...layout.titleDecoders.map((d) => decode(d, parts))]
+      .filter((p): p is string => Boolean(p))
+      .join(' - ');
 
-    const seasonCode = seasonalCol >= 0 ? parts[seasonalCol] : undefined;
-    const seasonal = seasonCode
-      ? seasonCode.toUpperCase() === 'S' || seasonCode === 'seasonally adjusted'
-      : false;
+  const seasonCode = seasonalCol >= 0 ? parts[seasonalCol] : undefined;
+  const seasonal = seasonCode
+    ? seasonCode.toUpperCase() === 'S' || seasonCode === 'seasonally adjusted'
+    : false;
 
-    entries.push({
-      seriesId,
-      title,
-      surveyAbbr,
-      ...(areaName && { areaName }),
-      ...(itemName && { itemName }),
-      ...(measure && { measure }),
-      ...(frequency && { frequency }),
-      ...(startYear !== undefined && { startYear }),
-      ...(endYear !== undefined && { endYear }),
-      ...(endPeriod && { endPeriod }),
-      seasonal,
-    });
+  return {
+    seriesId,
+    title,
+    surveyAbbr: layout.surveyAbbr,
+    ...(areaName && { areaName }),
+    ...(itemName && { itemName }),
+    ...(measure && { measure }),
+    ...(frequency && { frequency }),
+    ...(startYear !== undefined && { startYear }),
+    ...(endYear !== undefined && { endYear }),
+    ...(endPeriod && { endPeriod }),
+    seasonal,
+  };
+}
+
+/**
+ * How a streamed `.series` body ended. `whole`: it ended at a line break, its
+ * `rows` all written. `refused`: {@link seriesLayout} turned its header down
+ * and no row was written. `cut`: it ended mid-line. `unread`: its body read
+ * failed with `error`. A cut or unread body may have written rows from its
+ * complete lines, never one from the line it stopped in.
+ */
+type SeriesStream =
+  | { kind: 'whole'; rows: number }
+  | { kind: 'refused' }
+  | { kind: 'cut' }
+  | { kind: 'unread'; error: unknown };
+
+/**
+ * A survey's declared code tables, read before its `.series` request: the
+ * text of each that arrived, by table suffix, and why each other one did not.
+ */
+interface SurveyTables {
+  failures: { cause: string; table: string }[];
+  tables: Map<string, string>;
+}
+
+/**
+ * Parse a `.series` body as it arrives, handing its rows to `write` in chunks
+ * of at most {@link HARVEST_CHUNK_SIZE}, so no whole body, line array, or
+ * survey-wide row array is held. The header line is resolved first, and a
+ * header {@link seriesLayout} refuses cancels the body before any row. Every
+ * LABSTAT file ends in a line break, and a close-delimited response cut short
+ * resolves with a partial body rather than rejecting, so the text after the
+ * last line break is never parsed: it is the fragment of a line. A failed
+ * `write` rejects.
+ */
+async function streamSeries(
+  open: OpenResponse,
+  survey: SurveyDefinition,
+  tables: ReadonlyMap<string, string>,
+  measureRequired: boolean,
+  write: (rows: readonly CatalogSeries[]) => Promise<void>,
+): Promise<SeriesStream> {
+  /** Set by the body's own failure alone: a `write` that throws closes this generator, never throws into it. */
+  let readError: { error: unknown } | undefined;
+  let fragment = '';
+  const lines = (async function* () {
+    try {
+      fragment = yield* lineBatches(readBody(open));
+    } catch (error) {
+      readError = { error };
+    }
+  })();
+
+  let layout: SeriesLayout | undefined;
+  let rows: CatalogSeries[] = [];
+  let written = 0;
+  const flush = async () => {
+    await write(rows);
+    written += rows.length;
+    rows = [];
+  };
+  for await (const batch of lines) {
+    for (const line of batch) {
+      if (!layout) {
+        layout = seriesLayout(line, survey, tables, measureRequired);
+        if (!layout) return { kind: 'refused' };
+        continue;
+      }
+      const row = parseSeriesRow(line, layout);
+      if (!row) continue;
+      rows.push(row);
+      if (rows.length === HARVEST_CHUNK_SIZE) await flush();
+    }
   }
-  return entries;
+  if (rows.length > 0) await flush();
+  if (readError) return { kind: 'unread', error: readError.error };
+  return fragment ? { kind: 'cut' } : { kind: 'whole', rows: written };
 }
 
 /** Map a parsed catalog entry to a SQLite row. `seasonal` is stored as 0/1 (no boolean affinity). */
@@ -1346,7 +1506,10 @@ export class BlsCatalogService {
           signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
         },
       );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        await res.body?.cancel();
+        throw new Error(`HTTP ${res.status}`);
+      }
       return await res.text();
     };
     const results = await Promise.allSettled(OEWS_TABLE_NAMES.map(download));
@@ -1403,14 +1566,25 @@ export class BlsCatalogService {
   }
 
   /**
-   * Fetch `surveys` with bounded concurrency and upsert the parsed rows into
-   * the store in chunks. After a survey's upserts, its indexed rows absent from
-   * the new `.series` file are deleted; once every survey is done, so are the
-   * rows of surveys no longer configured (OES after its opt-in turns off) —
-   * judged against the whole configured list, so a harvest of some surveys
-   * leaves the others' rows alone. A survey that yields no rows (`SurveyLoad`)
-   * keeps its rows, and a harvest that applies no rows deletes nothing. Returns
-   * the rows applied and each failed survey's outcome, by abbreviation.
+   * Harvest `surveys` in batches of {@link SURVEY_FETCH_CONCURRENCY}: each
+   * batch's code tables load concurrently (`loadTables`), then its surveys run
+   * one at a time in `SURVEYS` order (`harvestSurvey`), each requesting its
+   * `.series` file only at its turn and streaming the body into the store
+   * before the next survey's request. No `.series` response waits open unread
+   * while another body streams, which for a body as long as OE's would leave
+   * it idle long enough for an upstream to close it; and a new index's row
+   * order — the order search keeps among equal scores — never depends on which
+   * download answers first. Once a survey's body has parsed whole, its indexed
+   * rows the new file no longer lists are deleted; once every survey is done,
+   * so are the rows of surveys no longer configured (OES after its opt-in
+   * turns off) — judged against the whole configured list, so a harvest of
+   * some surveys leaves the others' rows alone. A survey that fails
+   * (`SurveyLoad`) deletes none of its rows, though a body cut short or failed
+   * mid-read may have written rows from its complete lines (a survey that had
+   * no indexed rows keeps none of them); a harvest that applies no rows deletes
+   * nothing. A failed store write rejects the harvest, the streaming body
+   * cancelled and no later survey requested. Returns the rows applied and each
+   * failed survey's outcome, by abbreviation.
    */
   private async harvest(
     surveys: readonly SurveyDefinition[],
@@ -1423,36 +1597,30 @@ export class BlsCatalogService {
     let applied = 0;
     let oeTables: ReadonlyMap<string, string> = new Map();
     const failed = new Map<string, SurveyFailure>();
+    const written = (rows: number) => {
+      applied += rows;
+    };
     for (let i = 0; i < surveys.length; i += SURVEY_FETCH_CONCURRENCY) {
       const batch = surveys.slice(i, i + SURVEY_FETCH_CONCURRENCY);
-      const results = await Promise.allSettled(
-        batch.map((survey) => this.loadSurvey(survey, signal)),
+      const loaded = await Promise.allSettled(
+        batch.map((survey) => this.loadTables(survey, signal)),
       );
-      for (const [k, { abbr }] of batch.entries()) {
+      for (const [k, survey] of batch.entries()) {
         signal.throwIfAborted();
-        const result = results[k];
-        if (result?.status !== 'fulfilled') {
-          warn(`${abbr} harvest failed: ${String(result?.reason)}`);
+        const { abbr } = survey;
+        const tables = loaded[k];
+        if (tables?.status !== 'fulfilled') {
+          warn(`${abbr} harvest failed: ${String(tables?.reason)}`);
           failed.set(abbr, { outcome: 'unusable' });
           continue;
         }
-        if (result.value.outcome !== 'indexed') {
-          failed.set(abbr, result.value);
+        // A failed write rejects the harvest: the store failed, not the survey.
+        const load = await this.harvestSurvey(survey, tables.value, signal, written);
+        if (load.outcome !== 'indexed') {
+          failed.set(abbr, load);
           continue;
         }
-        const { entries, tables } = result.value;
-        if (abbr === OES_SURVEY_ABBR) oeTables = tables;
-        for (let j = 0; j < entries.length; j += HARVEST_CHUNK_SIZE) {
-          const chunk = entries.slice(j, j + HARVEST_CHUNK_SIZE);
-          signal.throwIfAborted();
-          await this.store.applyBatch(chunk.map(toRow), []);
-          applied += chunk.length;
-          await pause(signal);
-        }
-        const [first] = entries;
-        if (first) {
-          await this.deleteRows(first.surveyAbbr, new Set(entries.map((s) => s.seriesId)), signal);
-        }
+        if (abbr === OES_SURVEY_ABBR) oeTables = load.tables;
       }
     }
 
@@ -1466,20 +1634,130 @@ export class BlsCatalogService {
   }
 
   /**
-   * Delete `survey`'s indexed rows whose series id is not in `keep` — every row
-   * when `keep` is omitted. Walks the survey's rows a chunk at a time in rowid
-   * order off the `survey_abbr` index, deleting each chunk's stale ids in one
-   * transaction and yielding a turn between chunks, so no transaction spans a
-   * whole survey.
+   * Request one survey's `.series` file — at its turn, its code tables already
+   * read (`loadTables`) — and stream the body into the store (`streamSeries`),
+   * writing each chunk of rows and recording its SeriesIDs in a TEMP table, on
+   * disk under SQLite's default file-backed `temp_store` and gone with the
+   * connection, so the stale-row pass costs no heap however many series the
+   * survey lists. Once the body parsed whole, deletes the survey's indexed rows
+   * that table lacks. The TEMP table is made before the request, so nothing
+   * stands between the response and the stream, which reads the body to its
+   * end or cancels it unless the body itself fails. A failed or non-200
+   * request returns its cause; once the request opens, each table that did not
+   * arrive reports itself on stderr, for the header check to refuse. A body the
+   * parser refuses or that ends mid-line reports itself on stderr and returns
+   * `unusable`; a failed body read returns its cause. A survey with no indexed
+   * rows before this harvest deletes the rows such a partial body wrote.
+   * `written` hears each chunk's row count as it lands, and the count of rows
+   * deleted again as a negative. The request waits at most 30 s for headers,
+   * the body at most 60 s between chunks, with no whole-body deadline; an abort
+   * of `signal` rejects.
+   */
+  private async harvestSurvey(
+    survey: SurveyDefinition,
+    { failures, tables }: SurveyTables,
+    signal: AbortSignal,
+    written: (rows: number) => void,
+  ): Promise<SurveyLoad> {
+    const { abbr } = survey;
+    const db = await this.store.raw();
+    const listed = `temp.${CATALOG_TABLE}_listed_${abbr}`;
+    db.exec(`DROP TABLE IF EXISTS ${listed}`);
+    db.exec(`CREATE TABLE ${listed} (series_id TEXT PRIMARY KEY) WITHOUT ROWID`);
+    try {
+      // `openUrl` rejects only with the caller's cancellation.
+      const series = await openUrl(this.fileUrl(abbr, 'series'), this.userAgent, signal);
+      if (series.kind === 'refused') {
+        return { outcome: 'series_unavailable', cause: `HTTP ${series.status}` };
+      }
+      if (series.kind === 'failed') {
+        return {
+          outcome: 'series_unavailable',
+          cause: `request failed: ${failureCause(series.error, signal)}`,
+        };
+      }
+
+      const warm = this.cachedSurveyCounts.has(abbr.toUpperCase());
+      for (const { table, cause } of failures) {
+        /**
+         * A survey with no indexed rows still indexes without its measure table
+         * (see seriesLayout) — unless another dimension decodes through the same
+         * table (CU's item, PR's title), whose failure keeps the survey out.
+         */
+        const measureOnly =
+          !warm &&
+          table === survey.measure?.table &&
+          ![survey.area, survey.item, survey.frequency, ...(survey.title ?? [])].some(
+            (d) => d !== undefined && dimensionTables(d).includes(table),
+          );
+        const kept = measureOnly ? 'its rows index without a measure' : 'its indexed rows are kept';
+        warn(`${abbr}.${table} unavailable (${cause}) — ${kept}.`);
+      }
+
+      let wrote = 0;
+      const parsed = await streamSeries(series.open, survey, tables, warm, async (rows) => {
+        signal.throwIfAborted();
+        const record = db.prepare(`INSERT OR IGNORE INTO ${listed} (series_id) VALUES (?)`);
+        db.transaction(() => {
+          for (const { seriesId } of rows) record.run(seriesId);
+        });
+        await this.store.applyBatch(rows.map(toRow), []);
+        written(rows.length);
+        wrote += rows.length;
+        await pause(signal);
+      });
+      if ((parsed.kind === 'cut' || parsed.kind === 'unread') && !warm && wrote > 0) {
+        /**
+         * A survey with no indexed rows keeps none from a partial body: its rows
+         * would read as the whole survey, and any OE row turns OEWS composition off.
+         */
+        await this.deleteRows(abbr.toUpperCase(), undefined, signal);
+        written(-wrote);
+      }
+      if (parsed.kind === 'unread') {
+        return {
+          outcome: 'series_unavailable',
+          cause: `body read failed: ${failureCause(parsed.error, signal)}`,
+        };
+      }
+      if (parsed.kind === 'cut') {
+        const kept = warm
+          ? 'rows from its complete lines are written, and none of its indexed rows are removed'
+          : 'it indexes no rows until a whole download arrives';
+        warn(`${abbr}.series ends mid-line — a truncated download; ${kept}.`);
+        return { outcome: 'unusable' };
+      }
+      if (parsed.kind === 'refused' || parsed.rows === 0) return { outcome: 'unusable' };
+      await this.deleteRows(abbr.toUpperCase(), listed, signal);
+      return { outcome: 'indexed', tables };
+    } finally {
+      // A stopped harvest leaves the table to the connection `shutdown()` closes.
+      if (!signal.aborted) db.exec(`DROP TABLE ${listed}`);
+    }
+  }
+
+  /**
+   * Delete `survey`'s indexed rows whose series id the `listed` TEMP table
+   * lacks — every row when `listed` is omitted. Walks the survey's rows a
+   * chunk at a time in rowid order off the `survey_abbr` index, deleting each
+   * chunk's stale ids in one transaction and yielding a turn between chunks,
+   * so no transaction spans a whole survey.
    */
   private async deleteRows(
     survey: string,
-    keep: ReadonlySet<string> | undefined,
+    listed: string | undefined,
     signal: AbortSignal,
   ): Promise<void> {
-    const page = (await this.store.raw()).prepare<{ rowid: number; series_id: string }>(
-      `SELECT rowid, series_id FROM ${CATALOG_TABLE}
-       WHERE survey_abbr = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
+    const kept = listed
+      ? `EXISTS (SELECT 1 FROM ${listed} l WHERE l.series_id = c.series_id)`
+      : '0';
+    const page = (await this.store.raw()).prepare<{
+      kept: number;
+      rowid: number;
+      series_id: string;
+    }>(
+      `SELECT c.rowid AS rowid, c.series_id AS series_id, ${kept} AS kept FROM ${CATALOG_TABLE} c
+       WHERE c.survey_abbr = ? AND c.rowid > ? ORDER BY c.rowid LIMIT ?`,
     );
     let after = 0;
     for (;;) {
@@ -1488,24 +1766,20 @@ export class BlsCatalogService {
       const last = rows.at(-1);
       if (!last) return;
       after = last.rowid;
-      const stale = rows.filter((r) => !keep?.has(r.series_id)).map((r) => r.series_id);
+      const stale = rows.filter((r) => !r.kept).map((r) => r.series_id);
       if (stale.length > 0) await this.store.applyBatch([], stale);
       await pause(signal);
     }
   }
 
   /**
-   * Fetch a survey's `.series` file and the code tables its dimensions name,
-   * then parse. A failed `.series` request or body read returns its cause; a
-   * failed or unusable declared table, or a `.series` body the parser refuses,
-   * reports itself on stderr and returns `unusable`. Either preserves the
-   * survey's previous snapshot. Every request also aborts on `signal`, and an
-   * abort rejects rather than reading as a failed survey.
+   * Read the code tables `survey`'s dimensions name, concurrently and whole,
+   * before its `.series` request opens. A table that does not arrive is left
+   * out of `tables`, its cause kept for `harvestSurvey` to report; a non-200
+   * body is cancelled unread. Each request waits at most 15 s and also aborts
+   * on `signal`, and an abort rejects rather than reading as a failed table.
    */
-  private async loadSurvey(survey: SurveyDefinition, signal: AbortSignal): Promise<SurveyLoad> {
-    const { abbr } = survey;
-    const url = (file: string) => `${this.catalogBaseUrl}/${abbr}/${abbr}.${file}`;
-    const headers = { 'User-Agent': this.userAgent };
+  private async loadTables(survey: SurveyDefinition, signal: AbortSignal): Promise<SurveyTables> {
     const dimensions = [
       survey.area,
       survey.item,
@@ -1514,77 +1788,42 @@ export class BlsCatalogService {
       ...(survey.title ?? []),
     ];
     const tableNames = [...new Set(dimensions.flatMap((d) => (d ? dimensionTables(d) : [])))];
-    const request = (file: string, timeoutMs: number) =>
-      fetch(url(file), {
-        headers,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-      });
-
-    /**
-     * Why a request or body read failed, rethrowing a shutdown's abort. Node's
-     * fetch rejects with a bare "fetch failed" that carries the reason in `cause`.
-     */
-    const failure = (error: unknown): string => {
-      signal.throwIfAborted();
-      if (!(error instanceof Error)) return String(error);
-      return error.cause instanceof Error
-        ? `${error.message}: ${error.cause.message}`
-        : error.message;
+    const read = async (
+      table: string,
+    ): Promise<{ table: string } & ({ text: string } | { cause: string })> => {
+      let res: Response;
+      try {
+        res = await fetch(this.fileUrl(survey.abbr, table), {
+          headers: { 'User-Agent': this.userAgent },
+          signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+        });
+      } catch {
+        signal.throwIfAborted();
+        return { table, cause: 'request failed' };
+      }
+      if (!res.ok) {
+        await res.body?.cancel();
+        return { table, cause: `HTTP ${res.status}` };
+      }
+      try {
+        return { table, text: await res.text() };
+      } catch (error) {
+        return { table, cause: `body read failed: ${failureCause(error, signal)}` };
+      }
     };
 
-    const [seriesRes, ...tableResults] = await Promise.allSettled([
-      request('series', 30_000),
-      ...tableNames.map((table) => request(table, 15_000)),
-    ]);
+    // In declared order, so the warnings `harvestSurvey` writes keep that order.
+    const loaded: SurveyTables = { failures: [], tables: new Map() };
+    for (const result of await Promise.all(tableNames.map(read))) {
+      if ('text' in result) loaded.tables.set(result.table, result.text);
+      else loaded.failures.push(result);
+    }
+    return loaded;
+  }
 
-    if (seriesRes.status === 'rejected') {
-      return {
-        outcome: 'series_unavailable',
-        cause: `request failed: ${failure(seriesRes.reason)}`,
-      };
-    }
-    if (!seriesRes.value.ok) {
-      return { outcome: 'series_unavailable', cause: `HTTP ${seriesRes.value.status}` };
-    }
-    let seriesText: string;
-    try {
-      seriesText = await seriesRes.value.text();
-    } catch (error) {
-      return { outcome: 'series_unavailable', cause: `body read failed: ${failure(error)}` };
-    }
-
-    const warm = this.cachedSurveyCounts.has(abbr.toUpperCase());
-    const tables = new Map<string, string>();
-    for (const [i, table] of tableNames.entries()) {
-      const res = tableResults[i];
-      let cause: string;
-      if (res?.status !== 'fulfilled') cause = 'request failed';
-      else if (!res.value.ok) cause = `HTTP ${res.value.status}`;
-      else {
-        try {
-          tables.set(table, await res.value.text());
-          continue;
-        } catch (error) {
-          cause = `body read failed: ${failure(error)}`;
-        }
-      }
-      /**
-       * A survey with no indexed rows still indexes without its measure table
-       * (see parseSeries) — unless another dimension decodes through the same
-       * table (CU's item, PR's title), whose failure keeps the survey out.
-       */
-      const measureOnly =
-        !warm &&
-        table === survey.measure?.table &&
-        ![survey.area, survey.item, survey.frequency, ...(survey.title ?? [])].some(
-          (d) => d !== undefined && dimensionTables(d).includes(table),
-        );
-      const kept = measureOnly ? 'its rows index without a measure' : 'its indexed rows are kept';
-      warn(`${abbr}.${table} unavailable (${cause}) — ${kept}.`);
-    }
-
-    const entries = parseSeries(seriesText, survey, tables, warm);
-    return entries.length > 0 ? { outcome: 'indexed', entries, tables } : { outcome: 'unusable' };
+  /** The URL of one survey's LABSTAT file, `file` its suffix (`series`, `area`). */
+  private fileUrl(abbr: string, file: string): string {
+    return `${this.catalogBaseUrl}/${abbr}/${abbr}.${file}`;
   }
 
   /**
@@ -1725,7 +1964,7 @@ export class BlsCatalogService {
         scored.push({
           s,
           exact: 1,
-          allWords: 0,
+          words: 0,
           place: 0,
           score: 1000,
           current: 0,
@@ -1772,10 +2011,13 @@ export class BlsCatalogService {
       if (startsWord(titleLower, query, wholeQueryEnd)) score += 10;
       if (commonText !== undefined && startsWord(commonText, query, wholeQueryEnd)) score += 15;
 
-      // Token-level match. `matched` counts the tokens the row matches anywhere,
-      // its headline description included, for the headline gate below;
-      // `missing` counts the required words it matches nowhere, its survey's
-      // alias words included. A core measure matches `core` itself.
+      /**
+       * Token-level match. `matched` counts the tokens the row matches anywhere,
+       * its headline description included, for the headline gate below;
+       * `missing` counts the required words it matches nowhere (a word its
+       * survey's alias covers counts as matched), and the required words left
+       * are its `words` rank key. A core measure matches `core` itself.
+       */
       const aliasCovered = covered.get(survey);
       const idLower = s.seriesId.toLowerCase();
       const shortTerms = wholeShortTerms
@@ -1836,9 +2078,11 @@ export class BlsCatalogService {
       // names, its alias always among them: it outscores rows matching `core`
       // inside another word ("Fiber cores and tubes").
       if ((isCommon || isCore) && (aliasHit || matched * 2 > tokens.length)) score += 8;
-      const allWords = Number(required.length > 0 && missing === 0);
+      const words = required.length - missing;
       // A place the query names counts only on a row that matches every other word.
-      const place = Number(allWords === 1 && s.areaName !== undefined && named.has(s.areaName));
+      const place = Number(
+        required.length > 0 && missing === 0 && s.areaName !== undefined && named.has(s.areaName),
+      );
       // A row is current when its data runs to within a year of its survey's
       // newest row, so JT state rows and MP industries a year behind stay
       // current; unknown coverage counts as current.
@@ -1847,24 +2091,23 @@ export class BlsCatalogService {
         s.endYear === undefined || newest === undefined || s.endYear >= newest - 1,
       );
       const national = areaFilter ? 0 : Number(!s.areaName || NATIONAL_AREAS.has(s.areaName));
-      // The JOLTS all-industry, all-size row its breakdowns tie.
-      const aggregate = Number(
-        survey === 'JT' &&
-          s.title.includes(' - Total nonfarm - ') &&
-          s.title.includes(' - All size classes - '),
-      );
-      scored.push({ s, exact: 0, allWords, place, score, current, national, aggregate });
+      const aggregate = Number(isAggregate(survey, s.seriesId));
+      scored.push({ s, exact: 0, words, place, score, current, national, aggregate });
     }
 
-    // Exact IDs lead, then rows matching every query word — the place rows
-    // the query names first among them — then score. At equal score, current
-    // rows lead the rest, then national rows lead unless area is explicit,
-    // then the JOLTS aggregate leads its breakdowns; remaining ties keep
-    // candidate order.
+    /**
+     * Exact IDs lead, then rows by how many required query words they match,
+     * so rows matching every word lead — the place rows the query names first
+     * among them — and a headline its alias lifts never outranks a row
+     * matching more of the words; then score. At equal score, current rows
+     * lead the rest, then national rows lead unless area is explicit, then a
+     * survey's aggregate leads its breakdowns; remaining ties keep candidate
+     * order.
+     */
     scored.sort(
       (a, b) =>
         b.exact - a.exact ||
-        b.allWords - a.allWords ||
+        b.words - a.words ||
         b.place - a.place ||
         b.score - a.score ||
         b.current - a.current ||
@@ -1881,8 +2124,11 @@ export class BlsCatalogService {
    * The FTS candidate query: up to `CANDIDATE_LIMIT` rows matching `match`,
    * with structured filters applied so the cap bounds only rows that pass
    * them. Rows matching every required word (`allWords`) are admitted first,
-   * those in an area the query names (`named`) leading them, then the rest in
-   * bm25 order — rows with no decoded area included. The area is a
+   * those in an area the query names (`named`) leading them, then the national
+   * aggregates (`AGGREGATE_SERIES`; every aggregate under an explicit `area`),
+   * so a total that tied breakdowns would crowd past the cap still reaches the
+   * rescore; then the rest in bm25 order — rows with no decoded area included.
+   * The area is a
    * case-insensitive substring of `area_name`, `title`, or `series_id` — the
    * rescore's area gate, pushed down as bound `LIKE` parameters. A resolved
    * state or area code instead keeps rows whose `area_name` is one of its
@@ -1945,12 +2191,26 @@ export class BlsCatalogService {
       }
     }
     const db = await this.store.raw();
-    // `area_name IN (…)` is NULL for a row with no decoded area; the IS NOT NULL
-    // guard keeps such rows at 0, so they keep their bm25 place.
+    /**
+     * One admission rank, so the all-words match runs once per row: 0 for a
+     * row missing a required word, otherwise 1, plus 2 in an area the query
+     * names, plus 1 for an aggregate the rescore lifts at equal score. That is
+     * a national aggregate unless `area` is explicit, since the rescore's
+     * national key outranks its aggregate key: a state aggregate admitted
+     * early would crowd out national rows that outrank it. `area_name IN (…)`
+     * is NULL for a row with no decoded area, which would void the sum, hence
+     * the IS NULL guards.
+     */
     const place =
       named.length > 0
-        ? `(all_words AND area_name IS NOT NULL AND area_name IN (${named.map(() => '?').join(',')})) DESC, `
+        ? `2 * (area_name IS NOT NULL AND area_name IN (${named.map(() => '?').join(',')})) + `
         : '';
+    const national = area ? [] : [...NATIONAL_AREAS];
+    const nationalSql =
+      national.length > 0
+        ? `(area_name IS NULL OR area_name IN (${national.map(() => '?').join(',')})) AND `
+        : '';
+    const aggregate = `${nationalSql}CASE survey_abbr ${[...AGGREGATE_SERIES].map(() => 'WHEN ? THEN series_id GLOB ?').join(' ')} ELSE 0 END`;
     return db
       .prepare<MirrorRow>(
         `SELECT * FROM (
@@ -1959,9 +2219,16 @@ export class BlsCatalogService {
            JOIN ${CATALOG_FTS} ON ${CATALOG_TABLE}.rowid = ${CATALOG_FTS}.rowid
            WHERE ${where.join(' AND ')}
          )
-         ORDER BY all_words DESC, ${place}relevance ASC LIMIT ?`,
+         ORDER BY CASE WHEN all_words THEN 1 + ${place}(${aggregate}) ELSE 0 END DESC, relevance ASC LIMIT ?`,
       )
-      .all(...allWordsParams, ...params, ...named, CANDIDATE_LIMIT);
+      .all(
+        ...allWordsParams,
+        ...params,
+        ...named,
+        ...national,
+        ...[...AGGREGATE_SERIES].flat(),
+        CANDIDATE_LIMIT,
+      );
   }
 
   /**

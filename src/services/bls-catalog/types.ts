@@ -147,14 +147,17 @@ export type SurveySearchCoverage =
   | { searchCoverage: 'composed' | 'none' };
 
 /**
- * One survey's harvest outcome. `indexed` carries its parsed rows and the code
- * tables it fetched, by table suffix. Otherwise it
- * keeps its indexed rows: `series_unavailable` when its `.series` request or
- * body read failed, with the cause; `unusable` when a declared code table or the
+ * One survey's harvest outcome. `indexed`: its `.series` body parsed whole,
+ * its rows already written as they streamed; carries the code tables it
+ * fetched, by table suffix. Otherwise none of its indexed rows are deleted,
+ * though a body cut short or failed mid-read may have written rows from its
+ * complete lines (a survey that had no indexed rows keeps none of them):
+ * `series_unavailable` when its `.series` request or body read failed, with
+ * the cause; `unusable` when a declared code table or the
  * `.series` body failed a check that reported itself on stderr.
  */
 export type SurveyLoad =
-  | { outcome: 'indexed'; entries: CatalogSeries[]; tables: ReadonlyMap<string, string> }
+  | { outcome: 'indexed'; tables: ReadonlyMap<string, string> }
   | { outcome: 'series_unavailable'; cause: string }
   | { outcome: 'unusable' };
 

@@ -32,6 +32,14 @@ import {
   unpublishedOewsHint,
 } from '@/services/bls-catalog/bls-catalog-service.js';
 import type { CatalogSeries } from '@/services/bls-catalog/types.js';
+import {
+  cpuPairAsync,
+  expectLinearCpuTime,
+  expectLinearCpuTimeAsync,
+  LINE_BREAK_SHAPES,
+  repeatTo,
+  type TextShape,
+} from '../../fixtures/linear-time.js';
 import { OE_TABLE_FILES, storeOewsTables, tsv } from './oews-fixtures.js';
 
 let tmpDir: string;
@@ -61,6 +69,36 @@ function toMirrorRow(s: CatalogSeries): MirrorRow {
     end_year: s.endYear ?? null,
     end_period: s.endPeriod ?? null,
   };
+}
+
+/**
+ * Resolves once the installed fetch mock is asked for `file` (a LABSTAT file
+ * name such as `jt.series`), or for anything when `file` is omitted. Wraps the
+ * mock installed now, which keeps serving every request.
+ */
+function requestOf(file?: string): Promise<void> {
+  const serve = vi.mocked(globalThis.fetch).getMockImplementation()!;
+  let resolve: () => void = () => {};
+  const requested = new Promise<void>((r) => {
+    resolve = r;
+  });
+  vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+    const u = String(url);
+    if (file === undefined || u.slice(u.lastIndexOf('/') + 1) === file) resolve();
+    return serve(url, init);
+  });
+  return requested;
+}
+
+/** A 200 whose body errors with `error` on its first read. */
+function erroringBody(error: Error): Response {
+  return new Response(
+    new ReadableStream({
+      pull(controller) {
+        controller.error(error);
+      },
+    }),
+  );
 }
 
 /**
@@ -499,6 +537,7 @@ describe('BlsCatalogService.readiness (#112)', () => {
 
   it('is loading through a cold harvest, between its attempts too, and unavailable naming the stop once it rejects', async () => {
     const { requested } = serveLabstat({});
+    const lastSeries = requestOf(`${catalogSurveyList(false).split(',').at(-1)}.series`);
     const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', join(tmpDir, 'cold-attempts.db'));
     const loading = svc.load(2);
     const settled = loading.then(
@@ -507,9 +546,8 @@ describe('BlsCatalogService.readiness (#112)', () => {
     );
 
     // Every survey failed on the first attempt; the second waits out its backoff.
-    await vi.waitFor(() =>
-      expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(surveyCount),
-    );
+    await lastSeries;
+    expect(requested.filter((f) => f.endsWith('.series'))).toHaveLength(surveyCount);
     expect(svc.readiness).toEqual({ status: 'loading' });
     await expect(svc.search(searchInput('unemployment'))).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
@@ -567,9 +605,10 @@ describe('BlsCatalogService.readiness (#112)', () => {
     await store.close();
 
     const release = holdDownloads({});
+    const held = requestOf();
     const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
     const refreshing = svc.load(1);
-    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await held;
     expect(svc.readiness).toEqual({ status: 'ready' });
     release();
     await refreshing;
@@ -1289,8 +1328,8 @@ describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
   /**
    * Serve every survey one fresh row (`{ABBR}NEW`) and every declared table a
    * decoding row, except the files `failing` answers — mutable between checks.
-   * A `.series` body is built a microtask after its request, by which time its
-   * survey's table requests (issued alongside it) have named every key column.
+   * A `.series` body names every key column the table requests so far have:
+   * a survey's tables are requested before its `.series` file.
    */
   function serveSurveys(): {
     requested: string[];
@@ -1315,7 +1354,6 @@ describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
         const header = [...COMPOSITE_KEYS, `${table}_code`];
         return new Response(`${header.join('\t')}\tlabel_text\n${row(header)}\tDecoded\n`);
       }
-      await Promise.resolve();
       const header = [...keys];
       return new Response(
         `series_id\tseries_title\tseasonal\t${header.join('\t')}\n${abbr.toUpperCase()}NEW\tSeries ${abbr}\tS\t${row(header)}\n`,
@@ -1389,14 +1427,8 @@ describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
     await svc.shutdown();
   });
 
-  /** A body the runtime cannot read, as Node's string limit refuses a `.series` file over ~512 MiB. */
-  const unreadable: Served = () => {
-    const response = new Response('');
-    vi.spyOn(response, 'text').mockRejectedValue(
-      new RangeError('Cannot create a string longer than 0x1fffffe8 characters'),
-    );
-    return Promise.resolve(response);
-  };
+  /** A 200 whose body errors on its first read, as a connection reset after the headers does. */
+  const unreadable: Served = () => Promise.resolve(erroringBody(new Error('connection reset')));
 
   it.each([
     ['an unreadable body', 168, [1, 3, 7, 15], unreadable],
@@ -1541,11 +1573,7 @@ describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
       `${prefix} (HTTP 503) — its indexed rows are kept; next retry at the next hourly check.\n`,
     ]);
 
-    failing['jt.series'] = () => {
-      const response = new Response('');
-      vi.spyOn(response, 'text').mockRejectedValue(new Error('body failure'));
-      return Promise.resolve(response);
-    };
+    failing['jt.series'] = () => Promise.resolve(erroringBody(new Error('body failure')));
     let from = lines.length;
     await nextCheck(svc, requested); // check 1
     expect(jtLines(from)).toEqual([
@@ -1574,14 +1602,15 @@ describe('BlsCatalogService.load — retrying failed surveys (#104)', () => {
   });
 
   it('stops an in-flight retry on shutdown without a later write', async () => {
-    const { svc, requested, failing } = await afterJtFails();
+    const { svc, failing } = await afterJtFails();
     failing['jt.series'] = hang;
+    const jtRequested = requestOf('jt.series');
     const writeState = vi.spyOn(storeOf(svc), 'writeState');
     const retry = svc.load(1).then(
       () => 'resolved',
       (err: unknown) => (err instanceof Error ? err.message : String(err)),
     );
-    await vi.waitFor(() => expect(requested.at(-1)?.startsWith('jt.')).toBe(true));
+    await jtRequested;
     await svc.shutdown();
     expect(await retry).toMatch(/stopped by shutdown/);
     expect(writeState).not.toHaveBeenCalled();
@@ -2541,12 +2570,13 @@ describe('BlsCatalogService.load — index version upgrade (#63)', () => {
       const body = JT_FILES[u.slice(u.lastIndexOf('/') + 1)];
       return body === undefined ? new Response('', { status: 404 }) : new Response(body);
     });
+    const held = requestOf();
 
     const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
     const loading = svc.load(1);
 
     // The harvest is in flight (held at the gate); the old index serves meanwhile.
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    await held;
     expect(svc.isLoaded).toBe(true);
     const during = await svc.search(searchInput('JTS000000000000000QUR'));
     expect(during.series[0]?.title).toBe(LEGACY_TITLE);
@@ -3035,11 +3065,12 @@ describe('BlsCatalogService.load — index version 4 adds frequency and coverage
       const body = FREQUENCY_FILES[u.slice(u.lastIndexOf('/') + 1)];
       return body === undefined ? new Response('', { status: 404 }) : new Response(body);
     });
+    const held = requestOf();
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
     const svc = new BlsCatalogService(LABSTAT_URL, 'ua/1.0', dbPath, 168, false);
     const loading = svc.load(1);
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    await held;
     const during = await svc.search(searchInput('LNS14000000Q'));
     expect(during.series[0]).toMatchObject({
       seriesId: 'LNS14000000Q',
@@ -3630,39 +3661,6 @@ describe('BlsCatalogService.search — area codes and states (#110)', () => {
   });
 });
 
-/**
- * Assert that `run` takes linear time in its input's length. Times 10-call
- * batches of `run` on the 5K, 20K, and 80K-character `text` in five
- * interleaved rounds and keeps each size's fastest batch: noise only adds
- * time, and a GC pause or preemption must then slow the same size in every
- * round to count. The 5K time is floored at 10 µs, since several inputs finish
- * near timer resolution there, where a ratio is noise. Linear growth predicts
- * 16× from 5K to 80K; quadratic would be 256×.
- */
-function expectLinearTime(
-  run: (input: string) => void,
-  text: (length: number) => string,
-  label: string,
-): void {
-  const time = (input: string) => {
-    const start = performance.now();
-    for (let i = 0; i < 10; i++) run(input);
-    return (performance.now() - start) / 10;
-  };
-  const [small, mid, large] = [text(5_000), text(20_000), text(80_000)];
-  time(small); // warm the JIT
-  let [t5k, t20k, t80k] = [Infinity, Infinity, Infinity];
-  for (let round = 0; round < 5; round++) {
-    t5k = Math.min(t5k, time(small));
-    t20k = Math.min(t20k, time(mid));
-    t80k = Math.min(t80k, time(large));
-  }
-  t5k = Math.max(t5k, 0.01);
-  expect(t80k / t5k, label).toBeLessThan(64);
-  expect(t20k, label).toBeLessThan(t80k * 2);
-  expect(t80k, label).toBeLessThan(50);
-}
-
 describe('BlsCatalogService.search — geographic preference (#98)', () => {
   const national: CatalogSeries = {
     seriesId: 'LNS14000000',
@@ -3818,26 +3816,18 @@ describe('BlsCatalogService.search — geographic preference (#98)', () => {
     },
   );
 
-  it('keeps the geographic scanner bounded across long and multiline queries', async () => {
-    const svc = await seedAndLoad([national, place('Seattle')]);
-    for (const shape of [
-      (n: number) => `seattle ${'9'.repeat(n)}`,
-      (n: number) => `seattle ${'§1 x'.repeat(n)}\ny`,
-      (n: number) => `seattle ${'  \r\n'.repeat(n)}`,
-    ]) {
-      let first = 0;
-      for (const n of [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000]) {
-        const query = shape(n);
-        const start = process.threadCpuUsage();
-        await svc.search(search(query));
-        const cpu = process.threadCpuUsage(start);
-        const elapsed = Math.max((cpu.user + cpu.system) / 1000, 1);
-        first ||= elapsed;
-        expect(elapsed).toBeLessThan(500);
-        if (n === 320_000) expect(elapsed / first).toBeLessThan(256);
-      }
-    }
-  });
+  it.each<TextShape>([['a long digit run', (n) => '9'.repeat(n)], ...LINE_BREAK_SHAPES])(
+    'keeps the geographic scanner bounded on a place followed by %s',
+    async (label, text) => {
+      const svc = await seedAndLoad([national, place('Seattle')]);
+      await expectLinearCpuTimeAsync(
+        (query) => svc.search(search(query)),
+        (n) => `seattle ${text(n - 8)}`,
+        label,
+        250,
+      );
+    },
+  );
 
   it('rebuilds vocabulary when refreshed decoded areas change', async () => {
     const files: Record<string, string> = {
@@ -4013,11 +4003,21 @@ describe('escapeLike (#69)', () => {
     expect(escapeLike('Seattle-Tacoma, WA')).toBe('Seattle-Tacoma, WA');
   });
 
-  it('runs in linear time on worst-case caller text', () => {
-    for (const ch of ['%', '\\', '_']) {
-      expectLinearTime(escapeLike, (n) => ch.repeat(n), ch);
-      expect(escapeLike(ch.repeat(80_000))).toHaveLength(160_000);
-    }
+  it.each<TextShape>([
+    ['%', (n) => '%'.repeat(n)],
+    ['\\', (n) => '\\'.repeat(n)],
+    ['_', (n) => '_'.repeat(n)],
+    ...LINE_BREAK_SHAPES,
+  ])(
+    'runs in linear time on worst-case caller text: %s',
+    (label, text) => {
+      expectLinearCpuTime(escapeLike, text, label, 100);
+    },
+    0,
+  );
+
+  it.each(['%', '\\', '_'])('escapes every character of a long run of %s', (ch) => {
+    expect(escapeLike(ch.repeat(80_000))).toHaveLength(160_000);
   });
 });
 
@@ -4488,6 +4488,507 @@ describe('BlsCatalogService.search — currency, the JOLTS aggregate, and core m
       if (query === 'core') expect(result).toHaveLength(2);
     },
   );
+});
+
+describe('BlsCatalogService.search — survey aggregates lead their breakdowns (#128, #132)', () => {
+  const ids = async (svc: BlsCatalogService, input: Parameters<BlsCatalogService['search']>[0]) =>
+    (await svc.search(input)).series.map((s) => s.seriesId);
+  /** A current row; the third SeriesID character is the seasonal flag in every survey here. */
+  const row = (
+    seriesId: string,
+    surveyAbbr: string,
+    title: string,
+    areaName: string,
+    itemName?: string,
+    frequency?: string,
+  ): CatalogSeries => ({
+    seriesId,
+    title,
+    surveyAbbr,
+    seasonal: seriesId[2] === 'S',
+    areaName,
+    ...(itemName && { itemName }),
+    ...(frequency && { frequency }),
+    endYear: 2026,
+  });
+  const US = 'United States (National)';
+  const cm = (seriesId: string, title: string, item = 'Total compensation') =>
+    row(seriesId, 'CM', title, US, item);
+  const ci = (seriesId: string, title: string, item = 'Total compensation') =>
+    row(seriesId, 'CI', title, US, item);
+
+  /** Real 0.7.1 rows. Every row ties the totals on score; the percent rows lead on bm25. */
+  const ECEC: CatalogSeries[] = [
+    cm(
+      'CMU1010000000000P',
+      'Total compensation as a percent of total compensation for civilian workers',
+    ),
+    cm(
+      'CMU2010000000000P',
+      'Total compensation as a percent of total compensation for private industry workers',
+    ),
+    cm(
+      'CMU1270000000000P',
+      "Workers' compensation as a percent of total compensation for civilian workers",
+      "Workers' compensation",
+    ),
+    cm('CMU1010000000000D', 'Total compensation cost per hour worked for civilian workers'),
+  ];
+
+  it.each(['ecec total compensation', 'compensation'])(
+    'leads %j with the civilian total compensation cost per hour, over its percent rows',
+    async (query) => {
+      const svc = await seedAndLoad(ECEC);
+      expect((await ids(svc, search(query)))[0]).toBe('CMU1010000000000D');
+      expect(await ids(svc, search(query, { limit: 1 }))).toEqual(['CMU1010000000000D']);
+    },
+  );
+
+  /**
+   * Real 0.7.1 CM and CI rows. The percentile rows say "costs", so a "costs"
+   * query scores them above the totals, whose titles say "cost".
+   */
+  const PRIVATE: CatalogSeries[] = [
+    cm(
+      'CMU2010000000000N',
+      'Total compensation costs per hour worked at 90th percentile for private industry workers, current dollar',
+    ),
+    cm(
+      'CMU2010000000000P',
+      'Total compensation as a percent of total compensation for private industry workers',
+    ),
+    ci(
+      'CIS2012300000000I',
+      'Total compensation for private industry workers in the construction industry, current dollar index',
+    ),
+    ci(
+      'CIS2013000000000I',
+      'Total compensation for private industry workers in the manufacturing industry, current dollar index',
+    ),
+    cm('CMU2010000000000D', 'Total compensation cost per hour worked for private industry workers'),
+    ci(
+      'CIS2010000000000I',
+      'Total compensation for all private industry workers, current dollar index',
+    ),
+    cm(
+      'CMU1010000000000N',
+      'Total compensation costs per hour worked at 90th percentile for civilian workers, current dollar',
+    ),
+    ci(
+      'CIS1013000000000I',
+      'Total compensation for civilian workers in the manufacturing industry, current dollar index',
+    ),
+    ci('CIS1010000000000I', 'Total compensation for all civilian workers, current dollar index'),
+    ci(
+      'CIS1020000000000I',
+      'Wages and salaries for all civilian workers, current dollar index',
+      'Wages and salaries',
+    ),
+  ];
+
+  it('ranks the CM and CI totals above the equal-score industry breakdowns, below a better score', async () => {
+    const svc = await seedAndLoad(PRIVATE);
+    const result = await ids(
+      svc,
+      search('employer costs total compensation private industry', { limit: 50 }),
+    );
+    expect(result[0]).toBe('CMU2010000000000N');
+    const lastTotal = Math.max(
+      result.indexOf('CMU2010000000000D'),
+      result.indexOf('CIS2010000000000I'),
+    );
+    for (const breakdown of ['CIS2012300000000I', 'CIS2013000000000I', 'CMU2010000000000P']) {
+      expect(result.indexOf(breakdown)).toBeGreaterThan(lastTotal);
+    }
+  });
+
+  it.each([
+    ['employer cost total compensation private industry', 'CMU2010000000000D'],
+    ['employment cost index wages and salaries', 'CIS1020000000000I'],
+    // A named breakdown outscores the total it breaks down.
+    ['employer costs total compensation 90th percentile', 'CMU1010000000000N'],
+    ['employment cost index manufacturing', 'CIS1013000000000I'],
+  ])('keeps %j led by %s (characterization)', async (query, leader) => {
+    const svc = await seedAndLoad(PRIVATE);
+    expect((await ids(svc, search(query)))[0]).toBe(leader);
+  });
+
+  const bd = (seriesId: string, title: string, item: string, frequency = 'Quarterly') =>
+    row(seriesId, 'BD', title, 'U.S. totals', item, frequency);
+  /**
+   * 1,001 national industry rows titled only "Gross job gains" (or losses), as
+   * 1,310 real rows are: they outrank the totals' longer titles on bm25 and fill
+   * the 1,000-row candidate pool ahead of them.
+   */
+  const breakdowns = (dataClass: string, label: string) =>
+    Array.from({ length: 1001 }, (_, i) =>
+      bd(`BDS0000000000${300000 + i}1100${dataClass}LQ5`, label, `Industry ${i}`),
+    );
+  const TOTALS = {
+    gains: [
+      bd(
+        'BDS0000000000000000110001LQ5',
+        'Quarterly gross job gains for the total private sector in the U.S. (rounded to the nearest thousands)',
+        'Total private',
+      ),
+      bd(
+        'BDU0000000000000000110001LQ5',
+        'Quarterly gross job gains for the total private sector in the U.S. (rounded to the nearest thousands)',
+        'Total private',
+      ),
+      bd('BDU0000000000000000110001LA5', 'Gross job gains', 'Total private', 'Annual'),
+    ],
+    losses: [
+      ['BDS0000000000000000110004LQ5', 'Quarterly'],
+      ['BDU0000000000000000110004LQ5', 'Quarterly'],
+      ['BDU0000000000000000110004LA5', 'Annual'],
+    ].map(([id = '', frequency]) =>
+      bd(
+        id,
+        'Gross job losses for the total private sector in the U.S. (rounded to the nearest thousands)',
+        'Total private',
+        frequency,
+      ),
+    ),
+  };
+
+  it.each<[string, '01' | '04', keyof typeof TOTALS]>([
+    ['gross job gains', '01', 'gains'],
+    ['gross job losses', '04', 'losses'],
+  ])(
+    'admits and leads %j with the total-private rows past 1,001 tied industry rows',
+    async (query, dataClass, key) => {
+      const label = query.charAt(0).toUpperCase() + query.slice(1);
+      const totals = TOTALS[key].map((s) => s.seriesId);
+      const svc = await seedAndLoad([...breakdowns(dataClass, label), ...TOTALS[key]]);
+      const result = await svc.search(search(query, { limit: totals.length }));
+      expect(new Set(result.series.map((s) => s.seriesId))).toEqual(new Set(totals));
+      expect(result.capped).toBe(true);
+      const first = result.series[0]!.seriesId;
+      expect(await ids(svc, search(query, { limit: 1 }))).toEqual([first]);
+      expect(await ids(svc, search(query, { limit: 2 }))).toEqual(
+        result.series.slice(0, 2).map((s) => s.seriesId),
+      );
+    },
+  );
+
+  it('admits the area’s own totals first under an explicit area, where no national key applies', async () => {
+    // Real Texas rows share the breakdowns' title; the totals' two-word item loses on bm25.
+    const texas = (seriesId: string, item: string, frequency = 'Quarterly') =>
+      row(seriesId, 'BD', 'Gross job gains', 'Texas', item, frequency);
+    const totals = [
+      texas('BDS0000048000000000110001LQ5', 'Total private'),
+      texas('BDU0000048000000000110001LQ5', 'Total private'),
+      texas('BDU0000048000000000110001LA5', 'Total private', 'Annual'),
+    ];
+    const svc = await seedAndLoad([
+      ...Array.from({ length: 1001 }, (_, i) =>
+        texas(`BDS0000048000${300000 + i}110001LQ5`, `Industry${i}`),
+      ),
+      ...totals,
+    ]);
+    const result = await ids(svc, search('gross job gains', { area: 'Texas', limit: 3 }));
+    expect(new Set(result)).toEqual(new Set(totals.map((s) => s.seriesId)));
+  });
+
+  it('keeps a named industry ahead of the totals (characterization)', async () => {
+    const svc = await seedAndLoad([
+      ...TOTALS.gains,
+      bd(
+        'BDS0000000000100030110001LQ5',
+        'Gross job gains for the manufacturing sector in the U.S. (rounded to the nearest thousands)',
+        'Manufacturing',
+      ),
+    ]);
+    expect((await ids(svc, search('gross job gains manufacturing')))[0]).toBe(
+      'BDS0000000000100030110001LQ5',
+    );
+  });
+
+  /** 1,000 JOLTS aggregates, national (`Total US`) or one per state, matching "nonfarm". */
+  const joltsAggregates = (national: boolean) =>
+    Array.from({ length: 1000 }, (_, i) => {
+      const area = national ? 'Total US' : `State ${i}`;
+      return row(
+        `JTS000000${String(i).padStart(7, '0')}00HIL`,
+        'JT',
+        `JOLTS - Hires - Total nonfarm - ${area} - All size classes - Level - In Thousands`,
+        area,
+      );
+    });
+
+  it('admits aggregates first only among rows matching every word', async () => {
+    /**
+     * The aggregates match "nonfarm" alone. Admitted ahead of the partial
+     * matches, they would fill the pool and push out the productivity rows.
+     */
+    const mp = (seriesId: string, measure: string) => ({
+      seriesId,
+      title: `${measure} for Private Nonfarm Business Sector (NAICS 113-81), Indexes = 100.000`,
+      surveyAbbr: 'MP',
+      seasonal: false,
+      itemName: 'Private Nonfarm Business Sector (NAICS XG)',
+      endYear: 2025,
+    });
+    const svc = await seedAndLoad([
+      ...joltsAggregates(true),
+      mp('MPU4910062', 'Labor productivity'),
+      mp('MPU4910012', 'Total factor productivity'),
+    ]);
+    const result = await ids(svc, search('productivity growth nonfarm business'));
+    expect(new Set(result.slice(0, 2))).toEqual(new Set(['MPU4910062', 'MPU4910012']));
+  });
+
+  it('admits a state aggregate on bm25, behind the national rows the rescore ranks above it', async () => {
+    // Real CE rows; the "nonfarm" alias names CE, so they outscore every JOLTS row.
+    const ce = (seriesId: string, title: string) => ({
+      seriesId,
+      title,
+      surveyAbbr: 'CE',
+      seasonal: seriesId[2] === 'S',
+      itemName: 'Total nonfarm',
+      endYear: 2026,
+    });
+    const svc = await seedAndLoad([
+      ...joltsAggregates(false),
+      ce('CES0000000010', 'Women employees, thousands, total nonfarm, seasonally adjusted'),
+      ce('CEU0000000001', 'All employees, thousands, total nonfarm, not seasonally adjusted'),
+    ]);
+    const result = await ids(svc, search('nonfarm'));
+    expect(new Set(result.slice(0, 2))).toEqual(new Set(['CES0000000010', 'CEU0000000001']));
+  });
+
+  const CONSUMERS: Record<string, string> = {
+    CU: 'all urban consumers',
+    CW: 'urban wage earners and clerical workers',
+    SU: 'all urban consumers, chained',
+  };
+  /** A CU, CW, or SU row as its survey titles it, national (area `0000`) or Seattle (`S49D`). */
+  const cpi = (seriesId: string, item: string, frequency?: string) => {
+    const survey = seriesId.slice(0, 2);
+    const [area, place] =
+      seriesId.slice(4, 8) === '0000'
+        ? ['U.S. city average', 'U.S. city average']
+        : ['Seattle-Tacoma-Bellevue WA', 'Seattle-Tacoma-Bellevue, WA'];
+    const adjusted = seriesId[2] === 'S' ? 'seasonally adjusted' : 'not seasonally adjusted';
+    const title = `${item} in ${place}, ${CONSUMERS[survey]}, ${adjusted}`;
+    return row(seriesId, survey, title, area, item, frequency);
+  };
+  /** Real 0.7.1 Seattle CU rows: every one ties the All items rows for a Seattle CPI query. */
+  const CPI: CatalogSeries[] = [
+    cpi('CUURS49DSA0E', 'Energy'),
+    cpi('CUURS49DSAA', 'Apparel'),
+    cpi('CUURS49DSAC', 'Commodities'),
+    cpi('CUURS49DSAD', 'Durables'),
+    cpi('CUURS49DSAF1', 'Food'),
+    cpi('CUURS49DSA0L1E', 'All items less food and energy'),
+    cpi('CUURS49DSA0', 'All items'),
+    cpi('CUUSS49DSA0', 'All items', 'Semi-Annual'),
+    cpi('CUUR0000SA0', 'All items'),
+    cpi('CUSR0000SA0', 'All items'),
+  ];
+  const SEATTLE_ALL_ITEMS = new Set(['CUURS49DSA0', 'CUUSS49DSA0']);
+
+  it.each(['seattle cpi', 'seattle inflation', 'seattle consumer price index'])(
+    'leads %j with the Seattle All items rows, ahead of the area’s item indexes',
+    async (query) => {
+      const svc = await seedAndLoad(CPI);
+      const result = await ids(svc, search(query));
+      expect(new Set(result.slice(0, 2))).toEqual(SEATTLE_ALL_ITEMS);
+      expect(await ids(svc, search(query, { limit: 1 }))).toEqual([result[0]]);
+      expect(await ids(svc, search(query, { limit: 2 }))).toEqual(result.slice(0, 2));
+    },
+  );
+
+  it.each([
+    ['seattle cpi energy', undefined, 'CUURS49DSA0E'],
+    ['seattle cpi food', undefined, 'CUURS49DSAF1'],
+    ['all items', 'Seattle', 'CUURS49DSA0'],
+  ])(
+    'keeps %j (area %j) led by %s: a named item, or the All items row under an area (characterization)',
+    async (query, area, leader) => {
+      const svc = await seedAndLoad(CPI);
+      expect((await ids(svc, search(query, area ? { area } : {})))[0]).toBe(leader);
+    },
+  );
+
+  it.each(['cpi', 'inflation'])(
+    'keeps the national CPI-U All items headlines first for %j',
+    async (query) => {
+      const svc = await seedAndLoad(CPI);
+      expect(new Set((await ids(svc, search(query))).slice(0, 2))).toEqual(
+        new Set(['CUUR0000SA0', 'CUSR0000SA0']),
+      );
+    },
+  );
+
+  it('leads a CW Seattle query with its All items rows', async () => {
+    const svc = await seedAndLoad([
+      cpi('CWURS49DSA0E', 'Energy'),
+      cpi('CWURS49DSAA', 'Apparel'),
+      cpi('CWURS49DSA0', 'All items'),
+      cpi('CWUSS49DSA0', 'All items', 'Semi-Annual'),
+    ]);
+    const result = await ids(svc, search('seattle', { survey: 'CW' }));
+    expect(new Set(result.slice(0, 2))).toEqual(new Set(['CWURS49DSA0', 'CWUSS49DSA0']));
+  });
+
+  it('leads the chained CPI with its All items row', async () => {
+    const svc = await seedAndLoad([
+      cpi('SUUR0000SA0E', 'Energy'),
+      cpi('SUUR0000SAF1', 'Food'),
+      cpi('SUUR0000SAA', 'Apparel'),
+      cpi('SUUR0000SA0L1E', 'All items less food and energy'),
+      cpi('SUUR0000SA0', 'All items'),
+    ]);
+    expect((await ids(svc, search('chained', { survey: 'SU' })))[0]).toBe('SUUR0000SA0');
+  });
+
+  it('ranks a national breakdown above an area’s aggregate at equal score: the national key comes first', async () => {
+    const seattle = cpi('CUURS49DSA0', 'All items');
+    const food = cpi('CUUR0000SAF1', 'Food');
+    for (const order of [
+      [seattle, food],
+      [food, seattle],
+    ]) {
+      const svc = await seedAndLoad(order);
+      expect(await ids(svc, search('urban consumers'))).toEqual(['CUUR0000SAF1', 'CUURS49DSA0']);
+    }
+  });
+});
+
+describe('BlsCatalogService.search — rows matching more of the query words lead (#131)', () => {
+  const ids = async (svc: BlsCatalogService, input: Parameters<BlsCatalogService['search']>[0]) =>
+    (await svc.search(input)).series.map((s) => s.seriesId);
+  /** Real 0.7.1 rows. Of the nurses query, the CE headline matches only "wage", through the CE alias. */
+  const CES_HEADLINE: CatalogSeries = {
+    seriesId: 'CES0000000001',
+    title: 'All employees, thousands, total nonfarm, seasonally adjusted',
+    surveyAbbr: 'CE',
+    seasonal: true,
+    itemName: 'Total nonfarm',
+    endYear: 2026,
+  };
+  const le = (seriesId: string, suffix = ''): CatalogSeries => ({
+    seriesId,
+    title: `(unadj)- Employed full time, Wage and salary workers, Registered nurses${suffix}`,
+    surveyAbbr: 'LE',
+    seasonal: false,
+    areaName: 'U.S. Total',
+    endYear: 2025,
+  });
+  /**
+   * Of the five words, each LE row matches three, the CE hourly row two (one
+   * through the alias), and the headline one (through the alias). On score the
+   * CE rows lead: the alias boost, and the headline boost on top.
+   */
+  const NURSES: CatalogSeries[] = [
+    le('LEU0254594700', ', Men'),
+    {
+      seriesId: 'CES0500000003',
+      title: 'Average hourly earnings of all employees, total private, seasonally adjusted',
+      surveyAbbr: 'CE',
+      seasonal: true,
+      itemName: 'Total private',
+      endYear: 2026,
+    },
+    CES_HEADLINE,
+    le('LEU0254487900'),
+  ];
+  const NURSES_QUERY = 'registered nurses hourly mean wage';
+  const NURSES_ORDER = ['LEU0254487900', 'LEU0254594700', 'CES0500000003', 'CES0000000001'];
+
+  it('ranks rows by how many query words they match, ahead of score', async () => {
+    const svc = await seedAndLoad(NURSES);
+    expect(await ids(svc, search(NURSES_QUERY))).toEqual(NURSES_ORDER);
+  });
+
+  it.each([1, 2, 3])('keeps that order in the first %i rows', async (limit) => {
+    const svc = await seedAndLoad(NURSES);
+    expect(await ids(svc, search(NURSES_QUERY, { limit }))).toEqual(NURSES_ORDER.slice(0, limit));
+    expect(await ids(svc, search(NURSES_QUERY, { limit: 1, offset: limit }))).toEqual(
+      NURSES_ORDER.slice(limit, limit + 1),
+    );
+  });
+
+  const mp = (seriesId: string, measure: string): CatalogSeries => ({
+    seriesId,
+    title: `${measure} for Private Nonfarm Business Sector (NAICS 113-81), Indexes = 100.000`,
+    surveyAbbr: 'MP',
+    seasonal: false,
+    itemName: 'Private Nonfarm Business Sector (NAICS XG)',
+    endYear: 2025,
+  });
+
+  it('leads "productivity growth nonfarm business" with the MP rows over the CE headline', async () => {
+    // Each MP row matches three of the four words; the headline matches only "nonfarm", and outscores them.
+    const svc = await seedAndLoad([
+      CES_HEADLINE,
+      mp('MPU4910062', 'Labor productivity'),
+      mp('MPU4910012', 'Total factor productivity'),
+    ]);
+    const query = 'productivity growth nonfarm business';
+    const result = await ids(svc, search(query));
+    expect(new Set(result.slice(0, 2))).toEqual(new Set(['MPU4910062', 'MPU4910012']));
+    expect(result[2]).toBe('CES0000000001');
+    expect(await ids(svc, search(query, { limit: 1 }))).toEqual([result[0]]);
+    expect(await ids(svc, search(query, { limit: 2 }))).toEqual(result.slice(0, 2));
+  });
+
+  it('ranks the partial matches below an all-word place row by their word count', async () => {
+    // The LN headline matches two of the five words and outscores the LA level row, which matches four.
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNS14000000',
+        title: '(Seas) Unemployment Rate',
+        surveyAbbr: 'LN',
+        seasonal: true,
+        frequency: 'Monthly',
+      },
+      {
+        seriesId: 'LAUCN190130000000004',
+        title: 'Unemployment: Black Hawk County, IA (U)',
+        surveyAbbr: 'LA',
+        seasonal: false,
+        areaName: 'Black Hawk County, IA',
+      },
+      {
+        seriesId: 'LAUCN190130000000003',
+        title: 'Unemployment Rate: Black Hawk County, IA (U)',
+        surveyAbbr: 'LA',
+        seasonal: false,
+        areaName: 'Black Hawk County, IA',
+      },
+    ]);
+    expect(await ids(svc, search('black hawk county unemployment rate'))).toEqual([
+      'LAUCN190130000000003',
+      'LAUCN190130000000004',
+      'LNS14000000',
+    ]);
+  });
+
+  it('keeps a headline that ties on word count first on its score, its alias word counted (characterization)', async () => {
+    // Both rows match one of the two words: the headline "inflation" through the CU alias, the LN row "japan".
+    const svc = await seedAndLoad([
+      {
+        seriesId: 'LNU01392160',
+        title: '(unadj) Labor force participation rate - Japanese',
+        surveyAbbr: 'LN',
+        seasonal: false,
+        frequency: 'Monthly',
+      },
+      {
+        seriesId: 'CUUR0000SA0',
+        title: 'All items in U.S. city average, all urban consumers, not seasonally adjusted',
+        surveyAbbr: 'CU',
+        seasonal: false,
+        areaName: 'U.S. city average',
+        itemName: 'All items',
+        frequency: 'Monthly',
+      },
+    ]);
+    expect(await ids(svc, search('inflation in japan'))).toEqual(['CUUR0000SA0', 'LNU01392160']);
+  });
 });
 
 describe('BlsCatalogService.load racing shutdown', () => {
@@ -5568,31 +6069,35 @@ describe('conceptAliasSurveys (#89)', () => {
     expect([...conceptAliasSurveys('happiness while shopping')]).toEqual([]);
   });
 
-  it('runs in linear time on worst-case caller text', () => {
-    const run = (input: string) => {
-      conceptAliasSurveys(input);
-      queryFrequencies(input);
-    };
-    /**
-     * Near-misses, where each position starts a phrase or frequency word that
-     * fails late, plus a unit that matches at every word.
-     */
-    const units = [
-      'job ',
-      'cost of ',
-      'labor force ',
-      'semi-',
-      'semi ',
-      'employ',
-      'p',
-      'a',
-      'monthly ',
-    ];
-    for (const unit of units) {
-      const text = (n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
-      expectLinearTime(run, text, unit);
-    }
-  });
+  /**
+   * Near-misses, where each position starts a phrase or frequency word that
+   * fails late, plus a unit that matches at every word.
+   */
+  const units = [
+    'job ',
+    'cost of ',
+    'labor force ',
+    'semi-',
+    'semi ',
+    'employ',
+    'p',
+    'a',
+    'monthly ',
+  ];
+  it.each<TextShape>([
+    ...units.map((unit): TextShape => [JSON.stringify(unit), (n) => repeatTo(unit, n)]),
+    ...LINE_BREAK_SHAPES,
+  ])(
+    'runs in linear time on worst-case caller text: %s',
+    (label, text) => {
+      const run = (input: string) => {
+        conceptAliasSurveys(input);
+        queryFrequencies(input);
+      };
+      expectLinearCpuTime(run, text, label, 50);
+    },
+    0,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -5832,19 +6337,24 @@ describe('startsWord (#91)', () => {
     expect(startsWord(`${'all '.repeat(20_000)}x`, 'all')).toBe(true);
   });
 
-  it('runs in linear time on worst-case caller text, as haystack or needle', () => {
-    const title = 'All items in U.S. city average, all urban consumers, not seasonally adjusted';
-    const run = (input: string) => {
-      startsWord(title, input);
-      startsWord(input, 'all');
-      startsWord(input, 'job vacanc');
-    };
-    /** Units whose every position holds a near-miss: an in-word "all", or a phrase that fails late. */
-    for (const unit of ['xall', 'all ', 'job ', 'a', '(']) {
-      const text = (n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
-      expectLinearTime(run, text, unit);
-    }
-  });
+  /** Units whose every position holds a near-miss: an in-word "all", or a phrase that fails late. */
+  const units = ['xall', 'all ', 'job ', 'a', '('];
+  it.each<TextShape>([
+    ...units.map((unit): TextShape => [JSON.stringify(unit), (n) => repeatTo(unit, n)]),
+    ...LINE_BREAK_SHAPES,
+  ])(
+    'runs in linear time on worst-case caller text, as haystack or needle: %s',
+    (label, text) => {
+      const title = 'All items in U.S. city average, all urban consumers, not seasonally adjusted';
+      const run = (input: string) => {
+        startsWord(title, input);
+        startsWord(input, 'all');
+        startsWord(input, 'job vacanc');
+      };
+      expectLinearCpuTime(run, text, label, 50);
+    },
+    0,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -5935,33 +6445,32 @@ describe('BlsCatalogService.search — token modes (#95)', () => {
     },
   );
 
-  it('keeps token-mode scans linear in thread CPU time', async () => {
-    const shapes = [
-      { text: (n: number) => `${'za'.repeat(Math.ceil(n / 2))}\ny`, first: 1_250, last: 80_000 },
-      { text: (n: number) => ' a\r\n'.repeat(Math.ceil(n / 4)), first: 1_250, last: 80_000 },
-      { text: (n: number) => '1'.repeat(n), first: 5_000, last: 320_000 },
-    ];
-    for (const { text, first, last } of shapes) {
-      let baseline = 0;
-      let largest = 0;
-      for (let n = first; n <= last; n *= 2) {
-        const svc = await seedAndLoad([
-          { seriesId: 'CES0000000001', title: text(n), surveyAbbr: 'AP', seasonal: false },
+  it.each<TextShape>([
+    ['one long line ending in a break', (n) => `${repeatTo('za', n - 2)}\ny`],
+    ['line breaks throughout', (n) => repeatTo(' a\r\n', n)],
+    ['a long digit run', (n) => '1'.repeat(n)],
+  ])('keeps token-mode scans linear in thread CPU time on a title of %s', async (label, text) => {
+    // One indexed row per title length, seeded by the untimed first search of each.
+    const services = new Map<string, Promise<BlsCatalogService>>();
+    const serviceFor = (title: string) => {
+      let svc = services.get(title);
+      if (!svc) {
+        svc = seedAndLoad([
+          { seriesId: 'CES0000000001', title, surveyAbbr: 'AP', seasonal: false },
         ]);
-        await svc.search(search('a b c'));
-        const times: number[] = [];
-        for (let round = 0; round < 3; round++) {
-          const start = process.threadCpuUsage();
-          await svc.search(search('a b c'));
-          const elapsed = process.threadCpuUsage(start);
-          times.push((elapsed.user + elapsed.system) / 1_000);
-        }
-        largest = times.sort((a, b) => a - b)[1]!;
-        expect(largest).toBeLessThan(250);
-        if (n === first) baseline = Math.max(largest, 0.05);
-        await svc.shutdown();
+        services.set(title, svc);
       }
-      expect(largest / baseline).toBeLessThan(256);
+      return svc;
+    };
+    try {
+      await expectLinearCpuTimeAsync(
+        async (title) => (await serviceFor(title)).search(search('a b c')),
+        text,
+        label,
+        50,
+      );
+    } finally {
+      for (const svc of services.values()) await (await svc).shutdown();
     }
   });
 });
@@ -6016,35 +6525,30 @@ describe('BlsCatalogService.search — long and repetitive queries (#92)', () =>
     expect(ids).toEqual(['TEST_W31']);
   });
 
-  it('stays bounded in time however many distinct tokens the query holds', async () => {
-    const svc = await seedAndLoad(
-      Array.from({ length: 2_000 }, (_, i) => ({
-        seriesId: `TEST_BOUND${String(i).padStart(4, '0')}`,
-        title: `Series w${i} a${i % 7} b${i % 11} all items`,
-        surveyAbbr: 'AP',
-        seasonal: false,
-      })),
-    );
-    /** Median of five runs, so one GC pause cannot decide the ratio. */
-    const time = async (query: string) => {
-      const runs: number[] = [];
-      for (let i = 0; i < 5; i++) {
-        const start = performance.now();
-        await svc.search(search(query));
-        runs.push(performance.now() - start);
-      }
-      return runs.sort((a, b) => a - b)[2] ?? 0;
-    };
-    const distinct = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ');
-    await time(distinct(32)); // warm the statement cache and the JIT
-    const t32 = Math.max(await time(distinct(32)), 5);
-    const t5000 = await time(distinct(5_000));
-    const tRepeat = await time('all '.repeat(5_000));
-    // The cap makes cost independent of query length; uncapped, 5,000 terms cost ~90× 32.
-    expect(t5000 / t32).toBeLessThan(8);
-    expect(t5000).toBeLessThan(250);
-    expect(tRepeat).toBeLessThan(250);
-  });
+  const distinct = (n: number, gap = ' ') => Array.from({ length: n }, (_, i) => `w${i}`).join(gap);
+
+  it.each<[string, string]>([
+    ['5,000 distinct tokens', distinct(5_000)],
+    ['5,000 distinct tokens on one line ending in a break', `${distinct(5_000)}\ny`],
+    ['5,000 distinct tokens between line breaks', distinct(5_000, '\r\n')],
+    ['one token 5,000 times', 'all '.repeat(5_000)],
+  ])(
+    'stays bounded in time however many distinct tokens the query holds: %s',
+    async (label, query) => {
+      const svc = await seedAndLoad(
+        Array.from({ length: 2_000 }, (_, i) => ({
+          seriesId: `TEST_BOUND${String(i).padStart(4, '0')}`,
+          title: `Series w${i} a${i % 7} b${i % 11} all items`,
+          surveyAbbr: 'AP',
+          seasonal: false,
+        })),
+      );
+      // Scoring reads the first 32 distinct tokens, so the query costs about what 32 do.
+      const { growth, ms } = await cpuPairAsync((q) => svc.search(search(q)), distinct(32), query);
+      expect(growth, `${label}: CPU growth over 32 distinct tokens`).toBeLessThan(8);
+      expect(ms, `${label}: CPU ms per search`).toBeLessThan(250);
+    },
+  );
 
   it('matches nothing for an area longer than any indexed text, without a SQLite error', async () => {
     const svc = await seedAndLoad(ROWS);
@@ -6329,8 +6833,8 @@ describe('BlsCatalogService.load — the OE code tables on the refresh schedule 
   /**
    * Serve every configured survey one decodable row and the OE tables from the
    * fixtures, except the files `failing` names (HTTP 503) — mutable between
-   * checks. A `.series` body is built a microtask after its request, by which
-   * time its survey's table requests have named every key column.
+   * checks. A `.series` body names every key column the table requests so far
+   * have: a survey's tables are requested before its `.series` file.
    */
   function serveCatalog(): { requested: string[]; lines: string[]; failing: Set<string> } {
     const requested: string[] = [];
@@ -6357,7 +6861,6 @@ describe('BlsCatalogService.load — the OE code tables on the refresh schedule 
         const header = [...keys];
         return new Response(`${header.join('\t')}\tlabel_text\n${row(header)}\tDecoded\n`);
       }
-      await Promise.resolve();
       const header = [...keys];
       return new Response(
         `series_id\tseries_title\tseasonal\t${header.join('\t')}\n${abbr.toUpperCase()}NEW\tSeries ${abbr}\tS\t${row(header)}\n`,

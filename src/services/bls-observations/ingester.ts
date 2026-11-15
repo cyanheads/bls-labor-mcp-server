@@ -4,7 +4,10 @@
  * files from the survey's LABSTAT directory listing, streams each file's
  * tab-delimited rows, and yields pages for the framework's runner. A separate
  * pass, {@link syncFootnoteTables}, reads each survey's footnote code table for
- * the service to keep beside the rows.
+ * the service to keep beside the rows. Every read goes through the shared
+ * LABSTAT stream (`services/labstat/labstat-stream`), which bounds the wait for
+ * headers and between body chunks but never a whole body; the sync
+ * subprocess's own timeout bounds a run as a whole.
  *
  * Checkpoint: ISO 8601 datestamp of the newest `Last-Modified` among the files
  * a run read (lexicographically monotonic). A refresh skips a file whose
@@ -22,21 +25,16 @@
 
 import type { MirrorLogger, MirrorRow, SyncContext, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
 import { SURVEY_ABBRS } from '@/services/bls-catalog/bls-catalog-service.js';
+import {
+  lineBatches,
+  type OpenResult,
+  openUrl,
+  readBody,
+} from '@/services/labstat/labstat-stream.js';
 import type { ObservationRow, SyncGaps, UnreadFile } from './types.js';
 
 /** Rows yielded per page — bounds memory during bulk ingest. */
 const PAGE_SIZE = 5_000;
-
-/** How long a LABSTAT request may wait for its response headers. */
-const RESPONSE_TIMEOUT_MS = 30_000;
-
-/**
- * Longest wait for the next chunk of a response body. A body is read for as
- * long as it keeps arriving, with no whole-response deadline: the largest
- * LABSTAT data files exceed 390 MB, which no fixed deadline fits on every link.
- * The sync subprocess's own timeout bounds a run as a whole.
- */
-const BODY_STALL_TIMEOUT_MS = 60_000;
 
 /** Attempts per request on a transient failure, with linear backoff between them. */
 const MAX_FETCH_ATTEMPTS = 3;
@@ -73,92 +71,18 @@ function decodeCursor(s: string): IngestCursor {
 /** Why a LABSTAT request yielded no usable body. */
 type FetchFailure = Pick<UnreadFile, 'error' | 'status'>;
 
-/** A LABSTAT response whose headers have arrived, its body not yet read. */
-interface OpenResponse {
-  /** Aborts the request, erroring its body mid-read. */
-  abort: (reason: Error) => void;
-  /** `Last-Modified` as ISO 8601; absent when the header is missing or not a date. */
-  lastModified: string | undefined;
-  response: Response;
-}
-
-type OpenResult =
-  | { ok: true; open: OpenResponse }
-  | { ok: false; failure: FetchFailure; transient: boolean };
-
 /**
- * Request one LABSTAT URL, waiting at most {@link RESPONSE_TIMEOUT_MS} for its
- * headers. A non-200 answer is drained and reported, never thrown; the caller's
- * cancellation is rethrown untouched.
+ * The unread-file record of a request that yielded no response body, and
+ * whether another attempt may succeed: a network error or header timeout, or a
+ * status in {@link TRANSIENT_STATUSES}.
  */
-async function openUrl(url: string, userAgent: string, signal: AbortSignal): Promise<OpenResult> {
-  const request = new AbortController();
-  const headerTimer = setTimeout(
-    () => request.abort(timeoutError(`No response within ${RESPONSE_TIMEOUT_MS} ms`)),
-    RESPONSE_TIMEOUT_MS,
-  );
-  try {
-    const response = await fetch(url, {
-      headers: { 'User-Agent': userAgent },
-      signal: AbortSignal.any([signal, request.signal]),
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      return {
-        ok: false,
-        failure: { status: response.status },
-        transient: TRANSIENT_STATUSES.has(response.status),
-      };
-    }
-    const abort = (reason: Error) => request.abort(reason);
-    return {
-      ok: true,
-      open: { abort, lastModified: isoDate(response.headers.get('last-modified')), response },
-    };
-  } catch (err) {
-    signal.throwIfAborted();
-    return { ok: false, failure: { error: describeError(err) }, transient: true };
-  } finally {
-    clearTimeout(headerTimer);
-  }
-}
-
-/**
- * Decode a response body as it arrives. Each chunk must arrive within
- * {@link BODY_STALL_TIMEOUT_MS}; a stall aborts the request, which errors the
- * pending read. A consumer that stops early cancels the rest of the body.
- */
-async function* readBody({ abort, response }: OpenResponse): AsyncGenerator<string> {
-  const reader = response.body?.getReader();
-  if (!reader) return;
-  const decoder = new TextDecoder();
-  let streaming = true;
-  try {
-    for (;;) {
-      const stallTimer = setTimeout(
-        () => abort(timeoutError(`No data for ${BODY_STALL_TIMEOUT_MS} ms`)),
-        BODY_STALL_TIMEOUT_MS,
-      );
-      let chunk: Awaited<ReturnType<typeof reader.read>>;
-      try {
-        chunk = await reader.read();
-      } catch (err) {
-        streaming = false; // the body errored; there is nothing left to cancel
-        throw err;
-      } finally {
-        clearTimeout(stallTimer);
-      }
-      if (chunk.done) {
-        streaming = false;
-        const tail = decoder.decode();
-        if (tail) yield tail;
-        return;
-      }
-      yield decoder.decode(chunk.value, { stream: true });
-    }
-  } finally {
-    if (streaming) await reader.cancel();
-  }
+function openFailure(result: Exclude<OpenResult, { kind: 'opened' }>): {
+  failure: FetchFailure;
+  transient: boolean;
+} {
+  return result.kind === 'refused'
+    ? { failure: { status: result.status }, transient: TRANSIENT_STATUSES.has(result.status) }
+    : { failure: { error: describeError(result.error) }, transient: true };
 }
 
 /** Fetch a small LABSTAT file (a listing, a code table) as text, retrying a transient failure. */
@@ -171,9 +95,10 @@ async function fetchText(
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     if (attempt > 1) await sleep((attempt - 1) * 2_000, signal);
     const result = await openUrl(url, userAgent, signal);
-    if (!result.ok) {
-      failure = result.failure;
-      if (!result.transient) break;
+    if (result.kind !== 'opened') {
+      const failed = openFailure(result);
+      failure = failed.failure;
+      if (!failed.transient) break;
       continue;
     }
     try {
@@ -192,10 +117,6 @@ async function fetchText(
 function isoDate(header: string | null): string | undefined {
   const ms = header ? Date.parse(header) : Number.NaN;
   return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
-}
-
-function timeoutError(message: string): Error {
-  return new DOMException(message, 'TimeoutError');
 }
 
 function describeError(err: unknown): string {
@@ -349,12 +270,14 @@ async function* readDataFile(
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     if (attempt > 1) await sleep((attempt - 1) * 2_000, signal);
     const result = await openUrl(url, userAgent, signal);
-    if (!result.ok) {
-      failure = result.failure;
-      if (!result.transient) break;
+    if (result.kind !== 'opened') {
+      const failed = openFailure(result);
+      failure = failed.failure;
+      if (!failed.transient) break;
       continue;
     }
-    const { lastModified, response } = result.open;
+    const { response } = result.open;
+    const lastModified = isoDate(response.headers.get('last-modified'));
     if (file.newerThan && lastModified && lastModified <= file.newerThan) {
       await response.body?.cancel();
       return { read: true, lastModified };
@@ -385,7 +308,7 @@ async function* pageRows(
   let rowOffset = file.skipRows;
   let batch: ObservationRow[] = [];
 
-  for await (const lines of lineBatches(chunks)) {
+  for await (const lines of dataLines(chunks)) {
     for (const line of lines) {
       if (!columns) {
         columns = parseHeader(line);
@@ -416,15 +339,10 @@ async function* pageRows(
   return true;
 }
 
-/** Regroup streamed text into complete lines, one batch per chunk; the last line may lack its newline. */
-async function* lineBatches(chunks: AsyncIterable<string>): AsyncGenerator<string[]> {
-  let pending = '';
-  for await (const chunk of chunks) {
-    const lines = (pending + chunk).split('\n');
-    pending = lines.pop() ?? '';
-    if (lines.length > 0) yield lines;
-  }
-  if (pending) yield [pending];
+/** A data file's lines, batched as they stream; a last line without its line break is parsed like the rest. */
+async function* dataLines(chunks: AsyncIterable<string>): AsyncGenerator<string[]> {
+  const tail = yield* lineBatches(chunks);
+  if (tail) yield [tail];
 }
 
 // ---------------------------------------------------------------------------
