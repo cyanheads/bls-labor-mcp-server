@@ -79,7 +79,7 @@ US labor statistics from the Bureau of Labor Statistics: jobs, unemployment, wag
 ### `bls_dataframe_describe` <sub>tool</sub>
 
 - Optional `name` describes one registered dataframe; omit it to list active dataframes for the tenant. Unavailable when `CANVAS_PROVIDER_TYPE=none`.
-- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`, fixed at table creation), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, lists) report as `VARCHAR`; `SMALLINT` and `UTINYINT` report as `INTEGER`. Expired entries are removed when their canvas drop succeeds.
+- Returns source tool, query params, row count, TTL (`created_at`/`expires_at`, fixed at table creation), and `column_schema`; BLS columns are nullable. Registered-query types outside the canvas set (`DECIMAL`, `HUGEINT`, lists) report as `VARCHAR`; `TINYINT`, `SMALLINT`, `UTINYINT`, and `USMALLINT` report as `INTEGER`. Expired entries are removed when their canvas drop succeeds.
 
 ---
 
