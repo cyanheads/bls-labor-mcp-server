@@ -1,6 +1,6 @@
 # bls-labor-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 12:36:09
+Generated on: 2026-11-15 03:11:19
 
 ```text
 bls-labor-mcp-server/
@@ -31,6 +31,7 @@ bls-labor-mcp-server/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
 │   ├── 0.7.x/
+│   ├── 0.8.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -167,6 +168,7 @@ bls-labor-mcp-server/
 │   ├── services/
 │   │   ├── bls-api/
 │   │   │   ├── bls-api-service.ts
+│   │   │   ├── series-id-markdown.ts
 │   │   │   └── types.ts
 │   │   ├── bls-catalog/
 │   │   │   ├── area-filter.ts
@@ -180,8 +182,10 @@ bls-labor-mcp-server/
 │   │   │   └── types.ts
 │   │   ├── bls-periods/
 │   │   │   └── period-codes.ts
-│   │   └── canvas-bridge/
-│   │       └── canvas-bridge.ts
+│   │   ├── canvas-bridge/
+│   │   │   └── canvas-bridge.ts
+│   │   └── labstat/
+│   │       └── labstat-stream.ts
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
@@ -199,7 +203,10 @@ bls-labor-mcp-server/
 │   │   │   ├── wp.listing
 │   │   │   └── wp.stale
 │   │   ├── bls-live-responses.ts
-│   │   └── duckdb-canvas.ts
+│   │   ├── duckdb-canvas.ts
+│   │   ├── linear-time.test.ts
+│   │   ├── linear-time.ts
+│   │   └── markdown-read-back.ts
 │   ├── integration/
 │   ├── prompts/
 │   ├── resources/
@@ -209,13 +216,13 @@ bls-labor-mcp-server/
 │   │   ├── bls-api/
 │   │   │   ├── bls-api-mirror.test.ts
 │   │   │   ├── bls-api-service-retry.test.ts
-│   │   │   └── bls-api-service.test.ts
+│   │   │   ├── bls-api-service.test.ts
+│   │   │   └── series-id-markdown.test.ts
 │   │   ├── bls-catalog/
 │   │   │   ├── area-filter.test.ts
 │   │   │   ├── bls-catalog-lifecycle.test.ts
 │   │   │   ├── bls-catalog-refresh.test.ts
 │   │   │   ├── bls-catalog-service.test.ts
-│   │   │   ├── linear-time.ts
 │   │   │   ├── oews-composition.test.ts
 │   │   │   └── oews-fixtures.ts
 │   │   ├── bls-observations/
@@ -229,11 +236,14 @@ bls-labor-mcp-server/
 │   │   │   └── period-codes.test.ts
 │   │   ├── canvas-bridge/
 │   │   │   └── canvas-bridge.test.ts
+│   │   ├── labstat/
+│   │   │   └── labstat-stream.test.ts
 │   │   └── service-shutdown.test.ts
 │   ├── tools/
 │   │   ├── bls-data-tools.service.test.ts
 │   │   ├── bls-dataframe-describe.tool.test.ts
 │   │   ├── bls-dataframe-drop.tool.test.ts
+│   │   ├── bls-dataframe-markdown.test.ts
 │   │   ├── bls-dataframe-query.canvas.test.ts
 │   │   ├── bls-dataframe-query.tool.test.ts
 │   │   ├── bls-get-latest.tool.test.ts
