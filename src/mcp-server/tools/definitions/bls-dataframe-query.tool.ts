@@ -9,13 +9,26 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
+
+/**
+ * One GFM table cell that reads back as `text`. Text that escaping leaves
+ * unchanged stays plain; anything else becomes a code span, whose content a
+ * reader copies without escapes. GFM ends a cell at an unescaped `|` even
+ * inside a code span, so each pipe in the span is written `\|`. A table row is
+ * one line, so text holding a line break renders as its JSON string.
+ */
+function tableCell(text: string): string {
+  const oneLine = /[\r\n]/.test(text) ? JSON.stringify(text) : text;
+  if (escapeMarkdownInline(oneLine) === oneLine) return oneLine;
+  return markdown().inlineCode(oneLine).build().replaceAll('|', '\\|');
+}
 
 export const blsDataframeQueryTool = tool('bls_dataframe_query', {
   title: 'Query BLS Dataframes',
   description:
-    'Run a single-statement SELECT against the canvas dataframes registered by bls_get_series or by an earlier register_as. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs (information_schema, pg_catalog, sqlite_master, duckdb_*) are denied at the bridge layer — use bls_dataframe_describe to list available dataframes. Supports JOINs, aggregates, window functions, and CTEs. Optional register_as persists the result as a new dataframe with a fresh TTL for chained analysis. Canvas SQL operations consume zero BLS API quota.',
+    'Run a single-statement SELECT against the canvas dataframes registered by bls_get_series or by an earlier register_as. Read-only: writes, DDL, DROP, COPY, PRAGMA, ATTACH, and external-file table functions are rejected. System catalogs and DuckDB metadata views (information_schema, pg_catalog, sqlite_master, and views and functions such as pg_tables and duckdb_tables) are denied at the bridge layer wherever a statement names one, as an alias, CTE, or column name included, and as a register_as name — use bls_dataframe_describe to list available dataframes. Supports JOINs, aggregates, window functions, and CTEs. Optional register_as persists the result as a new dataframe with a fresh TTL for chained analysis. Canvas SQL operations consume zero BLS API quota.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   errors: [
@@ -24,6 +37,13 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'The requested register_as name already identifies a dataframe.',
       recovery: 'Choose a different register_as name; the existing dataframe is unchanged.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'register_as_system_catalog',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'register_as is the name of a DuckDB system catalog or metadata view, which canvas SQL cannot reference.',
+      recovery: 'Choose a different register_as name; nothing was staged under the refused one.',
       thrownBy: 'service',
     },
     {
@@ -129,15 +149,20 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
     const capped = result.truncated === true || result.rowCount > result.rows.length;
     if (capped) {
       let guidance: string;
+      /**
+       * The registered name stays out of the notice: the trailer renders a
+       * notice as live Markdown, where a caller-chosen name would not read
+       * back. `registered_as` carries it on both surfaces.
+       */
       if (preview < rowLimit) {
         guidance = meta?.tableName
-          ? `The complete result is materialized in dataframe ${meta.tableName}; increase preview only to return more rows inline.`
+          ? 'The complete result is materialized in the registered_as dataframe; increase preview only to return more rows inline.'
           : result.truncated === true
             ? `Query output exceeded row_limit=${rowLimit}; only ${result.rows.length} rows were returned (capped by preview=${preview}). Use register_as to persist all rows to canvas.`
             : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by preview=${preview}). Increase preview or use register_as to persist all rows to canvas.`;
       } else {
         guidance = meta?.tableName
-          ? `The complete result is materialized in dataframe ${meta.tableName}; query that dataframe with a narrower SELECT to retrieve more rows inline.`
+          ? 'The complete result is materialized in the registered_as dataframe; query that dataframe with a narrower SELECT to retrieve more rows inline.'
           : result.truncated === true
             ? `Query output exceeded row_limit=${rowLimit}; only ${result.rows.length} rows were materialized. Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`
             : `Query produced ${result.rowCount} rows but only ${result.rows.length} were returned (capped by row_limit=${rowLimit}). Use register_as to persist all rows to canvas, or increase row_limit (max 10000).`;
@@ -164,7 +189,7 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
     const lines: string[] = [];
     if (result.registered_as) {
       lines.push(
-        `Registered as \`${result.registered_as}\` (expires ${result.expires_at ?? 'unknown'}).`,
+        `Registered as ${markdown().inlineCode(result.registered_as).build()} (expires ${result.expires_at ?? 'unknown'}).`,
       );
     }
     const cappedNote =
@@ -178,15 +203,15 @@ export const blsDataframeQueryTool = tool('bls_dataframe_query', {
       return [{ type: 'text', text: lines.join('\n') }];
     }
 
-    const header = `| ${result.columns.map(escapeMarkdownInline).join(' | ')} |`;
+    const header = `| ${result.columns.map(tableCell).join(' | ')} |`;
     const sep = `| ${result.columns.map(() => '---').join(' | ')} |`;
     lines.push(header, sep);
     for (const row of result.rows) {
       const cells = result.columns.map((c) => {
         const v = row[c];
         if (v == null) return '';
-        if (typeof v === 'string') return escapeMarkdownInline(v);
-        if (typeof v === 'object') return escapeMarkdownInline(JSON.stringify(v));
+        if (typeof v === 'string') return tableCell(v);
+        if (typeof v === 'object') return tableCell(JSON.stringify(v));
         return String(v);
       });
       lines.push(`| ${cells.join(' | ')} |`);

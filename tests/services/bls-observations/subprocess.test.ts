@@ -89,6 +89,7 @@ describe('runObservationsSubprocess exit logging (#117)', () => {
   it.each([
     [0, 'info', 'Observations subprocess completed'],
     [2, 'warning', 'Observations subprocess completed with gaps'],
+    [3, 'info', 'Observations subprocess skipped'],
     [1, 'error', 'Observations subprocess exited non-zero'],
   ] as const)('logs child exit %i at %s level', async (code, level, message) => {
     const mockChild = {
@@ -119,7 +120,7 @@ describe('runObservationsSubprocess exit logging (#117)', () => {
 
     expect(log[level]).toHaveBeenCalledWith(expect.stringContaining(message), expect.anything());
     // Every exit outcome's message, so a second outcome logged at another level is caught.
-    const outcome = /^Observations subprocess (completed|exited|terminated)/;
+    const outcome = /^Observations subprocess (completed|skipped|exited|terminated)/;
     for (const other of ['info', 'warning', 'error'] as const) {
       if (other !== level) {
         expect(log[other].mock.calls.filter(([m]) => outcome.test(String(m)))).toEqual([]);
@@ -364,10 +365,13 @@ describe('runObservationsChildSync — the child entry (#72)', () => {
       expect(code).toBe(1);
       expect(await mirrorRows(DB(), 'CUUR0000SA0')).toContain('2025 M01 317.0');
       expect((await mirrorState(DB())).checkpoint).toBe('2026-11-01T18:00:00.000Z');
-      expect(records.find((r) => r.msg === 'Mirror sync failed')).toMatchObject({
-        level: 'error',
+      // A caller-stopped run is recorded as stopped, not failed.
+      expect(records.find((r) => r.msg === 'Mirror sync stopped')).toMatchObject({
+        level: 'info',
         mode: 'refresh',
+        reason: 'Aborted by SIGTERM',
       });
+      expect(records.some((r) => r.msg === 'Mirror sync failed')).toBe(false);
     });
 
     it('writes each unread file and the run outcome to stdout as JSON lines', async () => {
@@ -501,6 +505,48 @@ describe('runObservationsChildSync — the child entry (#72)', () => {
     expect(code).toBe(1);
     expect(records.filter((r) => r.msg === 'Observations sync complete')).toHaveLength(0);
     expect(records.filter((r) => r.msg === 'Observations sync failed')).toHaveLength(1);
+  });
+
+  it.each([
+    ['a refresh', []],
+    ['an init', ['--init']],
+  ])('exits 3 without syncing when %s finds the sync lease held elsewhere', async (_run, args) => {
+    const path = join(dir, 'obs.db');
+    // Another instance on the same store holds the lease, parked on its first fetch.
+    let parked!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      parked = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          parked();
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    );
+    const holder = new BlsObservationsService(path, 'https://labstat.invalid', 'test-agent');
+    const stop = new AbortController();
+    const held = holder.runSync({ mode: 'init', signal: stop.signal }).catch(() => undefined);
+    await fetchStarted;
+
+    try {
+      const { code, records } = await captureStdout(() =>
+        runObservationsChildSync(args, makeChildLogger(), never),
+      );
+
+      expect(code).toBe(3);
+      expect(records).toEqual([
+        expect.objectContaining({
+          level: 'notice',
+          msg: 'Observations mirror sync skipped: another process holds the sync lease',
+        }),
+      ]);
+    } finally {
+      stop.abort(new Error('test done'));
+      await held;
+      await holder.shutdown();
+    }
   });
 
   it('warns once and constructs no mirror when the flag is off', async () => {

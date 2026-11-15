@@ -8,6 +8,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CANVAS_IDENTIFIER_REGEX } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 
 export const blsDataframeDropTool = tool('bls_dataframe_drop', {
@@ -71,10 +72,8 @@ export const blsDataframeDropTool = tool('bls_dataframe_drop', {
     return { name: input.name, dropped };
   },
 
-  format: (result) => [
-    {
-      type: 'text',
-      text: result.dropped ? `Dropped ${result.name}.` : `${result.name} not found.`,
-    },
-  ],
+  format: (result) => {
+    const name = markdown().inlineCode(result.name).build();
+    return [{ type: 'text', text: result.dropped ? `Dropped ${name}.` : `${name} not found.` }];
+  },
 });

@@ -201,7 +201,7 @@ describe('blsDataframeDescribeTool over the DuckDB canvas', () => {
     });
     const text = (blsDataframeDescribeTool.format!(structured)[0] as { text: string }).text;
     expect(text).toContain(
-      'Columns: series_id:VARCHAR (nullable), periods:BIGINT (nullable), avg_value:DOUBLE (nullable)',
+      'Columns: `series_id`:VARCHAR (nullable), `periods`:BIGINT (nullable), `avg_value`:DOUBLE (nullable)',
     );
   });
 
@@ -227,7 +227,7 @@ describe('blsDataframeDescribeTool over the DuckDB canvas', () => {
       expect(structured.dataframes.map((d) => d.name).sort()).toEqual([...names].sort());
       const text = (blsDataframeDescribeTool.format!(structured)[0] as { text: string }).text;
       expect(text).toContain('**2 active dataframe(s):**');
-      for (const table of names) expect(text).toContain(`### ${table}`);
+      for (const table of names) expect(text).toContain(`### \`${table}\``);
     }
   });
 

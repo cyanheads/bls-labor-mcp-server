@@ -6,10 +6,26 @@
 import type { DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { blsDataframeDropTool } from '@/mcp-server/tools/definitions/bls-dataframe-drop.tool.js';
-import { initCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
+import { getCanvasBridge, initCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
 import { createDuckdbCanvas } from '../fixtures/duckdb-canvas.js';
+
+/** The drop tool, run against `tenant`'s state, where the bridge keeps the canvas id. */
+function onTenantState(tenant: ReturnType<typeof createMockContext>) {
+  return {
+    ...blsDataframeDropTool,
+    handler: (
+      input: Parameters<typeof blsDataframeDropTool.handler>[0],
+      ctx: Parameters<typeof blsDataframeDropTool.handler>[1],
+    ) =>
+      blsDataframeDropTool.handler(input, {
+        ...ctx,
+        state: tenant.state,
+        tenantId: tenant.tenantId,
+      }),
+  };
+}
 
 describe('blsDataframeDropTool', () => {
   beforeEach(() => {
@@ -66,15 +82,22 @@ describe('blsDataframeDropTool over the DuckDB canvas', () => {
   });
 
   it('fails with a retryable canvas_drop_failed on both surfaces when the provider drop rejects (#74)', async () => {
-    initCanvasBridge({
-      acquire: async (...args: Parameters<DataCanvas['acquire']>) => {
-        const instance = await canvas.acquire(...args);
-        instance.drop = () => Promise.reject(new Error('injected provider fault'));
-        return instance;
-      },
-    } as unknown as DataCanvas);
+    initCanvasBridge(canvas);
+    const staging = createMockContext({ tenantId: 'default' });
+    const { tableName } = await getCanvasBridge()!.registerDataframe(staging, {
+      rows: [{ series_id: 'LNS14000000' }],
+      schema: [{ name: 'series_id', type: 'VARCHAR', nullable: true }],
+      sourceTool: 'bls_get_series',
+      queryParams: {},
+    });
+    const acquireShared = canvas.acquireShared.bind(canvas);
+    vi.spyOn(canvas, 'acquireShared').mockImplementation(async (ctx, options) => {
+      const instance = await acquireShared(ctx, options);
+      if (instance) instance.drop = () => Promise.reject(new Error('injected provider fault'));
+      return instance;
+    });
 
-    const result = await runToolContract(blsDataframeDropTool, { name: 'df_AAAAA_BBBBB' });
+    const result = await runToolContract(onTenantState(staging), { name: tableName });
 
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({
@@ -83,15 +106,16 @@ describe('blsDataframeDropTool over the DuckDB canvas', () => {
         data: {
           reason: 'canvas_drop_failed',
           retryable: true,
-          tableName: 'df_AAAAA_BBBBB',
+          tableName,
           recovery: { hint: expect.stringContaining('Retry') },
         },
       },
     });
     const text = (result.content[0] as { text: string }).text;
-    expect(text).toContain('df_AAAAA_BBBBB');
+    expect(text).toContain(tableName);
     expect(text).toContain('Retry');
     expect(text).not.toContain('Dropped');
+    expect(await staging.state.get(`df-meta/${tableName}`)).not.toBeNull();
   });
 
   it('rejects a name outside the dataframe-name rule with that rule, on both surfaces (#99)', async () => {
@@ -123,7 +147,7 @@ describe('blsDataframeDropTool over the DuckDB canvas', () => {
 
       expect(result.isError).toBeFalsy();
       expect(result.structuredContent).toEqual({ name, dropped: false });
-      expect((result.content[0] as { text: string }).text).toBe(`${name} not found.`);
+      expect((result.content[0] as { text: string }).text).toBe(`\`${name}\` not found.`);
     }
   });
 });

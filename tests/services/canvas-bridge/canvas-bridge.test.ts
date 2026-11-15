@@ -1,12 +1,18 @@
 /**
- * @fileoverview Tests for CanvasBridge: registration failures, the register_as
- * schema, and drop/sweep failure handling. Schema and drop behavior run against
- * the real DuckDB canvas, with faults injected into the acquired instance.
+ * @fileoverview Tests for CanvasBridge: registration, the register_as schema,
+ * drop/sweep failure handling, and the one shared canvas per tenant. Every
+ * suite runs against the real DuckDB canvas, with faults injected into the
+ * acquired instance or the registry.
  * @module tests/services/canvas-bridge/canvas-bridge.test
  */
 
-import type { CanvasInstance, ColumnSchema, DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
+import {
+  type CanvasInstance,
+  type ColumnSchema,
+  type DataCanvas,
+  SQL_GATE_REASONS,
+} from '@cyanheads/mcp-ts-core/canvas';
+import { JsonRpcErrorCode, serviceUnavailable, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, type MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
@@ -19,109 +25,93 @@ const ROW_SCHEMA: ColumnSchema[] = ['series_id', 'year', 'period', 'value'].map(
   nullable: true,
 }));
 
-/** Minimal DataCanvas fake whose acquired instance fails on registerTable. */
-function canvasFailingWith(error: Error): DataCanvas {
-  return {
-    acquire: vi.fn().mockResolvedValue({
-      canvasId: 'canvas-1',
-      registerTable: vi.fn().mockRejectedValue(error),
-      query: vi.fn(),
-      drop: vi.fn(),
-    }),
-  } as unknown as DataCanvas;
+/** Alter each canvas instance the bridge acquires from the real `canvas`, before use. */
+function alterAcquired(canvas: DataCanvas, alter: (instance: CanvasInstance) => void): DataCanvas {
+  const acquireShared = canvas.acquireShared.bind(canvas);
+  vi.spyOn(canvas, 'acquireShared').mockImplementation(async (ctx, options) => {
+    const instance = await acquireShared(ctx, options);
+    if (instance) alter(instance);
+    return instance;
+  });
+  return canvas;
 }
 
-/** Minimal DataCanvas fake that captures every row passed to registerTable. */
-function successfulCanvas(registerTable: ReturnType<typeof vi.fn>): DataCanvas {
-  return {
-    acquire: vi.fn().mockResolvedValue({
-      canvasId: 'canvas-1',
-      registerTable,
-      query: vi.fn(),
-      drop: vi.fn(),
-    }),
-  } as unknown as DataCanvas;
+/** A real canvas, a tenant context, and teardown, for one suite. */
+function useDuckdbCanvas(tenantId: string) {
+  const env = {} as { canvas: DataCanvas; ctx: ReturnType<typeof createMockContext> };
+  beforeEach(() => {
+    env.canvas = createDuckdbCanvas();
+    env.ctx = createMockContext({ tenantId });
+  });
+  afterEach(async () => {
+    await env.canvas.shutdown(env.ctx as unknown as Parameters<DataCanvas['shutdown']>[0]);
+  });
+  return env;
 }
 
 describe('CanvasBridge.registerDataframe', () => {
-  it('registers every supplied row and stores only complete-table metadata (#54)', async () => {
-    const registerTable = vi.fn().mockResolvedValue({
-      tableName: 'df_AAAAA_BBBBB',
-      rowCount: ROWS.length,
-    });
-    const bridge = new CanvasBridge(successfulCanvas(registerTable));
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+  const env = useDuckdbCanvas('test-tenant');
 
-    const registered = await bridge.registerDataframe(ctx, {
+  /** Register `ROWS` through a bridge whose acquired instance fails registerTable with `error`. */
+  const registerFailingWith = (error: Error, appliedScope?: string) =>
+    new CanvasBridge(
+      alterAcquired(env.canvas, (instance) => {
+        instance.registerTable = () => Promise.reject(error);
+      }),
+    )
+      .registerDataframe(env.ctx, {
+        rows: ROWS,
+        schema: ROW_SCHEMA,
+        sourceTool: 'bls_get_series',
+        queryParams: {},
+        ...(appliedScope && { appliedScope }),
+      })
+      .catch((e: unknown) => e);
+
+  it('registers every supplied row and stores only complete-table metadata (#54)', async () => {
+    const bridge = new CanvasBridge(env.canvas);
+
+    const registered = await bridge.registerDataframe(env.ctx, {
       rows: ROWS,
       schema: ROW_SCHEMA,
       sourceTool: 'bls_get_series',
       queryParams: { series_ids: ['LNS14000000'] },
     });
 
-    expect(registerTable).toHaveBeenCalledWith(
-      expect.any(String),
-      ROWS,
-      expect.objectContaining({ schema: expect.any(Array) }),
+    expect(registered).toMatchObject({ rowCount: ROWS.length });
+    const { result } = await bridge.query(env.ctx, `SELECT * FROM ${registered.tableName}`);
+    expect(result.rows).toEqual(ROWS);
+    const stored = await env.ctx.state.get<Record<string, unknown>>(
+      `df-meta/${registered.tableName}`,
     );
-    expect(registered).toMatchObject({ rowCount: ROWS.length, tableName: 'df_AAAAA_BBBBB' });
-    const stored = await ctx.state.get<Record<string, unknown>>('df-meta/df_AAAAA_BBBBB');
     expect(stored).toMatchObject({ rowCount: ROWS.length, sourceTool: 'bls_get_series' });
     expect(stored).not.toHaveProperty('truncated');
     expect(stored).not.toHaveProperty('maxRows');
   });
 
   it('stores register_as metadata without materialization-cap fields (#54)', async () => {
-    const query = vi.fn().mockResolvedValue({
-      columns: ['series_id'],
-      rowCount: 1,
-      rows: [{ series_id: 'LNS14000000' }],
-      tableName: 'analysis_result',
+    const bridge = new CanvasBridge(env.canvas);
+    const { tableName } = await bridge.registerDataframe(env.ctx, {
+      rows: ROWS,
+      schema: ROW_SCHEMA,
+      sourceTool: 'bls_get_series',
+      queryParams: {},
     });
-    const canvas = {
-      acquire: vi.fn().mockResolvedValue({
-        canvasId: 'canvas-1',
-        query,
-        describe: vi.fn().mockResolvedValue([
-          {
-            name: 'analysis_result',
-            kind: 'table',
-            rowCount: 1,
-            columns: [{ name: 'series_id', type: 'VARCHAR', nullable: true }],
-          },
-        ]),
-        drop: vi.fn(),
-      }),
-    } as unknown as DataCanvas;
-    const bridge = new CanvasBridge(canvas);
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
 
-    const { meta } = await bridge.query(ctx, 'SELECT series_id FROM df_AAAAA_BBBBB', {
+    const { meta } = await bridge.query(env.ctx, `SELECT series_id FROM ${tableName}`, {
       registerAs: 'analysis_result',
     });
 
     expect(meta).toMatchObject({ rowCount: 1, tableName: 'analysis_result' });
     expect(meta).not.toHaveProperty('truncated');
     expect(meta).not.toHaveProperty('maxRows');
-    const stored = await ctx.state.get<Record<string, unknown>>('df-meta/analysis_result');
+    const stored = await env.ctx.state.get<Record<string, unknown>>('df-meta/analysis_result');
     expect(stored).not.toHaveProperty('truncated');
     expect(stored).not.toHaveProperty('maxRows');
   });
 
   it('throws canvas_registration_failed instead of swallowing an internal error (#46)', async () => {
-    const bridge = new CanvasBridge(canvasFailingWith(new Error('DuckDB appender rollback')));
-    // tenantId enables ctx.state, so the failure under test is registerTable's
-    // rather than a state error thrown before the provider is ever reached.
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
-
-    const error = await bridge
-      .registerDataframe(ctx, {
-        rows: ROWS,
-        schema: ROW_SCHEMA,
-        sourceTool: 'bls_get_series',
-        queryParams: {},
-      })
-      .catch((e: unknown) => e);
+    const error = await registerFailingWith(new Error('DuckDB appender rollback'));
 
     expect(error).toMatchObject({
       data: { reason: 'canvas_registration_failed', sourceTool: 'bls_get_series', rowCount: 1 },
@@ -130,18 +120,10 @@ describe('CanvasBridge.registerDataframe', () => {
 
   it('carries the caller-supplied scope into the failure message (#79)', async () => {
     // The caller knows the window it applied; the bridge only knows the rows.
-    const bridge = new CanvasBridge(canvasFailingWith(new Error('DuckDB appender rollback')));
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
-
-    const error = await bridge
-      .registerDataframe(ctx, {
-        rows: ROWS,
-        schema: ROW_SCHEMA,
-        sourceTool: 'bls_get_series',
-        queryParams: {},
-        appliedScope: 'The applied window was 2000–2019, end_year resolved from start_year.',
-      })
-      .catch((e: unknown) => e);
+    const error = await registerFailingWith(
+      new Error('DuckDB appender rollback'),
+      'The applied window was 2000–2019, end_year resolved from start_year.',
+    );
 
     expect((error as Error).message).toContain(
       'The applied window was 2000–2019, end_year resolved from start_year.',
@@ -150,41 +132,18 @@ describe('CanvasBridge.registerDataframe', () => {
 
   it('preserves the underlying error as the cause', async () => {
     const underlying = new Error('DuckDB appender rollback');
-    const bridge = new CanvasBridge(canvasFailingWith(underlying));
-    // tenantId enables ctx.state, so the failure under test is registerTable's
-    // rather than a state error thrown before the provider is ever reached.
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
 
-    const error = await bridge
-      .registerDataframe(ctx, {
-        rows: ROWS,
-        schema: ROW_SCHEMA,
-        sourceTool: 'bls_get_series',
-        queryParams: {},
-      })
-      .catch((e: unknown) => e);
+    const error = await registerFailingWith(underlying);
 
     expect((error as { cause?: unknown }).cause).toBe(underlying);
   });
 
   it('does not claim canvas is unconfigured — canvas is present, the call failed', async () => {
     // canvas_unavailable's recovery ("set CANVAS_PROVIDER_TYPE=duckdb") is wrong here.
-    const bridge = new CanvasBridge(canvasFailingWith(new Error('transient write failure')));
-    // tenantId enables ctx.state, so the failure under test is registerTable's
-    // rather than a state error thrown before the provider is ever reached.
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
-
-    const error = await bridge
-      .registerDataframe(ctx, {
-        rows: ROWS,
-        schema: ROW_SCHEMA,
-        sourceTool: 'bls_get_series',
-        queryParams: {},
-      })
-      .catch((e: unknown) => e);
+    const error = await registerFailingWith(new Error('transient write failure'));
 
     const data = (error as { data?: Record<string, unknown> }).data;
-    expect(data?.reason).not.toBe('canvas_unavailable');
+    expect(data?.reason).toBe('canvas_registration_failed');
     expect((error as Error).message).not.toMatch(/CANVAS_PROVIDER_TYPE/);
   });
 });
@@ -223,17 +182,6 @@ const SPILL_ROW_SCHEMA: ColumnSchema[] = [
   { name: 'available', type: 'BOOLEAN', nullable: true },
   { name: 'value_numeric', type: 'DOUBLE', nullable: true },
 ];
-
-/** Wrap a real canvas so each acquired instance can be altered before use. */
-function wrapAcquire(canvas: DataCanvas, alter: (instance: CanvasInstance) => void): DataCanvas {
-  return {
-    acquire: async (...args: Parameters<DataCanvas['acquire']>) => {
-      const instance = await canvas.acquire(...args);
-      alter(instance);
-      return instance;
-    },
-  } as unknown as DataCanvas;
-}
 
 /** Push a stored dataframe's expiry into the past so the next op sweeps it. */
 async function expire(ctx: ReturnType<typeof createMockContext>, tableName: string) {
@@ -308,15 +256,6 @@ describe('CanvasBridge against the DuckDB canvas', () => {
       await expect(bridge.drop(ctx, 'df_NOPE0_NOPE0')).resolves.toBe(false);
     });
 
-    it('removes metadata and reports dropped when its canvas already expired', async () => {
-      const { tableName } = await register();
-      const canvasId = await ctx.state.get<string>('canvas-id');
-      await canvas.drop(canvasId!, ctx as unknown as Parameters<DataCanvas['drop']>[1]);
-
-      await expect(bridge.drop(ctx, tableName)).resolves.toBe(true);
-      expect(await ctx.state.get(`df-meta/${tableName}`)).toBeNull();
-    });
-
     it('sweeps an expired dataframe: table dropped, metadata removed', async () => {
       const { tableName } = await register();
       await expire(ctx, tableName);
@@ -331,23 +270,22 @@ describe('CanvasBridge against the DuckDB canvas', () => {
 });
 
 describe('CanvasBridge.query without register_as', () => {
+  const env = useDuckdbCanvas('test-tenant');
+
   it('stores no metadata and never describes the result', async () => {
     const describeTable = vi.fn();
-    const canvas = {
-      acquire: vi.fn().mockResolvedValue({
-        canvasId: 'canvas-1',
-        query: vi.fn().mockResolvedValue({ columns: ['n'], rowCount: 1, rows: [{ n: 1 }] }),
-        describe: describeTable,
-        drop: vi.fn(),
+    const bridge = new CanvasBridge(
+      alterAcquired(env.canvas, (instance) => {
+        instance.describe = describeTable;
       }),
-    } as unknown as DataCanvas;
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    );
 
-    const { meta } = await new CanvasBridge(canvas).query(ctx, 'SELECT 1 AS n');
+    const { meta, result } = await bridge.query(env.ctx, 'SELECT 1 AS n');
 
+    expect(result.rows).toEqual([{ n: 1 }]);
     expect(meta).toBeUndefined();
     expect(describeTable).not.toHaveBeenCalled();
-    expect(await ctx.state.list('df-meta/')).toMatchObject({ items: [] });
+    expect(await env.ctx.state.list('df-meta/')).toMatchObject({ items: [] });
   });
 });
 
@@ -382,7 +320,7 @@ describe('CanvasBridge register_as schema comes from the canvas (#71)', () => {
       'review_numeric_summary',
     );
 
-    expect(schema).toEqual([
+    expect(schema?.map(({ name, type, nullable }) => ({ name, type, nullable }))).toEqual([
       { name: 'series_id', type: 'VARCHAR', nullable: true },
       { name: 'periods', type: 'BIGINT', nullable: true },
       { name: 'avg_value', type: 'DOUBLE', nullable: true },
@@ -433,7 +371,7 @@ describe('CanvasBridge register_as schema comes from the canvas (#71)', () => {
 
   it('fails the call and stores no metadata when the schema cannot be read', async () => {
     const faulty = new CanvasBridge(
-      wrapAcquire(canvas, (instance) => {
+      alterAcquired(canvas, (instance) => {
         instance.describe = () => Promise.reject(new Error('injected describe fault'));
       }),
     );
@@ -491,7 +429,7 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
   it('throws canvas_drop_failed and keeps the dataframe when the provider drop rejects', async () => {
     let fault = true;
     const bridge = new CanvasBridge(
-      wrapAcquire(canvas, (instance) => {
+      alterAcquired(canvas, (instance) => {
         const drop = instance.drop.bind(instance);
         instance.drop = (name) => (fault ? failingDrop() : drop(name));
       }),
@@ -515,29 +453,27 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
     await expect(rowCount()).rejects.toMatchObject({ data: { reason: 'missing_table' } });
   });
 
-  it('throws canvas_drop_failed and keeps metadata when the canvas cannot be acquired', async () => {
-    const unreachable = {
-      acquire: () => Promise.reject(new Error('injected acquire fault')),
-    } as unknown as DataCanvas;
-
-    await expect(new CanvasBridge(unreachable).drop(ctx, tableName)).rejects.toMatchObject({
-      data: { reason: 'canvas_drop_failed', tableName },
-    });
-    expect(await metaPresent()).toBe(true);
-  });
-
-  it('keeps the stored canvas when acquiring it fails for a reason other than not-found', async () => {
-    const canvasId = await ctx.state.get<string>('canvas-id');
-    const flaky = {
-      acquire: (id: string | undefined, reqCtx: Parameters<DataCanvas['acquire']>[1]) =>
+  /** Fail the registry lookup of the stored canvas id; minting still works. */
+  const failStoredAcquire = () => {
+    const acquire = canvas.acquire.bind(canvas);
+    return vi
+      .spyOn(canvas, 'acquire')
+      .mockImplementation((id, ...rest) =>
         id === undefined
-          ? canvas.acquire(id, reqCtx)
+          ? acquire(id, ...rest)
           : Promise.reject(new Error('injected acquire fault')),
-    } as unknown as DataCanvas;
+      );
+  };
 
-    await expect(new CanvasBridge(flaky).drop(ctx, tableName)).rejects.toMatchObject({
-      data: { reason: 'canvas_drop_failed' },
-    });
+  it('throws canvas_drop_failed and keeps the stored canvas and metadata when the canvas cannot be resolved', async () => {
+    const canvasId = await ctx.state.get<string>('canvas-id');
+    const spy = failStoredAcquire();
+
+    const error = await new CanvasBridge(canvas).drop(ctx, tableName).catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ data: { reason: 'canvas_drop_failed', tableName } });
+    expect((error as { cause?: Error }).cause?.message).toBe('injected acquire fault');
+    spy.mockRestore();
     expect(await ctx.state.get('canvas-id')).toBe(canvasId);
     expect(await metaPresent()).toBe(true);
     expect(await rowCount()).toBe(130);
@@ -549,7 +485,7 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
     Object.assign(cancellable, { state: ctx.state });
     const cancelled = timeout('Request cancelled.', { reason: 'cancelled' });
     const bridge = new CanvasBridge(
-      wrapAcquire(canvas, (instance) => {
+      alterAcquired(canvas, (instance) => {
         instance.drop = () => {
           controller.abort();
           return Promise.reject(cancelled);
@@ -564,7 +500,7 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
   it('keeps an expired entry whose drop rejects, and the triggering op still succeeds', async () => {
     await expire(ctx, tableName);
     const bridge = new CanvasBridge(
-      wrapAcquire(canvas, (instance) => {
+      alterAcquired(canvas, (instance) => {
         instance.drop = failingDrop;
       }),
     );
@@ -578,18 +514,16 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
     expect(await rowCount()).toBe(130);
   });
 
-  it('keeps an expired entry when the canvas is unavailable, and the triggering op still succeeds', async () => {
+  it('keeps an expired entry when its canvas cannot be resolved, and the op fails with that error', async () => {
     await expire(ctx, tableName);
-    const unreachable = {
-      acquire: () => Promise.reject(new Error('injected acquire fault')),
-    } as unknown as DataCanvas;
+    const spy = failStoredAcquire();
 
-    const listed = await new CanvasBridge(unreachable).describe(ctx);
+    await expect(new CanvasBridge(canvas).describe(ctx)).rejects.toThrow('injected acquire fault');
 
-    expect(listed.map((m) => m.tableName)).toEqual([tableName]);
+    spy.mockRestore();
     expect(await metaPresent()).toBe(true);
-    expect(logCalls(ctx).filter((c) => c.level === 'warning')).toHaveLength(1);
     expect(logCalls(ctx).some((c) => c.msg === 'Expired dataframe swept')).toBe(false);
+    expect(await rowCount()).toBe(130);
   });
 
   it('rejects a reserved-word name as input rather than as a provider failure', async () => {
@@ -599,5 +533,269 @@ describe('CanvasBridge drop and sweep failures keep metadata (#74)', () => {
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'identifier_reserved' },
     });
+  });
+});
+
+describe('CanvasBridge refuses a register_as that names a DuckDB system catalog', () => {
+  const env = useDuckdbCanvas('bridge-catalog');
+  let bridge: CanvasBridge;
+  let staged: string;
+
+  beforeEach(async () => {
+    bridge = new CanvasBridge(env.canvas);
+    ({ tableName: staged } = await bridge.registerDataframe(env.ctx, {
+      rows: ROWS,
+      schema: ROW_SCHEMA,
+      sourceTool: 'bls_get_series',
+      queryParams: {},
+    }));
+  });
+
+  /** Every table and view on the tenant's canvas, read on the canvas directly. */
+  const canvasTables = async () => {
+    const instance = await env.canvas.acquire(
+      (await env.ctx.state.get<string>('canvas-id')) ?? undefined,
+      env.ctx as unknown as Parameters<DataCanvas['acquire']>[1],
+    );
+    return (await instance.describe()).map((table) => table.name).sort();
+  };
+
+  it('refuses duckdb_columns before staging, and a later register_as on the canvas still works', async () => {
+    await expect(
+      bridge.query(env.ctx, `SELECT series_id FROM ${staged}`, { registerAs: 'duckdb_columns' }),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'register_as_system_catalog', registerAs: 'duckdb_columns' },
+      literals: ['duckdb_columns'],
+    });
+
+    expect(await canvasTables()).toEqual([staged]);
+    expect(await env.ctx.state.get('df-meta/duckdb_columns')).toBeNull();
+    const { meta } = await bridge.query(env.ctx, `SELECT series_id FROM ${staged}`, {
+      registerAs: 'after_refusal',
+    });
+    expect(meta?.columnSchema.map((column) => column.name)).toEqual(['series_id']);
+    expect(
+      (await bridge.query(env.ctx, 'SELECT series_id FROM after_refusal')).result.rows,
+    ).toEqual([{ series_id: 'LNS14000000' }]);
+  });
+
+  it.each(['pg_tables', 'PG_TABLES', 'Sqlite_Master', 'duckdb_views', 'information_schema'])(
+    'refuses %s and stages nothing under it',
+    async (registerAs) => {
+      await expect(bridge.query(env.ctx, 'SELECT 1 AS n', { registerAs })).rejects.toMatchObject({
+        data: { reason: 'register_as_system_catalog', registerAs },
+        literals: [registerAs],
+      });
+      expect(await canvasTables()).toEqual([staged]);
+    },
+  );
+
+  it('runs a blank register_as, as form-style clients send for an empty field, as a plain query', async () => {
+    const { result, meta } = await bridge.query(env.ctx, 'SELECT 1 AS n', { registerAs: '' });
+
+    expect(result.rows).toEqual([{ n: 1 }]);
+    expect(meta).toBeUndefined();
+    expect(await canvasTables()).toEqual([staged]);
+  });
+
+  it('refuses a quoted system catalog name as an invalid identifier and stages nothing', async () => {
+    await expect(
+      bridge.query(env.ctx, 'SELECT 1 AS n', { registerAs: '"pg_tables"' }),
+    ).rejects.toMatchObject({ data: { reason: SQL_GATE_REASONS.identifierShape } });
+    expect(await canvasTables()).toEqual([staged]);
+  });
+
+  it.each(['pg_tables_2025', 'my_pg_class', 'duckdb_columns_copy'])(
+    'registers the near-miss name %s',
+    async (registerAs) => {
+      const { meta } = await bridge.query(env.ctx, 'SELECT 1 AS n', { registerAs });
+
+      expect(meta?.tableName).toBe(registerAs);
+      expect((await bridge.query(env.ctx, `SELECT n FROM ${registerAs}`)).result.rows).toEqual([
+        { n: 1 },
+      ]);
+    },
+  );
+});
+
+/** Let every pending microtask run, so queued calls reach the point they wait at. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+describe('CanvasBridge keeps one shared canvas per tenant (#135)', () => {
+  let canvas: DataCanvas;
+  let ctx: ReturnType<typeof createMockContext>;
+  let bridge: CanvasBridge;
+  const reqCtx = () => ctx as unknown as Parameters<DataCanvas['acquire']>[1];
+
+  beforeEach(() => {
+    canvas = createDuckdbCanvas();
+    ctx = createMockContext({ tenantId: 'bridge-135' });
+    bridge = new CanvasBridge(canvas);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await canvas.shutdown(reqCtx());
+  });
+
+  const register = (on: ReturnType<typeof createMockContext> = ctx) =>
+    bridge.registerDataframe(on, {
+      rows: spillRows(),
+      schema: SPILL_ROW_SCHEMA,
+      sourceTool: 'bls_get_series',
+      queryParams: {},
+    });
+  const metaKeys = async () => (await ctx.state.list('df-meta/')).items.map((item) => item.key);
+  const dropSharedCanvas = async () =>
+    canvas.drop((await ctx.state.get<string>('canvas-id')) as string, reqCtx());
+  const answers = async (tableName: string) =>
+    (await bridge.query(ctx, `SELECT COUNT(*) AS n FROM ${tableName}`)).result.rows;
+
+  it('stages five concurrent first registrations on one canvas, each answering a query', async () => {
+    const registered = await Promise.all(Array.from({ length: 5 }, () => register()));
+
+    expect(canvas.countForTenant(reqCtx())).toBe(1);
+    const storedId = await ctx.state.get<string>('canvas-id');
+    for (const { tableName } of registered) {
+      // COUNT is BIGINT, which canvas rows carry as a JSON string.
+      expect(await answers(tableName)).toEqual([{ n: '130' }]);
+    }
+    expect(await ctx.state.get('canvas-id')).toBe(storedId);
+    expect((await metaKeys()).sort()).toEqual(
+      registered.map(({ tableName }) => `df-meta/${tableName}`).sort(),
+    );
+  });
+
+  it('resolves a canvas id stored as a bare string under canvas-id, as 0.7.1 stored it', async () => {
+    const legacy = await canvas.acquire(undefined, reqCtx());
+    await ctx.state.set('canvas-id', legacy.canvasId);
+
+    const { tableName } = await register();
+
+    expect(await ctx.state.get('canvas-id')).toBe(legacy.canvasId);
+    expect(canvas.countForTenant(reqCtx())).toBe(1);
+    expect(await legacy.describe({ tableName })).toHaveLength(1);
+  });
+
+  describe('once the shared canvas is gone', () => {
+    it('describe lists nothing, purges the stale metadata, and mints no canvas', async () => {
+      const { tableName } = await register();
+      await register();
+      await dropSharedCanvas();
+
+      await expect(bridge.describe(ctx, tableName)).resolves.toEqual([]);
+      await expect(bridge.describe(ctx)).resolves.toEqual([]);
+
+      expect(await metaKeys()).toEqual([]);
+      expect(await ctx.state.get('canvas-id')).toBeNull();
+      expect(canvas.countForTenant(reqCtx())).toBe(0);
+    });
+
+    it('drop reports nothing dropped, purges the metadata, and mints no canvas', async () => {
+      const { tableName } = await register();
+      await dropSharedCanvas();
+
+      await expect(bridge.drop(ctx, tableName)).resolves.toBe(false);
+
+      expect(await metaKeys()).toEqual([]);
+      expect(canvas.countForTenant(reqCtx())).toBe(0);
+    });
+
+    it('the TTL sweep checks the canvas without minting one', async () => {
+      const { tableName } = await register();
+      await expire(ctx, tableName);
+      await dropSharedCanvas();
+
+      await expect(bridge.describe(ctx)).resolves.toEqual([]);
+
+      expect(canvas.countForTenant(reqCtx())).toBe(0);
+      expect(await metaKeys()).toEqual([]);
+    });
+
+    it('the TTL sweep drops from the canvas describe resolved, minting none when it dies mid-call', async () => {
+      const { tableName } = await register();
+      await expire(ctx, tableName);
+      const acquireShared = canvas.acquireShared.bind(canvas);
+      // The canvas is live when describe resolves it and gone by the time the sweep runs.
+      vi.spyOn(canvas, 'acquireShared').mockImplementationOnce(async (...args) => {
+        const instance = await acquireShared(...args);
+        await dropSharedCanvas();
+        return instance;
+      });
+
+      await bridge.describe(ctx);
+
+      expect(canvas.countForTenant(reqCtx())).toBe(0);
+    });
+
+    it('the next staging replaces it, and describe lists only the table a query reaches', async () => {
+      const stale = await register();
+      const deadId = await ctx.state.get<string>('canvas-id');
+      await dropSharedCanvas();
+
+      const fresh = await register();
+
+      expect((await bridge.describe(ctx)).map((meta) => meta.tableName)).toEqual([fresh.tableName]);
+      expect(await ctx.state.get(`df-meta/${stale.tableName}`)).toBeNull();
+      expect(await ctx.state.get('canvas-id')).not.toBe(deadId);
+      expect(await answers(fresh.tableName)).toEqual([{ n: '130' }]);
+    });
+  });
+
+  it('propagates a stored-canvas failure other than canvas_not_found and keeps the id and metadata', async () => {
+    const { tableName } = await register();
+    const storedId = await ctx.state.get<string>('canvas-id');
+    const registryFault = serviceUnavailable('injected registry fault');
+    const acquire = canvas.acquire.bind(canvas);
+    const spy = vi
+      .spyOn(canvas, 'acquire')
+      .mockImplementation((id, ...rest) =>
+        id === undefined ? acquire(id, ...rest) : Promise.reject(registryFault),
+      );
+
+    await expect(bridge.describe(ctx)).rejects.toBe(registryFault);
+    await expect(bridge.query(ctx, 'SELECT 1 AS n')).rejects.toBe(registryFault);
+    await expect(register()).rejects.toMatchObject({
+      data: { reason: 'canvas_registration_failed' },
+      cause: registryFault,
+    });
+
+    spy.mockRestore();
+    expect(await ctx.state.get('canvas-id')).toBe(storedId);
+    expect(await metaKeys()).toEqual([`df-meta/${tableName}`]);
+    expect(canvas.countForTenant(reqCtx())).toBe(1);
+    expect(await answers(tableName)).toEqual([{ n: '130' }]);
+  });
+
+  it('fails a cancelled call queued behind the mint as cancelled, and the others get the canvas', async () => {
+    const mint = Promise.withResolvers<void>();
+    const acquire = canvas.acquire.bind(canvas);
+    vi.spyOn(canvas, 'acquire').mockImplementation(async (id, ...rest) => {
+      if (id === undefined) await mint.promise;
+      return acquire(id, ...rest);
+    });
+    const controller = new AbortController();
+    const cancellable = Object.assign(
+      createMockContext({ tenantId: 'bridge-135', signal: controller.signal }),
+      { state: ctx.state },
+    );
+
+    const first = register();
+    const cancelled = register(cancellable);
+    const last = register();
+    await settle();
+    const reason = timeout('Request cancelled.', { reason: 'cancelled' });
+    controller.abort(reason);
+
+    await expect(cancelled).rejects.toBe(reason);
+    mint.resolve();
+    const staged = await Promise.all([first, last]);
+
+    expect(canvas.countForTenant(reqCtx())).toBe(1);
+    for (const { tableName } of staged) {
+      expect(await answers(tableName)).toEqual([{ n: '130' }]);
+    }
+    expect(await metaKeys()).toHaveLength(2);
   });
 });

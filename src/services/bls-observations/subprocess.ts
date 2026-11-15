@@ -18,8 +18,10 @@
  *
  * Exit codes: 0 — the sync completed and read every listed file; 2
  * ({@link DEGRADED_EXIT_CODE}) — it completed, but left listed files unread or
- * found surveys listing none; 1 — it failed or was aborted. Either way short of
- * 0, the next scheduled run re-reads what was missed.
+ * found surveys listing none; 3 ({@link SKIPPED_EXIT_CODE}) — another process
+ * held the mirror's sync lease, so this run synced nothing; 1 — it failed or
+ * was aborted. Either way short of 0, the next scheduled run re-reads what was
+ * missed.
  *
  * @module services/bls-observations/subprocess
  */
@@ -27,6 +29,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { MirrorLogger, SyncMode } from '@cyanheads/mcp-ts-core/mirror';
 import {
   getBlsObservationsService,
@@ -43,6 +46,9 @@ const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 /** Exit code of a sync that completed with listed files unread or surveys listing none. */
 export const DEGRADED_EXIT_CODE = 2;
+
+/** Exit code of a run that synced nothing because another process held the mirror's sync lease. */
+export const SKIPPED_EXIT_CODE = 3;
 
 /** Tracks the in-flight child so overlapping cron ticks are no-ops. */
 let activeChild: ChildProcess | undefined;
@@ -122,6 +128,10 @@ export function runObservationsSubprocess(opts: {
           'Observations subprocess completed with gaps; the next run re-reads the files it missed',
           { code },
         );
+      } else if (code === SKIPPED_EXIT_CODE) {
+        log.info?.('Observations subprocess skipped; another process is syncing the mirror', {
+          code,
+        });
       } else if (timedOut) {
         log.error?.('Observations subprocess terminated on timeout', { code, signal });
       } else {
@@ -233,7 +243,10 @@ function isMainEntry(): boolean {
  * `--init` selects the full harvest; anything else is an incremental refresh.
  * The sync writes its own records — the runner's and each unread file — through
  * `log`. A sync that completes with gaps resolves to
- * {@link DEGRADED_EXIT_CODE}; ordinary failures — an unusable configuration, a
+ * {@link DEGRADED_EXIT_CODE}. One that finds the store's sync lease held — an
+ * init CLI, a scheduled refresh, or another instance on the same file is
+ * syncing — rejects `sync_locked` before reading anything and resolves to
+ * {@link SKIPPED_EXIT_CODE}. Ordinary failures — an unusable configuration, a
  * rejected or aborted sync — resolve to exit code 1 rather than throwing.
  */
 export async function runObservationsChildSync(
@@ -265,6 +278,12 @@ export async function runObservationsChildSync(
     });
     return DEGRADED_EXIT_CODE;
   } catch (err: unknown) {
+    if (err instanceof McpError && err.data?.reason === 'sync_locked') {
+      log.notice?.('Observations mirror sync skipped: another process holds the sync lease', {
+        mode,
+      });
+      return SKIPPED_EXIT_CODE;
+    }
     log.error?.('Observations sync failed', {
       error: err instanceof Error ? err.message : String(err),
     });

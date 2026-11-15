@@ -166,7 +166,7 @@ describe('blsDataframeQueryTool', () => {
     await blsDataframeQueryTool.handler(input, ctx);
 
     expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 3, cap: 3 });
-    expect(getEnrichment(ctx).notice).toContain('analysis_result');
+    expect(getEnrichment(ctx).notice).toContain('materialized in the registered_as dataframe');
     expect(getEnrichment(ctx).notice).not.toContain('use register_as');
   });
 
@@ -198,13 +198,14 @@ describe('blsDataframeQueryTool', () => {
     expect(result.structuredContent).toMatchObject({
       registered_as: 'analysis_result',
       truncated: true,
-      notice: expect.stringContaining('analysis_result'),
+      notice: expect.stringContaining('materialized in the registered_as dataframe'),
     });
     const text = result.content
       .filter((block) => block.type === 'text')
       .map((block) => block.text)
       .join('\n');
-    expect(text).toContain('analysis_result');
+    expect(text).toContain('Registered as `analysis_result`');
+    expect(text).toContain('materialized in the registered_as dataframe');
     expect(text).not.toContain('use register_as');
   });
 
@@ -360,7 +361,7 @@ describe('blsDataframeQueryTool', () => {
     expect(text).toContain('a\\|b');
   });
 
-  it('escapes backslashes so a cell survives markdown rendering', () => {
+  it('spans a cell holding a backslash, so it reads without added escapes', () => {
     const output = {
       columns: ['a', 'b'],
       row_count: 1,
@@ -368,13 +369,12 @@ describe('blsDataframeQueryTool', () => {
     };
     const blocks = blsDataframeQueryTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    // A bare backslash is consumed as an escape by the renderer, so the literal
-    // value has to arrive with its backslash doubled and the pipe escaped on top.
-    expect(text).toContain('x\\\\\\|y');
-    expect(text).toContain(String.raw`a\\\*b`);
+    // A code span keeps backslashes literal; only the pipe gains one, which GFM
+    // removes before the span is read.
+    expect(text).toContain(String.raw`| ${'`'}x\\|y${'`'} | ${'`'}a\*b${'`'} |`);
   });
 
-  it('escapes backslashes in serialized object cells', () => {
+  it('spans a serialized object cell, its pipes escaped for the table', () => {
     const output = {
       columns: ['payload'],
       row_count: 1,
@@ -382,10 +382,7 @@ describe('blsDataframeQueryTool', () => {
     };
     const blocks = blsDataframeQueryTool.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    // Markdown consumes a backslash only before punctuation, so three preserve
-    // the two backslashes JSON needs before the ordinary letter t.
-    expect(text).toContain(String.raw`C:\\\tmp`);
-    expect(text).toContain('a\\|b');
+    expect(text).toContain(String.raw`| ${'`'}{"path":"C:\\tmp","sep":"a\|b"}${'`'} |`);
   });
 
   it('formats null cell values as empty string', () => {

@@ -1,21 +1,23 @@
 /**
  * @fileoverview Adapter between BLS tools and the framework DataCanvas
- * primitive. Holds one shared canvas per tenant, generates `df_XXXXX_XXXXX`
- * table names, registers rows under the caller's declared schema, stores the
- * canvas-reported schema for `register_as` results, tracks per-table TTL +
- * provenance in `ctx.state`, and lazy-sweeps expired tables on every public op.
+ * primitive. Keeps one shared canvas per tenant through
+ * `DataCanvas.acquireShared`, generates `df_XXXXX_XXXXX` table names, registers
+ * rows under the caller's declared schema, stores the canvas-reported schema
+ * for `register_as` results, tracks per-table TTL + provenance in `ctx.state`,
+ * and lazy-sweeps expired tables on every public op.
  * @module services/canvas-bridge/canvas-bridge
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import {
+  assertNoSystemCatalogs,
   assertValidIdentifier,
   type CanvasInstance,
   type ColumnSchema,
   type DataCanvas,
   type QueryResult,
 } from '@cyanheads/mcp-ts-core/canvas';
-import { McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -77,7 +79,6 @@ export interface BridgeQueryOptions {
 }
 
 const META_PREFIX = 'df-meta/';
-const CANVAS_ID_KEY = 'canvas-id';
 const TABLE_NAME_CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 export class CanvasBridge {
@@ -91,15 +92,16 @@ export class CanvasBridge {
    * failure would leave them returning a truncated preview that reads as a
    * complete result. `canvas_registration_failed` is deliberately distinct from
    * `canvas_unavailable`: canvas is configured here — only this call failed, so
-   * "enable canvas" is the wrong recovery to hand back.
+   * "enable canvas" is the wrong recovery to hand back. A cancelled call fails
+   * as cancelled.
    */
   async registerDataframe(
     ctx: Context,
     options: RegisterDataframeOptions,
   ): Promise<RegisterDataframeResult> {
     try {
-      await this.sweepExpired(ctx);
-      const instance = await this.acquireSharedCanvas(ctx);
+      const instance = await this.stagingCanvas(ctx);
+      await this.sweepExpired(ctx, instance);
       const tableName = this.mintTableName();
       const { schema } = options;
 
@@ -131,6 +133,7 @@ export class CanvasBridge {
         columnSchema: schema,
       };
     } catch (error) {
+      if (ctx.signal.aborted) throw error;
       ctx.log.warning('Dataframe registration failed', {
         error: error instanceof Error ? error.message : String(error),
         sourceTool: options.sourceTool,
@@ -152,8 +155,14 @@ export class CanvasBridge {
     }
   }
 
+  /**
+   * List stored dataframe metadata, newest first. Never mints a canvas: with no
+   * live one, its records are purged and nothing is listed.
+   */
   async describe(ctx: Context, tableName?: string): Promise<DataframeMeta[]> {
-    await this.sweepExpired(ctx);
+    const instance = await this.liveCanvas(ctx);
+    if (!instance) return [];
+    await this.sweepExpired(ctx, instance);
     if (tableName) {
       const meta = await ctx.state.get<DataframeMeta>(`${META_PREFIX}${tableName}`);
       return meta ? [meta] : [];
@@ -168,10 +177,30 @@ export class CanvasBridge {
     sql: string,
     options: BridgeQueryOptions = {},
   ): Promise<{ result: QueryResult; meta?: DataframeMeta }> {
-    await this.sweepExpired(ctx);
-    const instance = await this.acquireSharedCanvas(ctx);
-
     const registerAs = options.registerAs;
+    // Blank registers nothing, as the canvas reads it: form-style clients send "" for an empty field.
+    if (registerAs) {
+      /**
+       * The framework's catalog gate, run on the name alone, refuses it before
+       * anything is staged: a table under a system catalog's name is one no
+       * later query may reference. The identifier rule runs first, so the gate
+       * only ever reads a name of at most 63 characters.
+       */
+      assertValidIdentifier(registerAs, 'table');
+      try {
+        assertNoSystemCatalogs(registerAs);
+      } catch (error) {
+        throw validationError(
+          `register_as ${registerAs} names a DuckDB system catalog, which canvas SQL cannot reference; nothing was staged.`,
+          { reason: 'register_as_system_catalog', registerAs },
+          { cause: error, literals: [registerAs] },
+        );
+      }
+    }
+
+    const instance = await this.stagingCanvas(ctx);
+    await this.sweepExpired(ctx, instance);
+
     let result: QueryResult;
     try {
       result = await instance.query(sql, {
@@ -182,19 +211,32 @@ export class CanvasBridge {
         signal: ctx.signal,
       });
     } catch (error) {
-      if (
-        ctx.signal.aborted ||
-        !(error instanceof McpError) ||
-        error.data?.reason !== 'register_as_clash'
-      ) {
-        throw error;
+      if (ctx.signal.aborted || !(error instanceof McpError)) throw error;
+      // The name the caller sends back renders as a code span (`literals`), never escaped.
+      if (error.data?.reason === 'register_as_clash' && registerAs !== undefined) {
+        throw new McpError(
+          error.code,
+          `Canvas table ${registerAs} already exists. Choose a different register_as name.`,
+          error.data,
+          { cause: error, literals: [registerAs] },
+        );
       }
-      throw new McpError(
-        error.code,
-        `Canvas table "${registerAs}" already exists. Choose a different register_as name.`,
-        error.data,
-        { cause: error },
-      );
+      const missing = error.data?.tableName;
+      if (error.data?.reason === 'missing_table' && typeof missing === 'string') {
+        // The framework quotes the name and points at a generic describe tool; name ours.
+        throw new McpError(
+          error.code,
+          `Canvas table ${missing} does not exist. The table may have expired, been dropped, or the name may be mistyped.`,
+          {
+            ...error.data,
+            recovery: {
+              hint: 'Re-run the tool that produced this table to stage it again, or list the currently staged tables with bls_dataframe_describe.',
+            },
+          },
+          { cause: error, literals: [missing] },
+        );
+      }
+      throw error;
     }
 
     let meta: DataframeMeta | undefined;
@@ -202,7 +244,9 @@ export class CanvasBridge {
       /**
        * `QueryResult` carries column names only; the canvas's own describe of
        * the materialized table is the schema. A failed read fails the call
-       * rather than storing a guessed one.
+       * rather than storing a guessed one. No `signal`: an abort here would
+       * leave the materialized table with no record, which the sweep never
+       * reaches.
        */
       const [table] = await instance.describe({ tableName: result.tableName });
       if (!table) {
@@ -229,48 +273,58 @@ export class CanvasBridge {
    * Drop a dataframe's table, then its metadata. Metadata goes only once the
    * canvas confirms the drop or the table's absence, so a failed drop never
    * leaves a live table that describe no longer lists and the sweep no longer
-   * reaches. `canvas_drop_failed` keeps both for a retry.
+   * reaches. `canvas_drop_failed` keeps both for a retry. With no live canvas
+   * there is nothing to drop: its records are purged and the result is false.
    */
   async drop(ctx: Context, tableName: string): Promise<boolean> {
     // A name that can never be a table is an input error, not a provider failure.
     assertValidIdentifier(tableName, 'table');
-    await this.sweepExpired(ctx);
+    const dropFailed = (error: unknown) =>
+      ctx.signal.aborted
+        ? error
+        : serviceUnavailable(
+            `Dropping dataframe ${tableName} failed; the dataframe and its metadata were kept.`,
+            {
+              reason: 'canvas_drop_failed',
+              retryable: true,
+              tableName,
+              ...ctx.recoveryFor('canvas_drop_failed'),
+            },
+            { cause: error, literals: [tableName] },
+          );
+
+    let instance: CanvasInstance | undefined;
+    try {
+      instance = await this.liveCanvas(ctx);
+    } catch (error) {
+      throw dropFailed(error);
+    }
+    if (!instance) return false;
+    await this.sweepExpired(ctx, instance);
     const metaKey = `${META_PREFIX}${tableName}`;
     const hadMeta = (await ctx.state.get(metaKey)) !== null;
 
     let dropped: boolean;
     try {
-      const instance = await this.acquireSharedCanvas(ctx);
       dropped = await instance.drop(tableName);
     } catch (error) {
-      if (ctx.signal.aborted) throw error;
-      throw serviceUnavailable(
-        `Dropping dataframe ${tableName} failed; the dataframe and its metadata were kept.`,
-        {
-          reason: 'canvas_drop_failed',
-          retryable: true,
-          tableName,
-          ...ctx.recoveryFor('canvas_drop_failed'),
-        },
-        { cause: error },
-      );
+      throw dropFailed(error);
     }
     await ctx.state.delete(metaKey);
     return dropped || hadMeta;
   }
 
   /**
-   * Drop expired dataframes. An entry whose drop fails keeps its metadata and
-   * is retried by the next operation; the sweep never fails the operation
-   * that triggered it.
+   * Drop expired dataframes from `instance`, the live canvas the triggering
+   * operation resolved. An entry whose drop fails keeps its metadata and is
+   * retried by the next operation; the sweep never fails the operation that
+   * triggered it.
    */
-  private async sweepExpired(ctx: Context): Promise<void> {
+  private async sweepExpired(ctx: Context, instance: CanvasInstance): Promise<void> {
     const nowIso = new Date().toISOString();
-    let instance: CanvasInstance | undefined;
     for await (const { key, meta } of this.iterateMeta(ctx)) {
       if (meta.expiresAt > nowIso) continue;
       try {
-        instance ??= await this.acquireSharedCanvas(ctx);
         await instance.drop(meta.tableName);
       } catch (error) {
         if (ctx.signal.aborted) throw error;
@@ -303,24 +357,33 @@ export class CanvasBridge {
   }
 
   /**
-   * Resolve the tenant's shared canvas, minting a replacement only when the
-   * stored one no longer exists. Any other acquire failure propagates: a
-   * replacement would orphan every table the stored canvas still holds.
+   * The tenant's shared canvas for staging, minted once under concurrent first
+   * calls. The id lives in `ctx.state` under `canvas-id`, the key 0.7.1 wrote.
+   * A stored id that fails for any reason other than `canvas_not_found`
+   * propagates and keeps the id and every record: a replacement would orphan
+   * every table the stored canvas still holds.
    */
-  private async acquireSharedCanvas(ctx: Context): Promise<CanvasInstance> {
-    const reqCtx = ctx as unknown as Parameters<DataCanvas['acquire']>[1];
-    const stored = await ctx.state.get<string>(CANVAS_ID_KEY);
-    if (stored) {
-      try {
-        return await this.canvas.acquire(stored, reqCtx);
-      } catch (error) {
-        if (!(error instanceof McpError && error.data?.reason === 'canvas_not_found')) throw error;
-        await ctx.state.delete(CANVAS_ID_KEY);
-      }
-    }
-    const instance = await this.canvas.acquire(undefined, reqCtx);
-    await ctx.state.set(CANVAS_ID_KEY, instance.canvasId);
-    return instance;
+  private stagingCanvas(ctx: Context): Promise<CanvasInstance> {
+    return this.canvas.acquireShared(ctx, { onReplace: () => this.purgeMeta(ctx) });
+  }
+
+  /** The live shared canvas, or `undefined` without minting one. */
+  private liveCanvas(ctx: Context): Promise<CanvasInstance | undefined> {
+    return this.canvas.acquireShared(ctx, {
+      create: false,
+      onReplace: () => this.purgeMeta(ctx),
+    });
+  }
+
+  /**
+   * Delete every dataframe record. Runs only when no live canvas is found, so
+   * every record names a table on a dead canvas. Idempotent: the framework
+   * reruns it when it, the mint, or the call holding the turn fails.
+   */
+  private async purgeMeta(ctx: Context): Promise<void> {
+    const keys: string[] = [];
+    for await (const { key } of this.iterateMeta(ctx)) keys.push(key);
+    if (keys.length > 0) await ctx.state.deleteMany(keys);
   }
 
   private mintTableName(): string {

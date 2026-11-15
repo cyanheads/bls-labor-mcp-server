@@ -30,7 +30,7 @@ Every sync also reads each survey's `{abbr}.footnote` table (EC has none, a 404 
 
 ## Harvest runs
 
-The harvest runs in a subprocess, which exits 0 on a clean run, 2 when it completed with gaps, and 1 when it failed or was aborted. The parent logs 2 at warning as a degraded run; the next scheduled run re-reads, with no extra retry. Response headers have 30 s and a body may stall for 60 s, with no whole-file deadline. Files stream in pages of 5,000 rows, so memory stays bounded. Requests retry up to 3 attempts, only on 408, 429, 500, 502, 503, 504, network errors, and timeouts; a 403 or 404 fails on the first try. The runner's and ingester's log records are JSON lines on the subprocess's stdout, relayed by the parent.
+The harvest runs in a subprocess, which exits 0 on a clean run, 2 when it completed with gaps, 3 when another process held the store's sync lease, and 1 when it failed or was aborted. The parent logs 2 at warning as a degraded run and 3 at info as a skipped one; the next scheduled run re-reads, with no extra retry. One sync runs per store file at a time: a bootstrap, a scheduled refresh, or another instance that finds the lease held syncs nothing and exits 3, so an `--init` that exits 3 has not run and needs re-running once the other sync finishes. A holder that dies keeps the lease for 2 minutes. Response headers have 30 s and a body may stall for 60 s, with no whole-file deadline. Files stream in pages of 5,000 rows, so memory stays bounded. Requests retry up to 3 attempts, only on 408, 429, 500, 502, 503, 504, network errors, and timeouts; a 403 or 404 fails on the first try. The runner's and ingester's log records are JSON lines on the subprocess's stdout, relayed by the parent.
 
 ## Live fallback
 

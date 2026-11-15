@@ -8,8 +8,11 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CANVAS_IDENTIFIER_REGEX } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvasBridge } from '@/services/canvas-bridge/canvas-bridge.js';
+
+/** A code span, which a reader copies without escapes: names and values sent back in SQL or a call. */
+const code = (value: string) => markdown().inlineCode(value).build();
 
 export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
   title: 'Describe BLS Dataframes',
@@ -68,7 +71,7 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
                     type: z
                       .string()
                       .describe(
-                        'Column type as the canvas reports it: VARCHAR, INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, JSON, or BLOB. A register_as column of another DuckDB type (DECIMAL, HUGEINT from SUM over integers, SMALLINT, a list) reports VARCHAR, though SQL still sees its real type.',
+                        'Column type as the canvas reports it: VARCHAR, INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, JSON, or BLOB. A register_as column of another DuckDB type (DECIMAL, HUGEINT from SUM over integers, a list) reports VARCHAR, though SQL still sees its real type; TINYINT, SMALLINT, UTINYINT, and USMALLINT report INTEGER.',
                       ),
                     nullable: z.boolean().describe('Whether the column permits NULL.'),
                   })
@@ -120,18 +123,18 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
     }
     const lines: string[] = [`**${result.dataframes.length} active dataframe(s):**\n`];
     for (const df of result.dataframes) {
-      lines.push(`### ${escapeMarkdownInline(df.name)}`);
+      lines.push(`### ${code(df.name)}`);
       lines.push(`- Source: ${df.source_tool}`);
       lines.push(`- Rows: ${df.row_count}`);
       lines.push(`- Created: ${df.created_at} — Expires: ${df.expires_at}`);
       const params = Object.entries(df.query_params)
-        .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+        .map(([k, v]) => `${escapeMarkdownInline(k)}=${code(JSON.stringify(v))}`)
         .join(', ');
-      if (params) lines.push(`- Params: ${escapeMarkdownInline(params)}`);
+      if (params) lines.push(`- Params: ${params}`);
       const cols = df.column_schema
-        .map((c) => `${c.name}:${c.type}${c.nullable ? ' (nullable)' : ''}`)
+        .map((c) => `${code(c.name)}:${c.type}${c.nullable ? ' (nullable)' : ''}`)
         .join(', ');
-      lines.push(`- Columns: ${escapeMarkdownInline(cols)}`);
+      lines.push(`- Columns: ${cols}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n').trimEnd() }];

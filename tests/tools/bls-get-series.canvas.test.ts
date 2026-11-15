@@ -156,7 +156,7 @@ describe('bls_get_series spill schema on the DuckDB canvas (#97)', () => {
     );
 
     expect(types.value_numeric).toBe('DOUBLE');
-    expect(text).toContain('value_numeric:DOUBLE');
+    expect(text).toContain('`value_numeric`:DOUBLE');
     const result = await query(`SELECT AVG(value_numeric) / 2 AS half FROM ${name}`);
     expect(result.rows[0]?.half).toBeCloseTo((159_000 + 159_899) / 4);
   });
@@ -196,7 +196,7 @@ describe('bls_get_series spill schema on the DuckDB canvas (#97)', () => {
       'pct_change_12m',
     ]) {
       expect(types[column], column).toBe('DOUBLE');
-      expect(text).toContain(`${column}:DOUBLE`);
+      expect(text).toContain(`\`${column}\`:DOUBLE`);
     }
     const result = await query(
       `SELECT pct_change_12m * 2 AS doubled, net_change_3m + 1 AS shifted FROM ${name} LIMIT 1`,
