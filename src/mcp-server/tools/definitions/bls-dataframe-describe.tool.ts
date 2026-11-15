@@ -71,7 +71,7 @@ export const blsDataframeDescribeTool = tool('bls_dataframe_describe', {
                     type: z
                       .string()
                       .describe(
-                        'Column type as the canvas reports it: VARCHAR, INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, JSON, or BLOB. A register_as column of another DuckDB type (DECIMAL, HUGEINT from SUM over integers, a list) reports VARCHAR, though SQL still sees its real type; TINYINT, SMALLINT, UTINYINT, and USMALLINT report INTEGER.',
+                        'Column type as the canvas reports it: VARCHAR, INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, JSON, or BLOB. A register_as column of another DuckDB type (DECIMAL, HUGEINT from SUM over integers, a list) reports VARCHAR, though SQL still sees its real type; TINYINT, SMALLINT, UTINYINT, and USMALLINT report INTEGER, and UINTEGER reports BIGINT.',
                       ),
                     nullable: z.boolean().describe('Whether the column permits NULL.'),
                   })
